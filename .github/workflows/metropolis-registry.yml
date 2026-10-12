@@ -166,7 +166,8 @@ jobs:
           fi
       - name: Build the registry
         run: |
-          mapfile -t proving < "$RUNNER_TEMP/proving/build-args"
+          # Bash 3.2 on macOS runners has no mapfile; read one argument per line.
+          proving=(); while IFS= read -r argument; do proving+=("$argument"); done < "$RUNNER_TEMP/proving/build-args"
           python3 scripts/build-metropolis-registry.py \
             --version "$METROPOLIS_VERSION" \
             --output registry \
@@ -178,7 +179,8 @@ jobs:
           forge build --root contracts/evm
           cargo fetch --locked --manifest-path sdk/shielded/Cargo.toml
           mkdir -p registry/qualification
-          mapfile -t proving < "$RUNNER_TEMP/proving/check-args"
+          # Bash 3.2 on macOS runners has no mapfile; read one argument per line.
+          proving=(); while IFS= read -r argument; do proving+=("$argument"); done < "$RUNNER_TEMP/proving/check-args"
           python3 scripts/check-metropolis-install.py --registry registry --proving-witnesses circuits/m5/build \
             "${proving[@]}" --prover-timeout-seconds 1800 \
             | tail -1 > registry/qualification/install.json

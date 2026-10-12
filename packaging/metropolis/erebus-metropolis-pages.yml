@@ -43,10 +43,12 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # The index covers all published versions, so a new release never makes an older
-          # pinned version uninstallable. Drafts are never indexed.
+          # The index covers all published package versions, so a new release never makes an older
+          # pinned version uninstallable. Drafts are never indexed. Only `v<version>` releases are
+          # packages; other releases in this repository (the `artifacts-*` proving-artifact releases)
+          # are never indexed or downloaded here.
           gh release list --repo PoulavBhowmick03/erebus-metropolis --limit 1000 \
-            --json tagName,isDraft --jq '.[] | select(.isDraft | not) | .tagName' > tags.txt
+            --json tagName,isDraft --jq '.[] | select(.isDraft | not) | .tagName | select(startswith("artifacts-") | not)' > tags.txt
           grep -Fxq -- "$TAG" tags.txt || { echo "dispatched tag is not a published release"; exit 1; }
           while read -r tag; do
             [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+\.dev[0-9]+$ ]] || { echo "invalid release tag"; exit 1; }
