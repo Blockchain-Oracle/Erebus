@@ -239,10 +239,17 @@ jobs:
           if ineligible:
               sys.exit(f"platform builds are not release eligible: {ineligible}")
           recorded = {platform: sorted(r["manifest_sha256"] for r in m.get("proving_domains") or []) for platform, m in manifests.items()}
-          if len({tuple(v) for v in recorded.values()}) != 1 or not next(iter(recorded.values())):
-              sys.exit(f"platform builds recorded different or missing proving manifests: {recorded}")
-          domains = next(iter(recorded.values()))
+          modes = {(d / "proving-mode").read_text().strip() for d in pathlib.Path("artifacts").glob("metropolis-registry-*")}
+          if len(modes) != 1:
+              sys.exit(f"platform legs used different proving modes: {sorted(modes)}")
+          if not all(recorded.values()):
+              sys.exit(f"a platform build recorded no proving manifest: {recorded}")
+          # Hosted inputs are shared, so both legs must record the same manifests. In ci-fixture mode each
+          # leg generates its own throwaway bundle (never publishable), so each leg is checked against its own.
+          if modes == {"hosted"} and len({tuple(v) for v in recorded.values()}) != 1:
+              sys.exit(f"platform builds recorded different hosted proving manifests: {recorded}")
           for directory in pathlib.Path("artifacts").glob("metropolis-registry-*"):
+              domains = sorted(r["manifest_sha256"] for r in json.loads((directory / "release.json").read_text()).get("proving_domains") or [])
               reports = {}
               for gate in ("install", "assets", "metered", "x402"):
                   path = directory / "qualification" / f"{gate}.json"
