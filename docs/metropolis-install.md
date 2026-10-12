@@ -307,7 +307,10 @@ uv run --locked python scripts/check-metropolis-install.py --registry artifacts/
 
 ### One-step operator setup (private settlement)
 
-After installing, `packaging/metropolis/operator_init.py` prepares one operator from the published release.
+`erebus-init --metropolis` prepares one operator. This entry point ships in builds
+containing the operator-setup integration; `0.3.0.dev2026101202` still requires the
+checkout entry point `python3 packaging/metropolis/operator_init.py`.
+Without `--metropolis`, `erebus-init` keeps the existing Starknet setup flow.
 `pins` downloads the public inputs over HTTPS:
 
 - the release manifest;
@@ -318,14 +321,14 @@ It checks the manifests against the authorization. Confirm the publisher address
 
 ```sh
 B="$PWD/erebus-metropolis/bin"
-python3 packaging/metropolis/operator_init.py pins --version 0.3.0.dev2026101202 --directory ./pins
-python3 packaging/metropolis/operator_init.py init --role buyer --pool wmon --directory ./buyer \
+"$B/erebus-init" --metropolis pins --version 0.3.0.dev2026101202 --directory ./pins
+"$B/erebus-init" --metropolis init --role buyer --pool wmon --directory ./buyer \
   --bin "$B" --pins ./pins --deployment ./pins/monad-testnet-shielded-v2.json \
   --endpoint 127.0.0.1:9101 --rpc-url https://testnet-rpc.monad.xyz --peer-rpc-url https://rpc.ankr.com/monad_testnet \
   --signer-address <your funded gas address> --transaction-key-file <owner-only gas key file> \
   --maximum-price <base units>
 # send ./buyer/share to the seller; after receiving the seller's share (including offer.json):
-python3 packaging/metropolis/operator_init.py connect --directory ./buyer --peer-share ./seller-share \
+"$B/erebus-init" --metropolis connect --directory ./buyer --peer-share ./seller-share \
   --resource dataset.snapshot.v1 --amount <opening price>
 ```
 

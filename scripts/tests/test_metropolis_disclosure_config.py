@@ -18,7 +18,7 @@ def load(name, relative):
     return module
 
 
-config = load("metropolis_disclosure_config", "packaging/metropolis/disclosure_config.py")
+config = load("metropolis_disclosure_config", "mcp-server/src/erebus_mcp/metropolis_setup/disclosure_config.py")
 registry = load("metropolis_registry_schema", "scripts/build-metropolis-registry.py")
 PIN = "0" * 63 + "1"
 

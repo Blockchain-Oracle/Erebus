@@ -12,7 +12,7 @@ from types import SimpleNamespace
 import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
-spec = importlib.util.spec_from_file_location("metropolis_operator_init", ROOT / "packaging/metropolis/operator_init.py")
+spec = importlib.util.spec_from_file_location("metropolis_operator_init", ROOT / "mcp-server/src/erebus_mcp/metropolis_setup/operator_init.py")
 init = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(init)
 

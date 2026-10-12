@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
-spec = importlib.util.spec_from_file_location("metropolis_stage_artifacts", ROOT / "packaging/metropolis/stage_artifacts.py")
+spec = importlib.util.spec_from_file_location("metropolis_stage_artifacts", ROOT / "mcp-server/src/erebus_mcp/metropolis_setup/stage_artifacts.py")
 staging = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(staging)
 BASE = "https://github.com/PoulavBhowmick03/erebus-metropolis/releases/download/artifacts-test"
