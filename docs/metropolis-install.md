@@ -367,8 +367,13 @@ The script lives in the repository, not in the wheels.
 
 `.github/workflows/metropolis-public-install.yml` runs the same check on native `macos-14` and
 `ubuntu-latest` runners, dispatch-only and read-only. It regenerates synthetic per-pool witnesses from the
-hosted artifacts. It has not been dispatched yet. Locally on macOS arm64, version `0.3.0.dev2026101202`
-verified: 16 commands matched, both pools proved, and both wrong-publisher attempts were refused.
+hosted artifacts. Because GitHub only dispatches workflows present on the default branch, run it as
+`Metropolis registry` with `public_install_version=<version>`; that skips build, compare and publish.
+[Run 38255174875](https://github.com/PoulavBhowmick03/Erebus/actions/runs/38255174875) verified `0.3.0.dev2026101202`
+on native `macos-14` and `ubuntu-latest`. On both, all 16 installed commands matched release manifest
+`f5a98837…`, deposit, transfer and withdrawal proved for WMON and USDC over public HTTPS from empty caches
+with the pinned publisher, and a wrong publisher was refused. Transfer proving took about 6.1–6.8 s on macOS
+and 8.7–8.8 s on Linux. These runs used synthetic witnesses and sent no transactions.
 
 ### Read-only demo
 
