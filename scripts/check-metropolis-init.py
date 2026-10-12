@@ -93,6 +93,61 @@ def require(condition: bool, message: str) -> None:
         raise ValueError(message)
 
 
+INTERRUPT = """
+import os, sys
+from pathlib import Path
+from erebus_mcp.metropolis_setup import operator_init as init
+real = os.replace
+def failing(source, target):
+    if Path(target).name == "payment.json":
+        raise OSError("injected interruption")
+    return real(source, target)
+init.os.replace = failing
+sys.exit(init.main(sys.argv[1:]))
+"""
+
+
+def policy_and_endpoint_rehearsal(bins: Path, work: Path, buyer: Path, pool: str) -> dict:
+    """Installed wallet-policy refusals, endpoint change, interrupted-change recovery and damaged-config doctor."""
+    refusals = {}
+    for name, extra in (("withdraw_without_recipient", ["--allow", "withdraw"]),
+                        ("replace_without_fee_caps", ["--allow", "replace"]),
+                        ("wrap_outside_wmon", ["--allow", "wrap"]) if pool != "wmon" else ("zero_cap", ["--maximum-amount", "0"])):
+        arguments = ["--metropolis", "wallet-policy", "--directory", str(buyer), "--maximum-amount", "1000", *extra]
+        refusals[name] = run(bins, work, arguments).get("status") == "error"
+    require(all(refusals.values()), f"{pool} wallet-policy refusals: {refusals}")
+    wallet = json.loads((buyer / "wallet.json").read_text())
+    original = (wallet["rpc_url"], wallet["peer_rpc_url"])
+    swapped = run(bins, work, ["--metropolis", "endpoints", "--directory", str(buyer), "--rpc-url", original[1], "--peer-rpc-url", original[0]])
+    require(swapped.get("status") == "changed" and swapped.get("wallet_opens") is True, f"{pool} endpoint change: {swapped}")
+    payment = json.loads((buyer / "payment.json").read_text())
+    require((payment["rpc_url"], payment["peer_rpc_url"]) == (original[1], original[0]) and "relay" not in payment,
+            f"{pool} payment endpoints not updated consistently")
+    interrupted = subprocess.run([str(bins / "python"), "-I", "-c", INTERRUPT, "endpoints", "--directory", str(buyer),
+                                  "--rpc-url", original[0], "--peer-rpc-url", original[1]], capture_output=True, text=True, timeout=300,
+                                 env={"PATH": f"{bins}:/usr/bin:/bin", "HOME": str(work / "home")})
+    require((buyer / ".endpoint-change/journal.json").exists(), f"{pool} interruption left no journal: {interrupted.stdout[-300:]}")
+    flagged = run(bins, work, ["--metropolis", "doctor", "--directory", str(buyer), "--offline"])
+    require(any("incomplete" in problem for problem in flagged.get("problems", [])), f"{pool} doctor missed the interrupted change")
+    resumed = run(bins, work, ["--metropolis", "endpoints", "--directory", str(buyer), "--resume"])
+    require(resumed.get("status") == "resumed" and resumed.get("applied_now") == ["payment.json"], f"{pool} resume: {resumed}")
+    restored = json.loads((buyer / "payment.json").read_text())
+    require((restored["rpc_url"], restored["peer_rpc_url"]) == original and not (buyer / ".endpoint-change").exists(),
+            f"{pool} endpoints after resume")
+    damaged = buyer / "wallet.json"
+    saved = damaged.read_bytes()
+    damaged.write_text("{damaged")
+    try:
+        sick = run(bins, work, ["--metropolis", "doctor", "--directory", str(buyer), "--offline"])
+    finally:
+        damaged.write_bytes(saved)
+    require(sick.get("status") == "attention" and "{damaged" not in json.dumps(sick), f"{pool} doctor on damaged wallet.json: {sick}")
+    healthy = run(bins, work, ["--metropolis", "doctor", "--directory", str(buyer), "--offline"])
+    require(healthy.get("status") == "healthy", f"{pool} doctor after recovery: {healthy}")
+    return {"policy_refusals": refusals, "endpoint_change": "changed and swapped back via interrupted change + resume",
+            "doctor_on_damaged_wallet": sick.get("status"), "doctor_after_recovery": healthy.get("status")}
+
+
 def pool_flow(bins: Path, work: Path, pins: Path, pool: str, port_base: int, online: bool) -> dict:
     root = work / pool
     root.mkdir()
@@ -143,6 +198,7 @@ def pool_flow(bins: Path, work: Path, pins: Path, pool: str, port_base: int, onl
                         "wallet_policy_default": policy.get("allowed_methods"),
                         "deposit_opt_in": funding.get("status"), "wallet_deposit_references": capabilities.get("deposit_operation_references") is True,
                         "doctor_checks": {k: v for k, v in doctor.get("checks", {}).items() if k != "owner_only"}}
+    report["buyer"].update(policy_and_endpoint_rehearsal(bins, work, root / "buyer", pool))
     service = subprocess.Popen([str(bins / "erebus-access-service")], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                env={"PATH": f"{bins}:/usr/bin:/bin", "HOME": str(work / "home"),
                                     "EREBUS_ACCESS_CONFIG": str(root / "seller/access.json")})

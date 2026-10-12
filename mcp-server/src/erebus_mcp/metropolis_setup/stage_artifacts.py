@@ -161,6 +161,11 @@ def stage(bundle: Path, pin: str, base_url: str, output: Path, domain_name: str 
     return record
 
 
+def _request(url: str) -> urllib.request.Request:
+    """Hosted downloads carry an explicit User-Agent; some hosts and RPC providers reject library defaults."""
+    return urllib.request.Request(url, headers={"user-agent": "erebus-metropolis-packaging"})
+
+
 def verify(staged: Path, opener=urllib.request.urlopen) -> dict:
     manifest = json.loads((staged / "manifest.json").read_bytes())
     results = []
@@ -169,7 +174,7 @@ def verify(staged: Path, opener=urllib.request.urlopen) -> dict:
             record = circuit[field]
             require_hostable_base_url(record["url"].rsplit("/", 1)[0] + "/")
             digest, size = hashlib.sha256(), 0
-            with opener(record["url"], timeout=60) as response:
+            with opener(_request(record["url"]), timeout=60) as response:
                 while chunk := response.read(1 << 20):
                     size += len(chunk)
                     if size > record["bytes"]:
@@ -184,7 +189,7 @@ def verify(staged: Path, opener=urllib.request.urlopen) -> dict:
 def download(url: str, limit: int, opener=urllib.request.urlopen) -> bytes:
     require_hostable_base_url(url.rsplit("/", 1)[0] + "/")
     chunks, size = [], 0
-    with opener(url, timeout=60) as response:
+    with opener(_request(url), timeout=60) as response:
         while chunk := response.read(1 << 20):
             size += len(chunk)
             if size > limit:

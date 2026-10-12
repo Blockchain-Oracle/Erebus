@@ -88,11 +88,14 @@ def test_verify_reports_hosted_only_when_every_download_matches(tmp_path):
             return False
 
     def serve(url, timeout):
+        assert url.get_header("User-agent")  # every hosted download names its client
+        url = url.full_url
         return Response((files / url.rsplit("/", 1)[1]).read_bytes())
 
     assert staging.verify(tmp_path / "out", serve)["hosted"] is True
 
     def tampered(url, timeout):
+        url = url.full_url
         return Response(b"x" if url.endswith("transfer.zkey") else (files / url.rsplit("/", 1)[1]).read_bytes())
 
     result = staging.verify(tmp_path / "out", tampered)
@@ -519,6 +522,7 @@ def test_hosted_checks_accept_any_recorded_domain_and_label_unrecorded_fixture_d
 def serve_staged(staged):
     """An opener answering staged release-asset URLs from the staged files directory."""
     def opener(url, timeout=60):
+        url = getattr(url, "full_url", url)
         return io.BytesIO((staged / "files" / url.rsplit("/", 1)[1]).read_bytes())
     return opener
 

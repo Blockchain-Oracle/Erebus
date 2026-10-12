@@ -235,7 +235,9 @@ def test_pins_downloads_over_https_from_the_release_commit_and_checks_manifests(
         f"{init.REGISTRY}/artifacts-x/manifest-wmon.json": manifest,
         f"{init.REGISTRY}/artifacts-x/manifest-wmon.signature.json": b"{}",
     }
-    opener = lambda url, timeout=120: io.BytesIO(served[url])
+    def opener(url, timeout=120):
+        assert url.get_header("User-agent", "").startswith("erebus-init/")
+        return io.BytesIO(served[url.full_url])
     result = init.pins(SimpleNamespace(version="0.3.0.dev1", directory=tmp_path / "pins"), opener)
     assert result["source_commit"] == commit and sorted(result["files"]) == sorted(p.name for p in (tmp_path / "pins").iterdir())
     served[f"{init.REGISTRY}/artifacts-x/manifest-wmon.json"] = b'{"settlement_contract": "0x99"}'
@@ -400,3 +402,135 @@ def test_sponsored_buyer_pins_the_relay_and_holds_no_transaction_key(world, monk
                                 "sponsor_address": "0x" + "5a" * 20, "timeout_seconds": 60}
     if (ROOT / "sdk/shielded/src/relay_client.rs").exists():
         assert set(payment["relay"]) <= rust_fields("sdk/shielded/src/relay_client.rs", "pub struct RelayEndpoint")
+
+
+def connected_buyer_and_seller(world):
+    for role in ("buyer", "seller"):
+        init.init(init_args(world, role))
+    init.connect(connect_args(world, "seller"))
+    init.connect(connect_args(world, "buyer"))
+
+
+def offline_chain(monkeypatch, passed=True, chain=10143):
+    monkeypatch.setattr(init, "network_check", lambda bins, url, cwd: {"passed": passed, "chain_id": chain})
+    real = init.command
+
+    def fake(bins, name, request, cwd):
+        if name == "erebus-wallet" and request.get("method") == "notes":
+            json.loads(Path(request["config_file"]).read_text())
+            return {"status": "ok", "result": {"notes": [], "operations": []}}
+        return real(bins, name, request, cwd)
+    monkeypatch.setattr(init, "command", fake)
+
+
+def endpoint_args(world, role, **changes):
+    values = dict(directory=world.root / role, rpc_url="https://c.example.net/", peer_rpc_url="https://d.example.net/",
+                  bin=None, resume=False, abort=False)
+    values.update(changes)
+    return SimpleNamespace(**values)
+
+
+def test_endpoint_change_updates_every_config_consistently_and_preserves_everything_else(world, monkeypatch):
+    connected_buyer_and_seller(world)
+    offline_chain(monkeypatch)
+    seller = world.root / "seller"
+    before_access = json.loads((seller / "access.json").read_text())
+    state_files = {p: p.read_bytes() for p in (seller / "state").rglob("*") if p.is_file()}
+    result = init.endpoints(endpoint_args(world, "seller"))
+    assert result["status"] == "changed" and result["configs"] == ["wallet.json", "access.json"] and result["transactions_sent"] == 0
+    wallet, access = json.loads((seller / "wallet.json").read_text()), json.loads((seller / "access.json").read_text())
+    assert (wallet["rpc_url"], wallet["peer_rpc_url"]) == ("https://c.example.net/", "https://d.example.net/")
+    assert (access["backend"]["rpc_url"], access["backend"]["peer_rpc_url"]) == ("https://c.example.net/", "https://d.example.net/")
+    assert {k: v for k, v in access.items() if k != "backend"} == {k: v for k, v in before_access.items() if k != "backend"}
+    assert {p: p.read_bytes() for p in (seller / "state").rglob("*") if p.is_file()} == state_files
+    assert all(owner_only(seller / name) for name in ("wallet.json", "access.json")) and not (seller / ".endpoint-change").exists()
+    buyer = init.endpoints(endpoint_args(world, "buyer"))
+    assert buyer["configs"] == ["wallet.json", "payment.json"]
+    assert "relay" not in json.loads((world.root / "buyer/payment.json").read_text())
+
+
+@pytest.mark.parametrize("changes,message", [
+    (dict(peer_rpc_url="https://c.example.net"), "must differ"),
+    (dict(rpc_url="http://c.example.net/"), "https"),
+    (dict(rpc_url="https://user:pw@c.example.net/"), "credentials"),
+    (dict(rpc_url=None), "needs --rpc-url"),
+])
+def test_endpoint_change_refuses_bad_endpoints_without_touching_configs(world, monkeypatch, changes, message):
+    connected_buyer_and_seller(world)
+    offline_chain(monkeypatch)
+    before = (world.root / "buyer/wallet.json").read_bytes()
+    with pytest.raises(ValueError, match=message):
+        init.endpoints(endpoint_args(world, "buyer", **changes))
+    assert (world.root / "buyer/wallet.json").read_bytes() == before and not (world.root / "buyer/.endpoint-change").exists()
+
+
+def test_endpoint_change_refuses_endpoints_failing_the_chain_check(world, monkeypatch):
+    connected_buyer_and_seller(world)
+    offline_chain(monkeypatch, passed=True, chain=1)
+    before = (world.root / "buyer/payment.json").read_bytes()
+    with pytest.raises(ValueError, match="chain 10143; nothing changed"):
+        init.endpoints(endpoint_args(world, "buyer"))
+    assert (world.root / "buyer/payment.json").read_bytes() == before
+
+
+def test_an_interrupted_endpoint_change_resumes_or_aborts_exactly(world, monkeypatch):
+    connected_buyer_and_seller(world)
+    offline_chain(monkeypatch)
+    buyer = world.root / "buyer"
+    originals = {name: (buyer / name).read_bytes() for name in ("wallet.json", "payment.json")}
+    real_replace, calls = init.os.replace, []
+
+    def crash_after_first(source, target):
+        calls.append(Path(target).name)
+        if Path(target).name == "payment.json":
+            raise OSError("power lost")
+        return real_replace(source, target)
+    monkeypatch.setattr(init.os, "replace", crash_after_first)
+    with pytest.raises(OSError):
+        init.endpoints(endpoint_args(world, "buyer"))
+    monkeypatch.setattr(init.os, "replace", real_replace)
+    assert json.loads((buyer / "wallet.json").read_text())["rpc_url"] == "https://c.example.net/"
+    assert (buyer / "payment.json").read_bytes() == originals["payment.json"]
+    assert "endpoint change is incomplete" in " ".join(init.doctor(SimpleNamespace(directory=buyer, offline=True))["problems"])
+    with pytest.raises(ValueError, match="already staged"):
+        init.endpoints(endpoint_args(world, "buyer"))
+    aborted = init.endpoints(endpoint_args(world, "buyer", rpc_url=None, peer_rpc_url=None, abort=True))
+    assert aborted["status"] == "aborted" and {name: (buyer / name).read_bytes() for name in originals} == originals
+    monkeypatch.setattr(init.os, "replace", crash_after_first)
+    with pytest.raises(OSError):
+        init.endpoints(endpoint_args(world, "buyer"))
+    monkeypatch.setattr(init.os, "replace", real_replace)
+    resumed = init.endpoints(endpoint_args(world, "buyer", rpc_url=None, peer_rpc_url=None, resume=True))
+    assert resumed["status"] == "resumed" and resumed["applied_now"] == ["payment.json"]
+    assert json.loads((buyer / "payment.json").read_text())["peer_rpc_url"] == "https://d.example.net/"
+    assert not (buyer / ".endpoint-change").exists() and owner_only(buyer / "payment.json")
+
+
+def test_doctor_reports_damaged_configs_without_crashing_or_echoing_contents(world, monkeypatch):
+    init.init(init_args(world, "buyer"))
+    offline_chain(monkeypatch)
+    buyer = world.root / "buyer"
+    (buyer / "wallet.json").write_text("{not json: secret-ish-content")
+    report = init.doctor(SimpleNamespace(directory=buyer, offline=True))
+    assert report["status"] == "attention" and "secret-ish-content" not in json.dumps(report)
+    assert any("wallet.json is missing or damaged" in problem for problem in report["problems"])
+    (buyer / "operator.json").write_text("[]")
+    assert init.doctor(SimpleNamespace(directory=buyer, offline=True))["status"] == "attention"
+
+
+def test_doctor_separates_balance_failures_from_the_network_verdict(world, monkeypatch):
+    init.init(init_args(world, "buyer"))
+    offline_chain(monkeypatch)
+
+    def refused(url, address, opener=None):
+        raise OSError("403")
+    monkeypatch.setattr(init, "rpc_balance", refused)
+    report = init.doctor(SimpleNamespace(directory=world.root / "buyer", offline=False))
+    endpoints = report["checks"]["endpoints"]
+    assert all(entry["passed"] is True and entry["signer_balance_wei"] is None for entry in endpoints.values())
+    assert sum("balance read failed" in problem for problem in report["problems"]) == 2
+
+
+def test_operator_requests_carry_an_explicit_user_agent():
+    request = init.request("https://rpc.example.net/", b"{}", {"content-type": "application/json"})
+    assert request.get_header("User-agent").startswith("erebus-init/")

@@ -411,8 +411,15 @@ one. `wallet-policy` writes an owner-only `wallet-policy.json` and adds `EREBUS_
 `erebus-wallet` advertises durable operation references for it. Releases up to `0.3.0.dev2026101202` advertise
 none, so those get reads only. It refuses `wrap`/`unwrap` outside the WMON pool, `withdraw` without named
 recipients, and `replace` without fee caps. `--allow status` adds the read-only paired account diagnostic, but
-only when the installed wallet advertises `paired_account_diagnostics`. The MCP wallet tools ship only in releases that include them. `doctor` reports an unfunded signer until it holds testnet MON. To change RPC endpoints there is no
-installed command yet; see "Operations rehearsals" below.
+only when the installed wallet advertises `paired_account_diagnostics`. The MCP wallet tools ship only in releases that include them. `doctor` reports an unfunded signer until it holds testnet MON. To change RPC endpoints, run
+`erebus-init --metropolis endpoints --directory DIR --rpc-url <primary> --peer-rpc-url <peer>`. Before
+changing anything, it checks both endpoints with the installed network check for chain 10143. It then
+stages new and original copies of every config that names endpoints (`wallet.json`, `payment.json`,
+`access.json`, an auditor's `disclosure.json`) and replaces them atomically. Wallet notes, checkpoints, keys
+and every other setting are left untouched. After an interruption, `doctor` reports the change as
+incomplete; `endpoints --resume` finishes it and `endpoints --abort` restores the saved originals. It never
+signs or sends anything. Operator HTTPS and JSON-RPC requests send an explicit `erebus-init/<version>`
+User-Agent. Some providers, such as `rpc-testnet.monadinfra.com`, reject library defaults.
 
 ### Installed-init and operations qualification
 
@@ -429,10 +436,9 @@ unpublished candidate `0.3.0.dev2026101301` built from clean commit `ab6dc3b` (i
 native binaries are byte-identical to the published `0.3.0.dev2026101202`. Rollback to `0.3.0.dev2026101202`
 kept the operator's files, binaries and wallet working; that version predates `erebus-init --metropolis`.
 
-Open items:
-- `doctor` misreports an RPC that rejects Python's default User-Agent (seen with
-  `rpc-testnet.monadinfra.com`), and errors instead of warning on a damaged `wallet.json`;
-- endpoint changes need an installed command; the rehearsal rewrites the configs itself.
+`doctor` never raises on damaged state. A missing or damaged `operator.json`, `wallet.json` or other
+config is reported as "attention" with a fixed description, never its contents. A provider's balance read
+failure is reported separately from its network-check verdict.
 
 Native CI for this candidate and any release need `ab6dc3b` on the remote and a new authorization.
 

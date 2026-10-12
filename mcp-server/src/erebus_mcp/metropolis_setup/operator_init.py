@@ -66,6 +66,20 @@ COMMANDS = ("erebus-negotiate", "erebus-payment", "erebus-wallet", "erebus-acces
             "erebus-shielded-disclosure", "erebus-artifacts", "erebus-local-prove", "erebus-mcp-server")
 ADDRESS = re.compile(r"0x[0-9a-f]{40}", re.ASCII)
 HEX64 = re.compile(r"[0-9a-f]{64}", re.ASCII)
+
+
+def user_agent() -> str:
+    """Explicit User-Agent for every operator HTTPS/JSON-RPC request; some providers reject library defaults."""
+    try:
+        from importlib.metadata import version
+        return f"erebus-init/{version('erebus-mcp-server')}"
+    except Exception:  # running from a checkout without the installed distribution
+        return "erebus-init/source"
+
+
+def request(url: str, body: bytes | None = None, headers: dict | None = None):
+    import urllib.request
+    return urllib.request.Request(url, body, {"user-agent": user_agent(), **(headers or {})})
 UNSIGNED = re.compile(r"[0-9]{1,78}", re.ASCII)
 GAS = {"gas_limit": 3000000, "max_fee_per_gas": "300000000000", "max_priority_fee_per_gas": "2000000000"}
 
@@ -166,7 +180,7 @@ def https(url: str, opener=None) -> bytes:
     import urllib.request
     if not url.startswith("https://"):
         raise ValueError("pins are downloaded over https only")
-    with (opener or urllib.request.urlopen)(url, timeout=120) as response:
+    with (opener or urllib.request.urlopen)(request(url), timeout=120) as response:
         data = response.read((8 << 20) + 1)
     if len(data) > 8 << 20:
         raise ValueError(f"unexpectedly large download: {url}")
@@ -437,10 +451,10 @@ def release_pins_from(operator: dict) -> dict:
                                     "binaries": {name: {"sha256": digest} for name, digest in operator["binaries_sha256"].items()}}}}
 
 
-def rpc_balance(url: str, address: str) -> int:
+def rpc_balance(url: str, address: str, opener=None) -> int:
     import urllib.request
     body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "eth_getBalance", "params": [address, "finalized"]}).encode()
-    with urllib.request.urlopen(urllib.request.Request(url, body, {"content-type": "application/json"}), timeout=30) as response:
+    with (opener or urllib.request.urlopen)(request(url, body, {"content-type": "application/json"}), timeout=30) as response:
         return int(json.loads(response.read(1 << 16))["result"], 16)
 
 
@@ -452,62 +466,224 @@ def network_check(bins: Path, url: str, cwd: Path) -> dict:
     return json.loads(result.stdout)
 
 
-def doctor(args) -> dict:
+ENDPOINT_STAGING = ".endpoint-change"
+ENDPOINT_JOURNAL = f"{ENDPOINT_STAGING}/journal.json"
+# Generated configs that name RPC endpoints, and where the pair lives inside each.
+ENDPOINT_CONFIGS = {"wallet.json": (), "payment.json": (), "access.json": ("backend",), "disclosure.json": ()}
+
+
+def endpoint_url(url: str) -> str:
+    parts = urllib.parse.urlsplit(url)
+    loopback = parts.hostname in {"127.0.0.1", "localhost", "::1"}
+    if not parts.hostname or parts.username or parts.password or parts.query or parts.fragment \
+            or not (parts.scheme == "https" or (parts.scheme == "http" and loopback)):
+        raise ValueError("RPC endpoints must be https (http only on loopback) without credentials, query or fragment")
+    return url
+
+
+def file_digest(path: Path) -> str | None:
+    return sha256(path) if path.is_file() else None
+
+
+def endpoints(args) -> dict:
+    """Change the primary and peer RPC endpoints of every generated config in one operator or auditor directory.
+
+    Both endpoints are checked read-only with the installed network check for chain 10143 before anything changes.
+    New and original copies are staged owner-only with a journal, then each config is replaced atomically; an
+    interrupted change is finished with --resume or undone with --abort. Wallet notes, checkpoints, keys and every
+    other setting are left untouched. Nothing is signed or sent."""
     directory = args.directory.resolve()
-    operator = json.loads((directory / "operator.json").read_text())
-    bins = Path(operator["bin"])
+    staging = directory / ENDPOINT_STAGING
+    journal_path = directory / ENDPOINT_JOURNAL
+    operator = read_config(directory / "operator.json")
+    bins = Path(operator["bin"]) if operator and "bin" in operator else (args.bin.resolve() if args.bin else None)
+    if bins is None:
+        raise ValueError("an auditor directory needs --bin (the installed release bin directory)")
+    if operator is not None:
+        verify_installed(bins, release_pins_from(operator))
+
+    def apply(journal: dict) -> list[str]:
+        applied = []
+        for entry in journal["files"]:
+            target, staged = directory / entry["name"], staging / f"{entry['name']}.new"
+            if file_digest(target) == entry["new_sha256"]:
+                continue
+            if file_digest(staged) != entry["new_sha256"]:
+                raise ValueError(f"staged {entry['name']} is missing or changed; run --abort")
+            os.replace(staged, target)
+            applied.append(entry["name"])
+        return applied
+
+    def finish(journal: dict, action: str, applied: list[str]) -> dict:
+        wallet_opens = None
+        if (directory / "wallet.json").exists():
+            notes = command(bins, "erebus-wallet", {"method": "notes", "config_file": str(directory / "wallet.json")}, directory)
+            wallet_opens = notes.get("status") == "ok"
+        shutil.rmtree(staging)
+        return {"status": action, "directory": str(directory), "rpc_url": journal["rpc_url"],
+                "peer_rpc_url": journal["peer_rpc_url"], "configs": [entry["name"] for entry in journal["files"]],
+                "applied_now": applied, "wallet_opens": wallet_opens, "transactions_sent": 0}
+
+    if args.resume or args.abort:
+        journal = read_config(journal_path)
+        if journal is None:
+            raise ValueError("no interrupted endpoint change to resume or abort")
+        if args.abort:
+            restored = []
+            for entry in journal["files"]:
+                original = staging / f"{entry['name']}.orig"
+                if file_digest(original) != entry["old_sha256"]:
+                    raise ValueError(f"the saved original of {entry['name']} is missing or changed")
+                if file_digest(directory / entry["name"]) != entry["old_sha256"]:
+                    temporary = directory / f".{entry['name']}.restore"
+                    shutil.copyfile(original, temporary)
+                    temporary.chmod(0o600)
+                    os.replace(temporary, directory / entry["name"])
+                    restored.append(entry["name"])
+            journal = {**journal, "rpc_url": journal["old_rpc_url"], "peer_rpc_url": journal["old_peer_rpc_url"]}
+            return finish(journal, "aborted", restored)
+        return finish(journal, "resumed", apply(journal))
+
+    if journal_path.exists() or staging.exists():
+        raise ValueError("an endpoint change is already staged; run --resume or --abort first")
+    if not args.rpc_url or not args.peer_rpc_url:
+        raise ValueError("a new endpoint change needs --rpc-url and --peer-rpc-url")
+    primary, peer = endpoint_url(args.rpc_url), endpoint_url(args.peer_rpc_url)
+    if primary.rstrip("/") == peer.rstrip("/"):
+        raise ValueError("the primary and peer RPC endpoints must differ")
+    for label, url in (("--rpc-url", primary), ("--peer-rpc-url", peer)):
+        check = network_check(bins, url, directory)
+        if check.get("passed") is not True or check.get("chain_id") not in (None, NAMESPACE_CHAIN):
+            raise ValueError(f"{label} did not pass the installed network check for chain {NAMESPACE_CHAIN}; nothing changed")
+    changes, old_pair = [], None
+    for name, nesting in ENDPOINT_CONFIGS.items():
+        path = directory / name
+        if not path.exists():
+            continue
+        data = read_config(path)
+        if data is None:
+            raise ValueError(f"{name} is damaged; restore it before changing endpoints")
+        holder = data
+        for key in nesting:
+            holder = holder[key]
+        if "rpc_url" not in holder or "peer_rpc_url" not in holder:
+            raise ValueError(f"{name} does not carry an endpoint pair")
+        old_pair = old_pair or (holder["rpc_url"], holder["peer_rpc_url"])
+        holder["rpc_url"], holder["peer_rpc_url"] = primary, peer
+        changes.append((name, path, data))
+    if not changes:
+        raise ValueError("no generated config with RPC endpoints in this directory")
+    staging.mkdir(mode=0o700)
+    entries = []
+    for name, path, data in changes:
+        shutil.copyfile(path, staging / f"{name}.orig")
+        (staging / f"{name}.orig").chmod(0o600)
+        private_json(staging / f"{name}.new", data)
+        entries.append({"name": name, "old_sha256": sha256(path), "new_sha256": sha256(staging / f"{name}.new")})
+    journal = {"version": 1, "rpc_url": primary, "peer_rpc_url": peer, "old_rpc_url": old_pair[0],
+               "old_peer_rpc_url": old_pair[1], "files": entries}
+    private_json(staging / "journal.tmp", journal)
+    os.replace(staging / "journal.tmp", journal_path)
+    return finish(journal, "changed", apply(journal))
+
+
+def read_config(path: Path) -> dict | None:
+    """A generated JSON config, or None when it is missing, unreadable or not a JSON object (contents never echoed)."""
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def doctor(args) -> dict:
+    """Read-only, secret-free health report. It never raises on damaged state and never reports a damaged
+    operator as healthy; file contents are never printed, only fixed problem descriptions."""
+    directory = args.directory.resolve()
     checks, problems = {}, []
+    operator = read_config(directory / "operator.json")
+    required = ("bin", "role", "pool", "release_version", "signer_address", "binaries_sha256", "operator", "hosting_manifest_sha256")
+    if operator is None or any(key not in operator for key in required):
+        return {"status": "attention", "role": None, "pool": None, "checks": {},
+                "problems": ["operator.json is missing or damaged; restore it from backup or re-run init in a new directory"],
+                "secrets_printed": False}
+    bins = Path(operator["bin"])
 
     def owner_only(path: Path, directory_expected: bool = False) -> bool:
-        info = path.lstat()
+        try:
+            info = path.lstat()
+        except OSError:
+            return False
         kind_ok = stat.S_ISDIR(info.st_mode) if directory_expected else stat.S_ISREG(info.st_mode)
         return kind_ok and not stat.S_IMODE(info.st_mode) & 0o077
 
     try:
         verify_installed(bins, release_pins_from(operator))
         checks["installed_commands"] = "match the release"
-    except ValueError as error:
-        problems.append(str(error))
-    configs = [name for name in ("wallet.json", "payment.json", "negotiate.json", "access.json", "mcp.json", "operator.json")
-               if (directory / name).exists()]
+    except (OSError, ValueError, KeyError) as error:
+        problems.append(str(error) if isinstance(error, ValueError) else "installed commands could not be checked")
+    configs = [name for name in ("wallet.json", "payment.json", "negotiate.json", "access.json", "mcp.json", "operator.json",
+                                 "wallet-policy.json") if (directory / name).exists()]
     keys = [Path(path) for name, path in operator["operator"].items() if name.endswith("_file") and "descriptor" not in name]
-    wallet = json.loads((directory / "wallet.json").read_text())
-    if wallet.get("transaction_key_file"):
+    wallet = read_config(directory / "wallet.json")
+    damaged = [name for name in configs if read_config(directory / name) is None]
+    if damaged:
+        problems.append(f"damaged or unreadable configs (contents not shown): {damaged}")
+    if wallet is not None and wallet.get("transaction_key_file"):
         keys.append(Path(wallet["transaction_key_file"]))
     loose = [str(path.relative_to(directory)) if path.is_relative_to(directory) else path.name
-             for path in [directory / name for name in configs] + keys if not path.exists() or not owner_only(path)]
+             for path in [directory / name for name in configs] + keys if not owner_only(path)]
     loose += [name for name in ("state", "keys", "share") if not owner_only(directory / name, True)]
     if loose:
         problems.append(f"not owner-only or missing: {loose}")
     checks["owner_only"] = {"configs": len(configs), "key_files": len(keys), "problems": loose}
-    manifest = Path(wallet["artifact_manifest_file"])
-    if sha256(manifest) != wallet["artifact_manifest_sha256"] or wallet["artifact_manifest_sha256"] != operator["hosting_manifest_sha256"]:
-        problems.append("the pinned artifact manifest changed")
-    circuits = json.loads(manifest.read_text())["circuits"]
-    wanted = [circuit[field]["sha256"] for circuit in circuits for field in ("wasm", "r1cs", "zkey")]
-    cache = Path(wallet["artifact_cache_root"])
-    checks["artifact_cache"] = {"cached": sum((cache / f"{digest}.artifact").exists() for digest in wanted), "of": len(wanted),
-                                "note": "missing artifacts download over HTTPS on first proof"}
+    pending = directory / ENDPOINT_JOURNAL
+    if pending.exists():
+        problems.append("an endpoint change is incomplete; run `endpoints --resume` or `endpoints --abort`")
+    wallet_fields = ("artifact_manifest_file", "artifact_manifest_sha256", "artifact_cache_root", "rpc_url", "peer_rpc_url",
+                     "signer_address")
+    if wallet is None or any(key not in wallet for key in wallet_fields):
+        problems.append("wallet.json is missing or damaged; the wallet, cache and endpoint checks were skipped")
+        return {"status": "attention", "role": operator["role"], "pool": operator["pool"],
+                "release_version": operator["release_version"], "signer_address": operator["signer_address"],
+                "checks": checks, "problems": problems, "secrets_printed": False}
+    try:
+        manifest = Path(wallet["artifact_manifest_file"])
+        if sha256(manifest) != wallet["artifact_manifest_sha256"] or wallet["artifact_manifest_sha256"] != operator["hosting_manifest_sha256"]:
+            problems.append("the pinned artifact manifest changed")
+        circuits = json.loads(manifest.read_text())["circuits"]
+        wanted = [circuit[field]["sha256"] for circuit in circuits for field in ("wasm", "r1cs", "zkey")]
+        cache = Path(wallet["artifact_cache_root"])
+        checks["artifact_cache"] = {"cached": sum((cache / f"{digest}.artifact").exists() for digest in wanted), "of": len(wanted),
+                                    "note": "missing artifacts download over HTTPS on first proof"}
+    except (OSError, ValueError, KeyError, TypeError):
+        problems.append("the pinned artifact manifest is missing or unreadable")
     try:
         notes = command(bins, "erebus-wallet", {"method": "notes", "config_file": str(directory / "wallet.json")}, directory)
         checks["wallet"] = {"opens": True, "notes": len(notes["result"]["notes"]), "operations": len(notes["result"]["operations"])}
-    except ValueError as error:
-        problems.append(f"wallet does not open: {error}")
+    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
+        problems.append("the installed wallet does not open this configuration")
     if not args.offline:
         endpoints = {}
         for label in ("rpc_url", "peer_rpc_url"):
             url = wallet[label]
+            entry = {}
             try:
                 check = network_check(bins, url, directory)
-                endpoints[label] = {"passed": check.get("passed"), "finalized": (check.get("finalized") or {}).get("number"),
-                                    "signer_balance_wei": rpc_balance(url, wallet["signer_address"])}
-                if check.get("passed") is not True:
-                    problems.append(f"{label} failed the network check")
-            except (OSError, ValueError, KeyError, subprocess.TimeoutExpired) as error:
-                endpoints[label] = {"passed": False}
-                problems.append(f"{label} unreachable: {type(error).__name__}")
+                entry.update(passed=check.get("passed") is True, finalized=(check.get("finalized") or {}).get("number"))
+                if not entry["passed"]:
+                    problems.append(f"{label} failed the installed network check")
+            except (OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
+                entry["passed"] = False
+                problems.append(f"{label} network check unavailable: {type(error).__name__}")
+            try:
+                entry["signer_balance_wei"] = rpc_balance(url, wallet["signer_address"])
+            except (OSError, ValueError, KeyError, TypeError) as error:
+                entry["signer_balance_wei"] = None
+                problems.append(f"{label} balance read failed: {type(error).__name__}")
+            endpoints[label] = entry
         checks["endpoints"] = endpoints
-        if all(entry.get("signer_balance_wei") == 0 for entry in endpoints.values()):
+        if endpoints and all(entry.get("signer_balance_wei") == 0 for entry in endpoints.values()):
             problems.append("the gas signer has no testnet MON yet")
     return {"status": "healthy" if not problems else "attention", "role": operator["role"], "pool": operator["pool"],
             "release_version": operator["release_version"], "signer_address": operator["signer_address"],
@@ -656,6 +832,14 @@ def main(argv=None) -> int:
                         help="repeatable: a write method, or the optional status read, agents may call; none by default")
     policy.add_argument("--withdrawal-recipient", action="append", default=[], help="repeatable; required with --allow withdraw")
     policy.add_argument("--replacement-fees", nargs=2, metavar=("MAX_FEE", "PRIORITY_FEE"), help="required with --allow replace")
+    change = commands.add_parser("endpoints", help="change the primary and peer RPC endpoints of generated configs")
+    change.add_argument("--directory", type=Path, required=True)
+    change.add_argument("--rpc-url")
+    change.add_argument("--peer-rpc-url")
+    change.add_argument("--bin", type=Path, help="auditor directories only: the installed release bin directory")
+    mode = change.add_mutually_exclusive_group()
+    mode.add_argument("--resume", action="store_true", help="finish an interrupted change")
+    mode.add_argument("--abort", action="store_true", help="restore the configs saved before an interrupted change")
     third = commands.add_parser("auditor")
     third.add_argument("--pool", choices=("wmon", "usdc"), required=True)
     third.add_argument("--directory", type=Path, required=True)
@@ -666,7 +850,7 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     try:
         result = {"pins": pins, "init": init, "connect": connect, "doctor": doctor, "auditor": auditor,
-                  "wallet-policy": wallet_policy}[args.command](args)
+                  "wallet-policy": wallet_policy, "endpoints": endpoints}[args.command](args)
     except (OSError, ValueError, KeyError, TypeError) as error:
         print(json.dumps({"status": "error", "error": str(error) if isinstance(error, ValueError) else type(error).__name__}))
         return 2
