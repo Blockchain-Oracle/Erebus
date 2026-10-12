@@ -44,7 +44,7 @@ class MetropolisSeam:
         try:
             completed = subprocess.run([binary], input=json.dumps(request), capture_output=True,
                                        text=True, check=False, timeout=self._timeout)
-        except (OSError, subprocess.TimeoutExpired):
+        except (OSError, subprocess.TimeoutExpired, UnicodeError):
             raise MetropolisError("native operation unavailable; retain its ID and recover by observation") from None
         if completed.returncode not in {0, 2} or completed.stderr or len(completed.stdout) > 32_768:
             raise MetropolisError("native operation failed; retain its ID and recover by observation")

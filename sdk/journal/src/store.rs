@@ -8,7 +8,7 @@
 
 use core::fmt;
 use std::fs::{File, OpenOptions};
-use std::io::{BufReader, BufWriter, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -124,7 +124,9 @@ impl<R: JournalRecord> Store<R> {
         faults: Arc<dyn FaultHook>,
     ) -> Result<Self, StoreError<R::Id>> {
         let root = root.into();
+        check_path_type(&root, true).map_err(Self::io(&root))?;
         std::fs::create_dir_all(&root).map_err(Self::io(&root))?;
+        check_path_type(&root, true).map_err(Self::io(&root))?;
         set_mode(&root, 0o700).map_err(Self::io(&root))?;
         Ok(Self {
             root,
@@ -181,6 +183,12 @@ impl<R: JournalRecord> Store<R> {
     /// Takes no lock. A caller that must see a stable record holds the id's lock first.
     pub fn read(&self, id: &R::Id) -> Result<Option<R>, StoreError<R::Id>> {
         self.read_path(&self.record_path(id))
+    }
+
+    /// Confirms directory durability before relying on a rename whose writer reported failure.
+    /// Successful writes already sync the directory; readers hold their normal locks here.
+    pub fn sync(&self) -> Result<(), StoreError<R::Id>> {
+        self.sync_dir()
     }
 
     /// Every record in the journal, in unspecified order.
@@ -254,7 +262,11 @@ impl<R: JournalRecord> Store<R> {
     /// file is then [`Corruption::MissingBlob`], never "nothing stored".
     pub fn read_blob(&self, id: &R::Id, attempt: usize) -> Result<Vec<u8>, StoreError<R::Id>> {
         let path = self.blob_path(id, attempt);
-        std::fs::read(&path).map_err(|error| Self::blob_error(path, error))
+        let mut bytes = Vec::new();
+        open_regular(&path)
+            .and_then(|mut file| file.read_to_end(&mut bytes))
+            .map_err(|error| Self::blob_error(path, error))?;
+        Ok(bytes)
     }
 
     /// [`Self::read_blob`] for a transaction stored as text. Bytes that are not UTF-8 are an
@@ -265,7 +277,11 @@ impl<R: JournalRecord> Store<R> {
         attempt: usize,
     ) -> Result<String, StoreError<R::Id>> {
         let path = self.blob_path(id, attempt);
-        std::fs::read_to_string(&path).map_err(|error| Self::blob_error(path, error))
+        let mut text = String::new();
+        open_regular(&path)
+            .and_then(|mut file| file.read_to_string(&mut text))
+            .map_err(|error| Self::blob_error(path, error))?;
+        Ok(text)
     }
 
     /// Removes every record `decide` marks [`PruneDecision::Remove`], with its stored
@@ -324,7 +340,7 @@ impl<R: JournalRecord> Store<R> {
     }
 
     fn read_path(&self, path: &Path) -> Result<Option<R>, StoreError<R::Id>> {
-        let file = match File::open(path) {
+        let file = match open_regular(path) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(source) => {
@@ -379,7 +395,8 @@ impl<R: JournalRecord> Store<R> {
             std::process::id(),
             OsRng.next_u64(),
         ));
-        let file = OpenOptions::new()
+        let mut options = private_options();
+        let file = options
             .write(true)
             .create_new(true)
             .open(&temporary)
@@ -437,12 +454,55 @@ impl<R: JournalRecord> Store<R> {
 }
 
 fn open_lock(path: &Path) -> std::io::Result<File> {
-    OpenOptions::new()
+    check_path_type(path, false)?;
+    let file = private_options()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
-        .open(path)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::other("journal lock is not a regular file"));
+    }
+    Ok(file)
+}
+
+// Parent directories and the journal owner must be trusted. These checks reject existing
+// links/special files, not concurrent namespace replacement by a compromised local owner.
+fn check_path_type(path: &Path, directory: bool) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata)
+            if if directory {
+                metadata.is_dir()
+            } else {
+                metadata.is_file()
+            } =>
+        {
+            Ok(())
+        }
+        Ok(_) => Err(std::io::Error::other("invalid journal path type")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn open_regular(path: &Path) -> std::io::Result<File> {
+    check_path_type(path, false)?;
+    let file = File::open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::other("journal entry is not a regular file"));
+    }
+    Ok(file)
+}
+
+fn private_options() -> OpenOptions {
+    let mut options = OpenOptions::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options
 }
 
 /// Removes a path, treating "already gone" as success.

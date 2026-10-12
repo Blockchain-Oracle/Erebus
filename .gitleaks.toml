@@ -1,6 +1,14 @@
 [extend]
 useDefault = true
 
+# These public spend secrets are reproducible conformance vectors, never operator keys.
+[[allowlists]]
+description = "Exact deterministic M5 note-vector spend secrets"
+condition = "AND"
+regexTarget = "line"
+paths = ['''(?:^|/)sdk/core/tests/fixtures/m5-note-vector\.json$''']
+regexes = ['''"spendSecretHex"\s*:\s*"(?:0182c996f69200665dc3f75a04f6f370c62e184e7b106fb66350c993b4edca01|14f496f58584c63e2ff60b82e9c51c1fbf04840113d69ed406e4f734b6c4c6d3|2c7d0505f1a684b88f6e1ee803ec1c9f7bd8f138fe7d80ee9faab9db42d7b11c)"''']
+
 # These allowlists require both the exact fixture/source path and a narrow public-data
 # shape. They do not exempt a whole directory or disable the generic API-key rule.
 [[allowlists]]

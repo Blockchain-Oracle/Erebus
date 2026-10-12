@@ -87,6 +87,43 @@ broadcast response, and retrieves the resource. It is a local rehearsal, not a
 live Monad interaction. The live path needs separate participant keys, two RPC
 providers, test-token allowance, faucet gas, and the configuration in the runbooks.
 
+### Use Cases
+
+Both fit the current mechanism: two known parties, one payment from the buyer, an off-chain
+deliverable, and disclosure of one deal.
+
+**Procurement with an audit.** A buyer agent holds a requisition (item, quantity, maximum unit
+price). A supplier agent holds a catalog floor. They negotiate a total, the buyer pays once, and
+one participant grants an auditor a scoped disclosure of that deal. The auditor passes it only if
+it settled, paid what was agreed, and stayed under the buyer's ceiling.
+
+```sh
+uv run python agents/src/erebus_agents/procurement_demo.py --latency 0
+```
+
+That rehearsal runs on the mock client. On the Metropolis rail each operator's files fix the
+price policy, so the deal agents supply only the operation ID (`docs/friction.md` F58). After a
+deal settles, the real disclosure step runs against the participant's durable state:
+
+```sh
+uv run python agents/src/erebus_agents/metropolis_audit.py --operation <op> \
+  --expected-issuer <issuer identity> --expected-commitment <deal commitment> \
+  --issuer-dir <dir> --auditor-dir <fresh dir> --state-root <issuer state> --store-root <store> \
+  --namespace eip155:10143 --issuer-key-file <issuer agreement key> --deployment <deployment.json>
+```
+
+The issuer selects the deal and exports a grant to the auditor's public key. The auditor, with only
+that grant and its own key, verifies the agreement offline and, with `--deployment`, the payment
+against chain data. A payment check that stays pending is not evidence of non-payment, and delivery
+is never verified. Evidence and grant files are create-new; re-issuing a grant takes fresh
+`--evidence-name` and `--grant-name` values.
+
+**Paid API or compute purchase.** The buyer negotiates a price and retrieves the resource through
+the `x402-exact` profile of `metropolis_loop.py`. The seller submits the payment, and only an
+independent auditor verifies it, with the same disclosure step.
+
+Public-bound payments expose the accepted terms and parties. Neither case proves delivery.
+
 ### AI-Assisted Development
 
 Claude, Codex, and OpenCode have assisted with implementation, tests, documentation,
@@ -128,7 +165,7 @@ Monad product, and the observation, catch-up, and lifetime fixes described in th
 | 2026-09-12 | 0.8 STRK | [`0x43329b0f…adcd`](https://starkscan.co/tx/0x43329b0ff5d7865e0be3d4180e608229a5e8fd0d90312f4189f7aa9b8acadcd) |
 
 Amount and recipient are not recoverable from any of them. Every negotiation round is.
-Full ledger and the observer check: [docs/evidence.md](./docs/evidence.md).
+Full ledger and the observer check: [docs/status.md](./docs/status.md).
 
 **[Install the MCP server](#install) · [Add it to your client](#add-it-to-your-mcp-client) · [The thirteen tools](#the-thirteen-tools) · [Docs](#documentation)**
 
@@ -595,7 +632,7 @@ Configuration, the full tool surface, error handling, and the raw CLI protocol a
 | [First product](./docs/product.md) | Agent-to-agent paid work: the four gaps, sequence, and open decisions |
 | [Friction log](./docs/friction.md) | Where the stack fought us, and how we worked around it |
 | [Agent skill](./skills/erebus/) | Operating Erebus from an agent, with unsafe-behavior evals |
-| [Evidence](./docs/evidence.md) | Every mainnet transaction, and the observer check against one |
+| [Evidence](./docs/status.md) | Every mainnet transaction, and the observer check against one |
 | [Run evidence](./docs/runs/) | Real mainnet and Sepolia runs with transaction hashes and timings |
 
 ## Repo layout

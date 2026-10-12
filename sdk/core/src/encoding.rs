@@ -43,9 +43,15 @@ pub enum EncodingError {
 ///
 /// The writer does not enforce schema bounds. Values in this crate are bounded when they are
 /// constructed, so a value that exists is encodable; the reader re-checks every bound.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct Writer {
     buffer: Vec<u8>,
+}
+
+impl core::fmt::Debug for Writer {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str("Writer { <redacted> }")
+    }
 }
 
 impl Writer {
@@ -244,6 +250,23 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn private_encoding_buffers_never_print_their_contents() {
+        let mut writer = Writer::new();
+        writer.text("PRIVATE_SERVICE_TERMS");
+        writer.u128(987654321);
+        assert_eq!(format!("{writer:?}"), "Writer { <redacted> }");
+        assert_eq!(format!("{writer:#?}"), "Writer { <redacted> }");
+        let bytes = writer.finish();
+        let mut reader = Reader::new(&bytes);
+        assert_eq!(
+            reader.text("service", 1, 256).unwrap(),
+            "PRIVATE_SERVICE_TERMS"
+        );
+        assert_eq!(reader.u128("amount").unwrap(), 987654321);
+        reader.finish().unwrap();
+    }
 
     #[test]
     fn integers_are_full_width_big_endian() {

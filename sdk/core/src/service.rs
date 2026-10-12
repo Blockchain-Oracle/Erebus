@@ -19,7 +19,7 @@ pub const MAX_UNIT_BYTES: usize = 32;
 pub const MAX_FULFILLMENT_METHOD_BYTES: usize = 64;
 
 /// What a seller promises to deliver, and to whom.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ServiceRecord {
     /// Resource identifier, for example `gpu.h100.hour`.
     pub resource: String,
@@ -35,6 +35,12 @@ pub struct ServiceRecord {
     pub fulfillment_method: String,
     /// Commitment to out-of-band fulfillment parameters; all zero when there are none.
     pub fulfillment_digest: [u8; 32],
+}
+
+impl core::fmt::Debug for ServiceRecord {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str("ServiceRecord { <redacted> }")
+    }
 }
 
 /// A service record was internally inconsistent.

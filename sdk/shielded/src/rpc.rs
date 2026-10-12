@@ -3,9 +3,10 @@
 //! It transmits no note openings. A response is checked against block headers and then
 //! against the local Poseidon tree before the wallet may use it.
 
+use futures_util::stream::{self, StreamExt, TryStreamExt};
 use reqwest::{Client, Url};
 use serde::de::DeserializeOwned;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha3::{Digest, Keccak256};
 
 use crate::indexer::{IndexError, PoolBlock, PoolEvent, PoolIndex};
@@ -33,13 +34,20 @@ struct JsonRpcResponse<T> {
     error: Option<serde_json::Value>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 struct BlockHeader {
     number: String,
     hash: String,
     parent_hash: String,
     timestamp: String,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct PoolSnapshot {
+    pub finalized: PoolFinalizedBlock,
+    pub head_number: u64,
+    pub head_hash: [u8; 32],
 }
 
 /// Explicit RPC-finalized pool-chain anchor. This is not proof that a payment occurred.
@@ -63,7 +71,7 @@ pub struct PoolIdentity {
 }
 
 /// Independently reviewed runtime hashes for the pool's four immutable dependencies.
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PoolDependencyPins {
     /// Poseidon implementation runtime hash.
     pub poseidon: [u8; 32],
@@ -73,6 +81,39 @@ pub struct PoolDependencyPins {
     pub transfer: [u8; 32],
     /// Withdrawal verifier runtime hash.
     pub withdraw: [u8; 32],
+}
+
+/// Independently reviewed runtime hashes for the pool contract and its four dependencies.
+///
+/// A deployment's verifier is only as trustworthy as the code that implements it. Pins come
+/// from reviewed deployment evidence, never from the RPC being checked; every hash is read
+/// back from chain code at one canonical block and compared. A zero pin is a configuration
+/// error, never "skip the check".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PoolRuntimePins {
+    /// Pool contract runtime hash.
+    pub pool: [u8; 32],
+    /// Poseidon implementation runtime hash.
+    pub poseidon: [u8; 32],
+    /// Deposit verifier runtime hash.
+    pub deposit: [u8; 32],
+    /// Transfer verifier runtime hash.
+    pub transfer: [u8; 32],
+    /// Withdrawal verifier runtime hash.
+    pub withdraw: [u8; 32],
+}
+
+impl PoolRuntimePins {
+    /// The four dependency pins, for [`PoolRpc::authenticate_dependencies_at`].
+    #[must_use]
+    pub const fn dependencies(&self) -> PoolDependencyPins {
+        PoolDependencyPins {
+            poseidon: self.poseidon,
+            deposit: self.deposit,
+            transfer: self.transfer,
+            withdraw: self.withdraw,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -88,33 +129,84 @@ struct RpcLog {
     removed: Option<bool>,
 }
 
+/// Default number of block-header reads [`PoolRpc::sync`] keeps in flight.
+pub const DEFAULT_MAX_CONCURRENT_READS: u64 = 8;
+
+/// Hard ceiling for [`PoolRpc::with_max_concurrent_reads`].
+pub const MAX_CONCURRENT_READS: u64 = 32;
+
+/// Default request-rate ceiling for one configured source, not a provider-wide quota.
+pub const DEFAULT_MAX_REQUESTS_PER_SECOND: u32 = 40;
+
+/// Widest `eth_getLogs` block range a scan issues; the public Monad testnet RPC cap.
+pub const MAX_LOG_BLOCK_RANGE: u64 = 100;
+
+/// Requests the pacer admits back to back before spacing them at the configured rate.
+const PACER_BURST: u32 = 8;
+
+/// Generic cell-rate pacer: at most `PACER_BURST` requests at once, then one per `interval`.
+///
+/// In any one-second span it admits at most `PACER_BURST + rate` requests, which keeps the
+/// local burst bounded. Separate sources have separate pacers; operator quotas still apply.
+struct RequestPacer {
+    interval: std::time::Duration,
+    tolerance: std::time::Duration,
+    next: tokio::sync::Mutex<tokio::time::Instant>,
+}
+
+impl RequestPacer {
+    fn new(per_second: u32) -> Self {
+        let interval = std::time::Duration::from_secs(1) / per_second;
+        Self {
+            interval,
+            tolerance: interval * (PACER_BURST - 1),
+            next: tokio::sync::Mutex::new(tokio::time::Instant::now()),
+        }
+    }
+
+    async fn admit(&self) {
+        let mut next = self.next.lock().await;
+        let now = tokio::time::Instant::now();
+        let theoretical = (*next).max(now);
+        if let Some(earliest) = theoretical.checked_sub(self.tolerance) {
+            if earliest > now {
+                tokio::time::sleep_until(earliest).await;
+            }
+        }
+        *next = theoretical + self.interval;
+    }
+}
+
 /// A configured read-only source for one EVM pool deployment.
 pub struct PoolRpc {
     url: Url,
     client: Client,
     chain_id: u64,
     pool: [u8; 20],
+    max_concurrent_reads: usize,
+    pacer: RequestPacer,
 }
 
 impl PoolRpc {
-    /// Checks immutable hash/verifier dependencies at one canonical block hash.
-    /// Pins must come from reviewed deployment evidence; this does not authenticate providers.
-    pub async fn authenticate_dependencies_at(
-        &self,
-        block_hash: [u8; 32],
-        pins: PoolDependencyPins,
-    ) -> Result<(), RpcError> {
+    /// Reads the pool and its four dependency runtime hashes at one canonical block.
+    ///
+    /// This reports the code the provider serves, for deployment review and local test setup.
+    /// It is not authentication: pins must be compared against independently reviewed
+    /// deployment evidence, never copied from the provider being checked.
+    pub async fn runtime_pins_at(&self, block_hash: [u8; 32]) -> Result<PoolRuntimePins, RpcError> {
         self.check_chain().await?;
-        let block = serde_json::json!({"blockHash":format!("0x{}", hex::encode(block_hash)),"requireCanonical":true});
-        for (signature, expected) in [
-            ("poseidonTwo()", pins.poseidon),
-            ("depositVerifier()", pins.deposit),
-            ("transferVerifier()", pins.transfer),
-            ("withdrawVerifier()", pins.withdraw),
-        ] {
-            if expected == [0; 32] {
-                return Err(RpcError::Configuration);
-            }
+        let block = canonical_block(block_hash);
+        let pool = self.code_hash_at(self.pool, &block).await?;
+        let mut dependencies = [[0u8; 32]; 4];
+        for (position, signature) in [
+            "poseidonTwo()",
+            "depositVerifier()",
+            "transferVerifier()",
+            "withdrawVerifier()",
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let address: String = self.call("eth_call", serde_json::json!([
                 {"to":format!("0x{}", hex::encode(self.pool)),"data":format!("0x{}",hex::encode(&Keccak256::digest(signature.as_bytes())[..4]))}, block
             ])).await?;
@@ -122,29 +214,104 @@ impl PoolRpc {
             if word[..12] != [0; 12] || word[12..] == [0; 20] {
                 return Err(RpcError::Evidence("invalid immutable pool dependency"));
             }
-            let code: String = self
-                .call(
-                    "eth_getCode",
-                    serde_json::json!([format!("0x{}", hex::encode(&word[12..])), block]),
-                )
-                .await?;
-            let code = hex::decode(
-                code.strip_prefix("0x")
-                    .ok_or(RpcError::Evidence("invalid dependency code"))?,
-            )
-            .map_err(|_| RpcError::Evidence("invalid dependency code"))?;
-            if code.is_empty() || Keccak256::digest(&code).as_slice() != expected {
-                return Err(RpcError::Evidence(
-                    "pool dependency runtime differs from trusted pin",
-                ));
-            }
+            let address: [u8; 20] = word[12..]
+                .try_into()
+                .map_err(|_| RpcError::Evidence("invalid immutable pool dependency"))?;
+            dependencies[position] = self.code_hash_at(address, &block).await?;
         }
-        self.check_chain().await
+        self.check_chain().await?;
+        Ok(PoolRuntimePins {
+            pool,
+            poseidon: dependencies[0],
+            deposit: dependencies[1],
+            transfer: dependencies[2],
+            withdraw: dependencies[3],
+        })
+    }
+
+    /// Checks immutable hash/verifier dependencies at one canonical block hash.
+    /// Pins must come from reviewed deployment evidence; this does not authenticate providers.
+    pub async fn authenticate_dependencies_at(
+        &self,
+        block_hash: [u8; 32],
+        pins: PoolDependencyPins,
+    ) -> Result<(), RpcError> {
+        if [pins.poseidon, pins.deposit, pins.transfer, pins.withdraw].contains(&[0; 32]) {
+            return Err(RpcError::Configuration);
+        }
+        if self.runtime_pins_at(block_hash).await?.dependencies() != pins {
+            return Err(RpcError::Evidence(
+                "pool dependency runtime differs from trusted pin",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Checks the pool's own runtime and its four dependencies at one canonical block hash.
+    ///
+    /// The certificate path calls this before it records a pool runtime pin, so the pin it
+    /// stores is the code that was actually read, not the configuration it was read against.
+    pub async fn authenticate_runtime_at(
+        &self,
+        block_hash: [u8; 32],
+        pins: PoolRuntimePins,
+    ) -> Result<(), RpcError> {
+        if [
+            pins.pool,
+            pins.poseidon,
+            pins.deposit,
+            pins.transfer,
+            pins.withdraw,
+        ]
+        .contains(&[0; 32])
+        {
+            return Err(RpcError::Configuration);
+        }
+        if self.runtime_pins_at(block_hash).await? != pins {
+            return Err(RpcError::Evidence("pool runtime differs from trusted pin"));
+        }
+        Ok(())
+    }
+
+    /// Reads one address's code hash at a canonical block.
+    async fn code_hash_at(
+        &self,
+        address: [u8; 20],
+        block: &serde_json::Value,
+    ) -> Result<[u8; 32], RpcError> {
+        let code: String = self
+            .call(
+                "eth_getCode",
+                serde_json::json!([format!("0x{}", hex::encode(address)), block]),
+            )
+            .await?;
+        let code = hex::decode(
+            code.strip_prefix("0x")
+                .ok_or(RpcError::Evidence("invalid contract code"))?,
+        )
+        .map_err(|_| RpcError::Evidence("invalid contract code"))?;
+        if code.is_empty() {
+            return Err(RpcError::Evidence("contract code is empty"));
+        }
+        Ok(Keccak256::digest(&code).into())
     }
     /// Checks endpoint identity without exposing a URL or its credentials.
     /// Distinct URLs do not establish operational provider independence.
     pub fn shares_endpoint(&self, other: &Self) -> bool {
         self.matches_endpoint(other.endpoint())
+    }
+
+    /// Stable domain-separated hash of the configured endpoint, chain, and pool.
+    ///
+    /// It names this observer configuration in durable records without storing the URL or any
+    /// credential in it. It does not identify or authenticate the provider behind the URL.
+    pub fn endpoint_fingerprint(&self) -> [u8; 32] {
+        erebus_core::suite::keccak256(&[
+            b"EREBUS_POOL_RPC_ENDPOINT_V1",
+            &self.chain_id.to_be_bytes(),
+            &self.pool,
+            self.url.as_str().as_bytes(),
+        ])
     }
     /// Endpoint identity for configuration checks. It may contain credentials; do not log it.
     pub(crate) fn endpoint(&self) -> &str {
@@ -197,7 +364,30 @@ impl PoolRpc {
             client,
             chain_id,
             pool,
+            max_concurrent_reads: DEFAULT_MAX_CONCURRENT_READS as usize,
+            pacer: RequestPacer::new(DEFAULT_MAX_REQUESTS_PER_SECOND),
         })
+    }
+
+    /// Sets how many block-header reads one history window keeps in flight (1..=32).
+    ///
+    /// Concurrency changes only how fast blocks are fetched. Every block is still checked
+    /// and applied in height order, and a batch commits only after all of its reads succeed.
+    pub fn with_max_concurrent_reads(mut self, reads: u64) -> Result<Self, RpcError> {
+        if reads == 0 || reads > MAX_CONCURRENT_READS {
+            return Err(RpcError::Configuration);
+        }
+        self.max_concurrent_reads = usize::try_from(reads).map_err(|_| RpcError::Configuration)?;
+        Ok(self)
+    }
+
+    /// Sets this endpoint's request-rate ceiling across every read through this source.
+    pub fn with_max_requests_per_second(mut self, rate: u32) -> Result<Self, RpcError> {
+        if rate == 0 {
+            return Err(RpcError::Configuration);
+        }
+        self.pacer = RequestPacer::new(rate);
+        Ok(self)
     }
 
     async fn call<T: DeserializeOwned>(
@@ -205,24 +395,52 @@ impl PoolRpc {
         method: &'static str,
         params: serde_json::Value,
     ) -> Result<T, RpcError> {
-        let response = self
-            .client
-            .post(self.url.clone())
-            .json(&serde_json::json!({"jsonrpc":"2.0","id":1,"method":method,"params":params}))
-            .send()
-            .await
-            .map_err(|_| RpcError::Request(method))?;
-        if !response.status().is_success() {
-            return Err(RpcError::Request(method));
+        // Retry transport failures only for idempotent reads; callers still validate every result.
+        let read_only = matches!(
+            method,
+            "eth_chainId"
+                | "eth_blockNumber"
+                | "eth_getBlockByNumber"
+                | "eth_getLogs"
+                | "eth_call"
+                | "eth_getCode"
+        );
+        for attempt in 0..4 {
+            self.pacer.admit().await;
+            let response = self
+                .client
+                .post(self.url.clone())
+                .json(&serde_json::json!({"jsonrpc":"2.0","id":1,"method":method,"params":params}))
+                .send()
+                .await;
+            let response = match response {
+                Ok(response) => response,
+                Err(error)
+                    if read_only && attempt < 3 && (error.is_timeout() || error.is_connect()) =>
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(100 << attempt)).await;
+                    continue;
+                }
+                Err(_) => return Err(RpcError::Request(method)),
+            };
+            let transient = matches!(response.status().as_u16(), 429 | 502 | 503 | 504);
+            if read_only && transient && attempt < 3 {
+                tokio::time::sleep(std::time::Duration::from_millis(100 << attempt)).await;
+                continue;
+            }
+            if !response.status().is_success() {
+                return Err(RpcError::Request(method));
+            }
+            let decoded: JsonRpcResponse<T> = response
+                .json()
+                .await
+                .map_err(|_| RpcError::Request(method))?;
+            if decoded.error.is_some() {
+                return Err(RpcError::Request(method));
+            }
+            return decoded.result.ok_or(RpcError::Request(method));
         }
-        let decoded: JsonRpcResponse<T> = response
-            .json()
-            .await
-            .map_err(|_| RpcError::Request(method))?;
-        if decoded.error.is_some() {
-            return Err(RpcError::Request(method));
-        }
-        decoded.result.ok_or(RpcError::Request(method))
+        Err(RpcError::Request(method))
     }
 
     /// Confirms the endpoint's current EVM chain ID before reading any logs.
@@ -274,6 +492,87 @@ impl PoolRpc {
     pub async fn canonical_block_hash(&self, number: u64) -> Result<[u8; 32], RpcError> {
         self.check_chain().await?;
         fixed_hex::<32>(&self.header(number).await?.hash)
+    }
+
+    /// Selects canonical anchors below both explicit finalized tips and heads.
+    /// Callers recheck them after dependent reads; this is not consensus proof.
+    pub(crate) async fn shared_snapshot(&self, peer: &Self) -> Result<PoolSnapshot, RpcError> {
+        if self.chain_id != peer.chain_id
+            || self.pool != peer.pool
+            || self.endpoint() == peer.endpoint()
+        {
+            return Err(RpcError::Configuration);
+        }
+        let (first, second) = tokio::join!(self.finalized_head(), peer.finalized_head());
+        let first = first?;
+        let second = second?;
+        let finalized_number = first.number.min(second.number);
+        let (first_head, second_head) = tokio::join!(self.head(), peer.head());
+        let head_number = first_head?.min(second_head?);
+        if head_number < finalized_number {
+            return Err(RpcError::Evidence(
+                "shared finalized anchor is ahead of head",
+            ));
+        }
+        let common = |number| async move {
+            let (first, second) = tokio::join!(self.header(number), peer.header(number));
+            let first = first?;
+            if first != second? {
+                return Err(RpcError::Evidence("RPC providers disagree on shared block"));
+            }
+            Ok(PoolFinalizedBlock {
+                number,
+                hash: fixed_hex::<32>(&first.hash)?,
+                timestamp: quantity(&first.timestamp)?,
+            })
+        };
+        let finalized = common(finalized_number).await?;
+        if [first, second]
+            .iter()
+            .any(|tip| tip.number == finalized_number && *tip != finalized)
+        {
+            return Err(RpcError::Evidence(
+                "finalized anchor changed during snapshot selection",
+            ));
+        }
+        let head = common(head_number).await?;
+        self.check_chain().await?;
+        peer.check_chain().await?;
+        Ok(PoolSnapshot {
+            finalized,
+            head_number,
+            head_hash: head.hash,
+        })
+    }
+
+    pub(crate) async fn shared_finalized_prefix(
+        &self,
+        peer: &Self,
+        snapshot: PoolSnapshot,
+        number: u64,
+        expected_hash: [u8; 32],
+    ) -> Result<PoolSnapshot, RpcError> {
+        if number > snapshot.finalized.number {
+            return Err(RpcError::Evidence(
+                "prefix is not finalized by both providers",
+            ));
+        }
+        let (first, second) = tokio::join!(self.header(number), peer.header(number));
+        let first = first?;
+        if first != second? || fixed_hex::<32>(&first.hash)? != expected_hash {
+            return Err(RpcError::Evidence(
+                "RPC providers disagree on finalized prefix",
+            ));
+        }
+        Ok(PoolSnapshot {
+            finalized: PoolFinalizedBlock {
+                number,
+                hash: expected_hash,
+                timestamp: quantity(&first.timestamp)?,
+            },
+            head_number: number,
+            head_hash: expected_hash,
+        })
     }
 
     /// Reads the pool's one-time deal state at an explicitly pinned canonical block.
@@ -406,9 +705,44 @@ impl PoolRpc {
     /// Fetches one block's pool logs and checks their hashes against its canonical header.
     pub async fn read_block(&self, number: u64) -> Result<PoolBlock, RpcError> {
         self.check_chain().await?;
-        let before = self.header(number).await?;
-        let hash = fixed_hex::<32>(&before.hash)?;
-        let parent_hash = fixed_hex::<32>(&before.parent_hash)?;
+        let mut blocks = self.read_range(number, number).await?;
+        match (blocks.pop(), blocks.is_empty()) {
+            (Some(block), true) => Ok(block),
+            _ => Err(RpcError::Evidence("wrong block count")),
+        }
+    }
+
+    /// Reads canonical headers `from..=to` with bounded concurrency, returned in height order.
+    ///
+    /// Any failed or missing response fails the whole range; nothing is treated as absent.
+    async fn headers(&self, from: u64, to: u64) -> Result<Vec<BlockHeader>, RpcError> {
+        stream::iter(from..=to)
+            .map(|number| self.header(number))
+            .buffered(self.max_concurrent_reads)
+            .try_collect()
+            .await
+    }
+
+    /// Fetches the pool logs of `from..=to` and checks each against its canonical header.
+    ///
+    /// Every block's header is read before the ranged `eth_getLogs` and again after it, and
+    /// each hash must be unchanged. Every log must name a block in the range, that block's
+    /// pre-read hash, and the pool, and must arrive in (block, log index) order. Parent-hash
+    /// continuity is checked by [`PoolIndex::apply_block`] as the caller applies the blocks in
+    /// order. The range never exceeds [`MAX_LOG_BLOCK_RANGE`].
+    async fn read_range(&self, from: u64, to: u64) -> Result<Vec<PoolBlock>, RpcError> {
+        if from > to || to - from >= MAX_LOG_BLOCK_RANGE {
+            return Err(RpcError::Configuration);
+        }
+        let mut blocks = Vec::new();
+        for (number, header) in (from..=to).zip(self.headers(from, to).await?) {
+            blocks.push(PoolBlock {
+                number,
+                hash: fixed_hex::<32>(&header.hash)?,
+                parent_hash: fixed_hex::<32>(&header.parent_hash)?,
+                events: Vec::new(),
+            });
+        }
         let topics = [
             event_topic("NoteInserted(uint256,uint256,uint256)"),
             event_topic("DealTransferred(uint256,uint256,uint256)"),
@@ -416,35 +750,49 @@ impl PoolRpc {
         ];
         let logs: Vec<RpcLog> = self.call("eth_getLogs", serde_json::json!([{
             "address": format!("0x{}", hex::encode(self.pool)),
-            "fromBlock": format!("0x{number:x}"),
-            "toBlock": format!("0x{number:x}"),
+            "fromBlock": format!("0x{from:x}"),
+            "toBlock": format!("0x{to:x}"),
             "topics": [topics.iter().map(|topic| format!("0x{}", hex::encode(topic))).collect::<Vec<_>>()]
         }])).await?;
-        let mut events = Vec::with_capacity(logs.len());
+        let mut last = None;
         for log in logs {
+            let number = quantity(&log.block_number)?;
+            let block = number
+                .checked_sub(from)
+                .and_then(|offset| usize::try_from(offset).ok())
+                .and_then(|offset| blocks.get_mut(offset))
+                .ok_or(RpcError::Evidence("log block or pool mismatch"))?;
             if fixed_hex::<20>(&log.address)? != self.pool
-                || quantity(&log.block_number)? != number
-                || fixed_hex::<32>(&log.block_hash)? != hash
+                || block.number != number
+                || fixed_hex::<32>(&log.block_hash)? != block.hash
                 || log.removed.unwrap_or(false)
             {
                 return Err(RpcError::Evidence("log block or pool mismatch"));
             }
-            events.push(decode_log(&log, &topics)?);
+            let position = (number, quantity(&log.log_index)?);
+            if last.is_some_and(|last| position <= last) {
+                return Err(RpcError::Evidence("logs out of block order"));
+            }
+            last = Some(position);
+            block.events.push(decode_log(&log, &topics)?);
         }
-        let after = self.header(number).await?;
-        if fixed_hex::<32>(&after.hash)? != hash {
-            return Err(RpcError::Evidence("block changed while logs were read"));
+        let after = self.headers(from, to).await?;
+        if after.len() != blocks.len() {
+            return Err(RpcError::Evidence("wrong block count"));
         }
-        Ok(PoolBlock {
-            number,
-            hash,
-            parent_hash,
-            events,
-        })
+        for (block, header) in blocks.iter().zip(&after) {
+            if fixed_hex::<32>(&header.hash)? != block.hash {
+                return Err(RpcError::Evidence("block changed while logs were read"));
+            }
+        }
+        Ok(blocks)
     }
 
     /// Rewinds a changed tip and appends at most `limit` consecutive canonical blocks.
     ///
+    /// Blocks are fetched in contiguous windows of at most [`MAX_LOG_BLOCK_RANGE`] heights,
+    /// with header reads running concurrently up to the configured bound, and are applied
+    /// strictly in height order. Any failed read aborts the batch without committing.
     /// A batch is committed only after the pool's stored root and leaf count agree with
     /// the event index. An observation is not finality; callers still need their chosen
     /// confirmation rule before treating notes as irreversible.
@@ -495,11 +843,19 @@ impl PoolRpc {
             return Ok(0);
         }
         let end = through.min(start.saturating_add(limit - 1));
-        for number in start..=end {
-            let block = self.read_block(number).await?;
-            staged.apply_block(block)?;
+        let mut from = start;
+        loop {
+            let to = end.min(from.saturating_add(MAX_LOG_BLOCK_RANGE - 1));
+            for block in self.read_range(from, to).await? {
+                staged.apply_block(block)?;
+            }
+            if to >= end {
+                break;
+            }
+            from = to + 1;
         }
         self.verify_pool_state(&staged).await?;
+        self.check_chain().await?;
         *index = staged;
         Ok(end - start + 1)
     }
@@ -507,6 +863,11 @@ impl PoolRpc {
 
 fn event_topic(signature: &str) -> [u8; 32] {
     Keccak256::digest(signature.as_bytes()).into()
+}
+
+/// The block parameter every code read must use: one hash, required canonical.
+fn canonical_block(block_hash: [u8; 32]) -> serde_json::Value {
+    serde_json::json!({"blockHash":format!("0x{}", hex::encode(block_hash)),"requireCanonical":true})
 }
 
 fn fixed_hex<const N: usize>(value: &str) -> Result<[u8; N], RpcError> {
@@ -591,6 +952,184 @@ fn decode_log(log: &RpcLog, topics: &[[u8; 32]; 3]) -> Result<PoolEvent, RpcErro
 
 #[cfg(test)]
 mod tests {
+    async fn retry_rpc(
+        failures: usize,
+        status: u16,
+        payload: serde_json::Value,
+    ) -> (
+        super::PoolRpc,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use axum::{http::StatusCode, routing::post, Json, Router};
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let rpc = super::PoolRpc::new(
+            &format!("http://{}", listener.local_addr().unwrap()),
+            10143,
+            [1; 20],
+        )
+        .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route(
+                    "/",
+                    post(move || {
+                        let count = counter.fetch_add(1, Ordering::SeqCst);
+                        let payload = payload.clone();
+                        async move {
+                            (
+                                if count < failures {
+                                    StatusCode::from_u16(status).unwrap()
+                                } else {
+                                    StatusCode::OK
+                                },
+                                Json(payload),
+                            )
+                        }
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+        });
+        (rpc, calls, server)
+    }
+
+    #[tokio::test]
+    async fn transient_read_retries_are_bounded_and_never_retry_writes_or_invalid_evidence() {
+        use super::RpcError;
+        use serde_json::json;
+        use std::sync::atomic::Ordering;
+        for status in [429, 502, 503, 504] {
+            let (rpc, calls, server) = retry_rpc(2, status, json!({"result":"0x279f"})).await;
+            rpc.check_chain().await.unwrap();
+            assert_eq!(calls.load(Ordering::SeqCst), 3);
+            server.abort();
+        }
+        let (rpc, calls, server) = retry_rpc(99, 429, json!({})).await;
+        assert!(matches!(
+            rpc.check_chain().await,
+            Err(RpcError::Request("eth_chainId"))
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+        server.abort();
+
+        for (status, payload) in [
+            (400, json!({})),
+            (
+                200,
+                json!({"error":{"code":-32602,"message":"invalid params"}}),
+            ),
+            (200, json!({"result":null})),
+            (200, json!({"result":123})),
+        ] {
+            let (rpc, calls, server) = retry_rpc(99, status, payload).await;
+            assert!(rpc.check_chain().await.is_err());
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            server.abort();
+        }
+        let (rpc, calls, server) = retry_rpc(1, 429, json!({"result":"0x1"})).await;
+        assert!(matches!(
+            rpc.check_chain().await,
+            Err(RpcError::Evidence("wrong chain ID"))
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        server.abort();
+
+        let (rpc, calls, server) = retry_rpc(99, 429, json!({})).await;
+        assert!(rpc
+            .call::<String>("eth_sendRawTransaction", json!([]))
+            .await
+            .is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
+    async fn snapshot_rpc(
+        head: u64,
+        finalized: Option<u64>,
+        conflicting_height: Option<u64>,
+        change_after_finality_read: bool,
+    ) -> (super::PoolRpc, tokio::task::JoinHandle<()>) {
+        use axum::{routing::post, Json, Router};
+        use serde_json::{json, Value};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let finalized_reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, Router::new().route("/", post(move |Json(request): Json<Value>| {
+                let finalized_reads = finalized_reads.clone();
+                async move {
+                let block = |number: u64| {
+                    let mut hash = [0x11; 32];
+                    hash[..8].copy_from_slice(&number.to_be_bytes());
+                    if conflicting_height == Some(number) { hash[31] = 0x33; }
+                    if change_after_finality_read && finalized == Some(number)
+                        && request["params"][0] != "finalized"
+                        && finalized_reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0
+                    { hash[31] = 0x44; }
+                    json!({"number":format!("0x{number:x}"),"hash":format!("0x{}",hex::encode(hash)),
+                        "parentHash":format!("0x{}", "22".repeat(32)),"timestamp":format!("0x{:x}",number+100)})
+                };
+                let result = match request["method"].as_str().unwrap() {
+                    "eth_chainId" => json!("0x7a69"),
+                    "eth_blockNumber" => json!(format!("0x{head:x}")),
+                    "eth_getBlockByNumber" if request["params"][0] == "finalized" => finalized.map_or(Value::Null, block),
+                    "eth_getBlockByNumber" => block(u64::from_str_radix(request["params"][0].as_str().unwrap().trim_start_matches("0x"),16).unwrap()),
+                    _ => panic!("unexpected snapshot RPC method"),
+                };
+                Json(json!({"jsonrpc":"2.0","id":request["id"],"result":result}))
+                }
+            }))).await.unwrap();
+        });
+        (super::PoolRpc::new(&url, 31337, [3; 20]).unwrap(), server)
+    }
+
+    #[tokio::test]
+    async fn shared_snapshot_accepts_honest_tip_lag_but_rejects_conflicts_and_missing_finality() {
+        let (first, first_server) = snapshot_rpc(12, Some(10), None, false).await;
+        let (peer, peer_server) = snapshot_rpc(13, Some(11), None, false).await;
+        assert_ne!(
+            first.finalized_head().await.unwrap(),
+            peer.finalized_head().await.unwrap()
+        );
+        let snapshot = first.shared_snapshot(&peer).await.unwrap();
+        assert_eq!(snapshot.finalized.number, 10);
+        assert_eq!(snapshot.head_number, 12);
+        assert_eq!(
+            snapshot.head_hash,
+            first.canonical_block_hash(12).await.unwrap()
+        );
+        for (finalized, conflict) in [(Some(11), Some(10)), (Some(11), Some(12)), (None, None)] {
+            let (bad, server) = snapshot_rpc(13, finalized, conflict, false).await;
+            assert!(first.shared_snapshot(&bad).await.is_err());
+            server.abort();
+        }
+        assert!(first.shared_snapshot(&first).await.is_err());
+        first_server.abort();
+        peer_server.abort();
+    }
+
+    #[tokio::test]
+    async fn shared_snapshot_rejects_both_providers_changing_the_reported_finalized_block() {
+        let (first, first_server) = snapshot_rpc(12, Some(10), None, true).await;
+        let (peer, peer_server) = snapshot_rpc(13, Some(10), None, true).await;
+        assert!(matches!(
+            first.shared_snapshot(&peer).await,
+            Err(super::RpcError::Evidence(
+                "finalized anchor changed during snapshot selection"
+            ))
+        ));
+        first_server.abort();
+        peer_server.abort();
+    }
     #[test]
     fn endpoint_identity_ignores_fragments_and_normalizes_the_root_path() {
         let first = super::PoolRpc::new("http://127.0.0.1:9", 31_337, [3; 20]).unwrap();

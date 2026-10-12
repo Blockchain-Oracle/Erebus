@@ -72,7 +72,12 @@ pub(super) async fn finish(
     let backend = if selected.terms.suite_id == 2 {
         json!({"mode":"shielded","chain_id":31337,"pool":config["pool"],"rpc_url":config["rpc_url"],
             "peer_rpc_url":config["peer_rpc_url"],"first_block":config["first_block"],
-            "first_hash":hex::decode(config["first_hash"].as_str().unwrap().trim_start_matches("0x")).unwrap()})
+            "first_hash":hex::decode(config["first_hash"].as_str().unwrap().trim_start_matches("0x")).unwrap(),
+            "runtime_keccak256":config["runtime_keccak256"],
+            "poseidon_keccak256":config["poseidon_keccak256"],
+            "deposit_verifier_keccak256":config["deposit_verifier_keccak256"],
+            "transfer_verifier_keccak256":config["transfer_verifier_keccak256"],
+            "withdraw_verifier_keccak256":config["withdraw_verifier_keccak256"]})
     } else {
         json!({"mode":"public_bound","namespace":config["namespace"],"settlement_contract":config["settlement_contract"],
             "verifier_version":1,"rpc_url":config["peer_rpc_url"],"from_block":config["first_block"],
@@ -129,7 +134,11 @@ pub(super) async fn finish(
     let retrieved: Value = retrieved.json().await.unwrap();
     assert_eq!(retrieved["issuance"]["repeated"], true);
     let access = fixture.root.path().join("erebus-access");
-    fs::copy(env!("CARGO_BIN_EXE_erebus-access"), &access).unwrap();
+    fs::copy(
+        native_binary("erebus-access", env!("CARGO_BIN_EXE_erebus-access")),
+        &access,
+    )
+    .unwrap();
     let retrieval = json!({"method":"retrieve","evidence_file":buyer["evidence_file"],
         "buyer_key_file":fixture.root.path().join("buyer/agreement.key"),"service_url":format!("{url}/v1/access"),
         "service_id":hex::encode(service_id),"cache_root":fixture.root.path().join("buyer/content-cache"),"allow_loopback_http":true});
@@ -152,10 +161,25 @@ pub(super) async fn finish(
     let (ok, cached) = super::super::finish(spawn(&access, fixture.root.path(), retrieval));
     assert!(ok, "{cached}");
     assert_eq!(cached["result"]["cached"], true);
+
+    audit_payment(fixture, buyer, seller, config, &selected);
+}
+
+pub(super) fn audit_payment(
+    fixture: &Fixture,
+    buyer: &Value,
+    seller: &Value,
+    config: &Value,
+    selected: &SelectedAgreement,
+) {
+    let seller_root = fixture.root.path().join("seller");
     // The auditor owns only its key, grant, and public history cache; participant paths go offline.
     let disclosure = fixture.root.path().join("erebus-disclosure");
     fs::copy(
-        env!("CARGO_BIN_EXE_erebus-shielded-disclosure"),
+        native_binary(
+            "erebus-shielded-disclosure",
+            env!("CARGO_BIN_EXE_erebus-shielded-disclosure"),
+        ),
         &disclosure,
     )
     .unwrap();
@@ -186,7 +210,11 @@ pub(super) async fn finish(
     let deployment = if selected.terms.suite_id == 2 {
         json!({"namespace":config["namespace"],"settlement_contract":config["pool"],"verifier_version":2,
             "rpc_url":config["rpc_url"],"peer_rpc_url":config["peer_rpc_url"],"first_block":config["first_block"],
-            "first_hash":config["first_hash"],"cache_root":auditor.join("public-history")})
+            "first_hash":config["first_hash"],"cache_root":auditor.join("public-history"),
+            "runtime_keccak256":config["runtime_keccak256"],"poseidon_keccak256":config["poseidon_keccak256"],
+            "deposit_verifier_keccak256":config["deposit_verifier_keccak256"],
+            "transfer_verifier_keccak256":config["transfer_verifier_keccak256"],
+            "withdraw_verifier_keccak256":config["withdraw_verifier_keccak256"]})
     } else {
         json!({"namespace":config["namespace"],"settlement_contract":config["settlement_contract"],"verifier_version":1,
             "rpc_url":config["peer_rpc_url"],"from_block":config["first_block"],"log_block_range":100,"max_log_queries":8,

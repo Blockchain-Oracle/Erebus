@@ -2671,6 +2671,7 @@ dependencies = [
  "erebus-journal",
  "erebus-transport",
  "fs2",
+ "futures-util",
  "hex",
  "num-bigint",
  "reqwest 0.12.28",

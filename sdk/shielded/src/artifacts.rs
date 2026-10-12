@@ -12,7 +12,7 @@ use std::{
 };
 
 use fs2::FileExt;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 
@@ -50,6 +50,20 @@ struct Circuit {
     wasm: ArtifactFile,
     r1cs: ArtifactFile,
     zkey: ArtifactFile,
+    #[serde(default)]
+    identity: Option<CircuitIdentity>,
+}
+
+/// Publisher-attested identities for a reviewed circuit and its deployed verifier.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CircuitIdentity {
+    /// Hash of the release's canonical source inventory, including transitive includes.
+    source_inventory_sha256: String,
+    witness_schema_version: u16,
+    verification_key_sha256: String,
+    /// Keccak-256 of the complete deployed runtime, not creation bytecode.
+    verifier_runtime_keccak256: String,
 }
 
 #[derive(Deserialize)]
@@ -67,6 +81,62 @@ struct Manifest {
 /// Fields are private so URLs, sizes, and digests cannot be changed after authentication.
 pub struct ArtifactRelease {
     manifest: Manifest,
+    publisher_authenticated: bool,
+}
+
+/// Detached publisher signature over the exact manifest bytes, with a protocol-specific domain.
+/// The publisher address must be pinned independently in operator configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManifestSignature {
+    /// Signature-envelope version, currently 1.
+    pub version: u16,
+    /// SHA-256 of the exact manifest file, without JSON reserialization.
+    pub manifest_sha256: String,
+    /// Canonical suite-1 signature: lowercase hex `r || s || recovery_id`.
+    pub signature_hex: String,
+}
+
+/// Operator-pinned publisher and detached signature. Never load the trusted publisher from
+/// the manifest or the artifact server; the signature alone does not establish trust.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManifestAuthorization {
+    /// Independently trusted lowercase Ethereum-style publisher address.
+    pub publisher: String,
+    /// Detached signature supplied with the release.
+    pub signature: ManifestSignature,
+}
+
+fn manifest_signature_digest(sha256: &[u8; 32]) -> [u8; 32] {
+    erebus_core::suite::keccak256(&[b"EREBUS_ARTIFACT_MANIFEST_SIGNATURE_V1", sha256])
+}
+
+fn valid_identity_hash(value: &str) -> bool {
+    value.len() == 64
+        && value != "0".repeat(64)
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+impl ManifestSignature {
+    /// Signs exact public manifest bytes with a separate release-publisher identity.
+    /// Signing does not certify the circuit, ceremony, or deployed verifier.
+    pub fn sign(
+        bytes: &[u8],
+        publisher: &erebus_transport::identity::AuthorizationIdentity,
+    ) -> Result<Self, InstallError> {
+        if bytes.is_empty() || bytes.len() > MAX_MANIFEST_BYTES {
+            return Err(InstallError::Manifest);
+        }
+        let digest: [u8; 32] = Sha256::digest(bytes).into();
+        Ok(Self {
+            version: 1,
+            manifest_sha256: hex::encode(digest),
+            signature_hex: hex::encode(publisher.sign_digest(&manifest_signature_digest(&digest))),
+        })
+    }
 }
 
 /// Local cache and explicit development exceptions. There are no private proving inputs here.
@@ -144,6 +214,9 @@ pub enum InstallError {
     /// Manifest bytes, schema, hashes, sizes, or deployment metadata are invalid.
     #[error("artifact manifest is invalid or does not match its trusted digest")]
     Manifest,
+    /// Detached signature is absent, malformed, or not made by the pinned publisher.
+    #[error("artifact publisher signature is missing or invalid")]
+    Publisher,
     /// A prototype release was not explicitly allowed.
     #[error("test-only proving artifacts require explicit development opt-in")]
     TestOnly,
@@ -162,6 +235,11 @@ pub enum InstallError {
 }
 
 impl ArtifactRelease {
+    /// Whether this manifest explicitly identifies insecure local test material.
+    pub fn is_test_only(&self) -> bool {
+        self.manifest.test_only
+    }
+
     /// Authenticates the entire manifest before interpreting it or making any request.
     pub fn authenticate(bytes: &[u8], expected_sha256: [u8; 32]) -> Result<Self, InstallError> {
         if bytes.len() > MAX_MANIFEST_BYTES
@@ -171,7 +249,8 @@ impl ArtifactRelease {
         }
         let manifest: Manifest =
             serde_json::from_slice(bytes).map_err(|_| InstallError::Manifest)?;
-        if manifest.version != 1
+        if !matches!(manifest.version, 1 | 2)
+            || (!manifest.test_only && manifest.version != 2)
             || manifest.chain_id == 0
             || manifest.verifier_version == 0
             || erebus_evm::deployment::parse_lowercase_address(&manifest.settlement_contract)
@@ -196,6 +275,19 @@ impl ArtifactRelease {
             }
         }
         for circuit in &manifest.circuits {
+            match (&circuit.identity, manifest.version) {
+                (Some(identity), 2)
+                    if identity.witness_schema_version == 2
+                        && [
+                            &identity.source_inventory_sha256,
+                            &identity.verification_key_sha256,
+                            &identity.verifier_runtime_keccak256,
+                        ]
+                        .into_iter()
+                        .all(|hash| valid_identity_hash(hash)) => {}
+                (None, 1) => {}
+                _ => return Err(InstallError::Manifest),
+            }
             for file in [&circuit.wasm, &circuit.r1cs, &circuit.zkey] {
                 if file.bytes == 0
                     || file.bytes > MAX_ARTIFACT_BYTES
@@ -210,7 +302,51 @@ impl ArtifactRelease {
                 }
             }
         }
-        Ok(Self { manifest })
+        Ok(Self {
+            manifest,
+            publisher_authenticated: false,
+        })
+    }
+
+    /// Authenticates exact manifest bytes and optionally verifies a detached signature against
+    /// an independently pinned publisher. Non-test installation requires this signature.
+    pub fn authenticate_authorized(
+        bytes: &[u8],
+        expected_sha256: [u8; 32],
+        authorization: Option<&ManifestAuthorization>,
+    ) -> Result<Self, InstallError> {
+        let mut release = Self::authenticate(bytes, expected_sha256)?;
+        if let Some(authorization) = authorization {
+            let signer = erebus_evm::deployment::parse_lowercase_address(&authorization.publisher)
+                .filter(|address| address != &[0; 20])
+                .ok_or(InstallError::Publisher)?;
+            let envelope = &authorization.signature;
+            if envelope.version != 1
+                || envelope.manifest_sha256 != hex::encode(expected_sha256)
+                || envelope.signature_hex.len() != 130
+                || !envelope
+                    .signature_hex
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                return Err(InstallError::Publisher);
+            }
+            let signature =
+                hex::decode(&envelope.signature_hex).map_err(|_| InstallError::Publisher)?;
+            erebus_core::suite::suite(1)
+                .map_err(|_| InstallError::Publisher)?
+                .verify_authorization(
+                    &signer,
+                    &manifest_signature_digest(&expected_sha256),
+                    &signature,
+                )
+                .map_err(|_| InstallError::Publisher)?;
+            release.publisher_authenticated = true;
+        }
+        if !release.manifest.test_only && !release.publisher_authenticated {
+            return Err(InstallError::Publisher);
+        }
+        Ok(release)
     }
 
     /// Requires the caller's independently trusted deployment to match this artifact release.
@@ -219,6 +355,24 @@ impl ArtifactRelease {
             && self.manifest.verifier_version == version
             && erebus_evm::deployment::parse_lowercase_address(&self.manifest.settlement_contract)
                 == Some(contract)
+    }
+
+    /// Compares signed verifier identities with independently configured live-code pins.
+    /// Legacy test manifests have no identities; only their explicit test opt-in permits use.
+    pub fn matches_verifier_pins(&self, pins: &crate::rpc::PoolDependencyPins) -> bool {
+        if self.manifest.version == 1 {
+            return self.manifest.test_only;
+        }
+        self.manifest.circuits.iter().all(|circuit| {
+            let expected = match circuit.kind {
+                CircuitKind::Deposit => pins.deposit,
+                CircuitKind::Transfer => pins.transfer,
+                CircuitKind::Withdraw => pins.withdraw,
+            };
+            circuit.identity.as_ref().is_some_and(|identity| {
+                identity.verifier_runtime_keccak256 == hex::encode(expected)
+            })
+        })
     }
 
     /// Installs public artifacts and proves locally without sending witness data to a server.
@@ -274,6 +428,9 @@ impl ArtifactRelease {
         kind: CircuitKind,
         options: &InstallOptions,
     ) -> Result<InstalledArtifacts, InstallError> {
+        if !self.manifest.test_only && !self.publisher_authenticated {
+            return Err(InstallError::Publisher);
+        }
         if self.manifest.test_only && !options.allow_test_artifacts {
             return Err(InstallError::TestOnly);
         }
@@ -295,6 +452,7 @@ impl ArtifactRelease {
         }
         let client = reqwest::Client::builder()
             .timeout(options.timeout)
+            .referer(false)
             .redirect(reqwest::redirect::Policy::custom(move |attempt| {
                 if attempt.previous().len() >= 5 || !allowed_url(attempt.url(), allow_http) {
                     attempt.error("artifact redirect is not allowed")
@@ -438,38 +596,194 @@ async fn install_file(
     {
         return Err(InstallError::Integrity);
     }
-    let partial = tempfile::NamedTempFile::new_in(root).map_err(|_| InstallError::Cache)?;
-    let mut file = tokio::fs::File::from_std(
-        partial
-            .as_file()
-            .try_clone()
-            .map_err(|_| InstallError::Cache)?,
-    );
-    let mut hash = Sha256::new();
-    let mut count = 0u64;
+    let mut download = ArtifactDownload::new(root, &path, spec)?;
     while let Some(chunk) = response.chunk().await.map_err(|_| InstallError::Download)? {
-        count = count
-            .checked_add(chunk.len() as u64)
-            .ok_or(InstallError::Integrity)?;
-        if count > spec.bytes {
-            return Err(InstallError::Integrity);
-        }
-        hash.update(&chunk);
-        file.write_all(&chunk)
-            .await
-            .map_err(|_| InstallError::Cache)?;
+        download.write(&chunk).await?;
     }
-    if count != spec.bytes || hex::encode(hash.finalize()) != spec.sha256 {
-        return Err(InstallError::Integrity);
-    }
-    file.sync_all().await.map_err(|_| InstallError::Cache)?;
-    drop(file);
-    partial.persist(&path).map_err(|_| InstallError::Cache)?;
-    fs::File::open(root)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|_| InstallError::Cache)?;
+    let count = download.finish().await?;
     if !cached(&path, spec)? {
         return Err(InstallError::Integrity);
     }
     Ok((path, count))
+}
+
+// Own the temporary file through every write and publication boundary. Dropping an
+// interrupted download removes its partial file without publishing unchecked bytes.
+struct ArtifactDownload<'a> {
+    partial: tempfile::NamedTempFile,
+    file: tokio::fs::File,
+    root: &'a Path,
+    path: &'a Path,
+    spec: &'a ArtifactFile,
+    hash: Sha256,
+    count: u64,
+    #[cfg(test)]
+    fail_at: Option<&'static str>,
+}
+
+impl<'a> ArtifactDownload<'a> {
+    fn new(root: &'a Path, path: &'a Path, spec: &'a ArtifactFile) -> Result<Self, InstallError> {
+        let partial = tempfile::NamedTempFile::new_in(root).map_err(|_| InstallError::Cache)?;
+        let file = tokio::fs::File::from_std(
+            partial
+                .as_file()
+                .try_clone()
+                .map_err(|_| InstallError::Cache)?,
+        );
+        Ok(Self {
+            partial,
+            file,
+            root,
+            path,
+            spec,
+            hash: Sha256::new(),
+            count: 0,
+            #[cfg(test)]
+            fail_at: None,
+        })
+    }
+
+    fn boundary(&self, _stage: &'static str) -> Result<(), InstallError> {
+        #[cfg(test)]
+        if self.fail_at == Some(_stage) {
+            return Err(std::io::Error::from_raw_os_error(28)).map_err(|_| InstallError::Cache);
+        }
+        Ok(())
+    }
+
+    async fn write(&mut self, chunk: &[u8]) -> Result<(), InstallError> {
+        self.count = self
+            .count
+            .checked_add(chunk.len() as u64)
+            .ok_or(InstallError::Integrity)?;
+        if self.count > self.spec.bytes {
+            return Err(InstallError::Integrity);
+        }
+        self.boundary("write")?;
+        self.hash.update(chunk);
+        self.file
+            .write_all(chunk)
+            .await
+            .map_err(|_| InstallError::Cache)
+    }
+
+    async fn finish(self) -> Result<u64, InstallError> {
+        if self.count != self.spec.bytes
+            || hex::encode(self.hash.clone().finalize()) != self.spec.sha256
+        {
+            return Err(InstallError::Integrity);
+        }
+        self.boundary("sync")?;
+        self.file
+            .sync_all()
+            .await
+            .map_err(|_| InstallError::Cache)?;
+        self.boundary("persist")?;
+        #[cfg(test)]
+        let fail_directory_sync = self.fail_at == Some("directory_sync");
+        drop(self.file);
+        self.partial
+            .persist(self.path)
+            .map_err(|_| InstallError::Cache)?;
+        #[cfg(test)]
+        if fail_directory_sync {
+            return Err(InstallError::Cache);
+        }
+        fs::File::open(self.root)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|_| InstallError::Cache)?;
+        Ok(self.count)
+    }
+}
+
+#[cfg(test)]
+mod download_tests {
+    use super::*;
+
+    fn spec() -> ArtifactFile {
+        ArtifactFile {
+            url: "https://artifacts.invalid/file".into(),
+            bytes: 6,
+            sha256: hex::encode(Sha256::digest(b"abcdef")),
+        }
+    }
+
+    #[tokio::test]
+    async fn download_disk_pressure_never_publishes_partial_bytes_and_can_retry() {
+        for stage in ["write", "sync", "persist", "directory_sync"] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("artifact");
+            let spec = spec();
+            let mut download = ArtifactDownload::new(root.path(), &path, &spec).unwrap();
+            download.write(b"abc").await.unwrap();
+            download.fail_at = Some(stage);
+            let result = match download.write(b"def").await {
+                Ok(()) => download.finish().await,
+                Err(error) => {
+                    drop(download);
+                    Err(error)
+                }
+            };
+            assert!(matches!(result, Err(InstallError::Cache)));
+            if stage == "directory_sync" {
+                // A failed directory fsync may leave the verified rename visible.
+                // Recovery must hash it again rather than assume durable success.
+                assert!(cached(&path, &spec).unwrap());
+                assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
+            } else {
+                assert!(!path.exists());
+                assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
+            }
+            let mut retry = ArtifactDownload::new(root.path(), &path, &spec).unwrap();
+            retry.write(b"abc").await.unwrap();
+            retry.write(b"def").await.unwrap();
+            assert_eq!(retry.finish().await.unwrap(), 6);
+            assert!(cached(&path, &spec).unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn dropped_and_truncated_downloads_do_not_publish_or_replace_cached_files() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("artifact");
+        let spec = spec();
+        fs::write(&path, b"abcdef").unwrap();
+        let mut download = ArtifactDownload::new(root.path(), &path, &spec).unwrap();
+        download.write(b"abc").await.unwrap();
+        drop(download);
+        assert!(cached(&path, &spec).unwrap());
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
+        let mut download = ArtifactDownload::new(root.path(), &path, &spec).unwrap();
+        download.write(b"abc").await.unwrap();
+        assert!(matches!(
+            download.finish().await,
+            Err(InstallError::Integrity)
+        ));
+        assert!(cached(&path, &spec).unwrap());
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn streamed_hash_and_length_mismatches_never_publish() {
+        for body in [
+            b"abcdeg".as_slice(),
+            b"abcdefg".as_slice(),
+            b"abc".as_slice(),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("artifact");
+            let spec = spec();
+            let mut download = ArtifactDownload::new(root.path(), &path, &spec).unwrap();
+            let result = match download.write(body).await {
+                Ok(()) => download.finish().await,
+                Err(error) => {
+                    drop(download);
+                    Err(error)
+                }
+            };
+            assert!(matches!(result, Err(InstallError::Integrity)));
+            assert!(!path.exists());
+            assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
+        }
+    }
 }

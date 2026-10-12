@@ -9,6 +9,35 @@ during recording), **HISTORICAL** (a finalized transaction read back read-only),
 
 Target length: 2:30–3:00. Terminal font large enough to read; no browser needed.
 
+## Shielded Recording Update (2026-10-12)
+
+The scenes below describe the older public-bound demo. For the shielded submission,
+record this sequence instead. Do not present source-built commands as a published release.
+
+1. Show the qualified installed version and the pinned WMON deployment. If qualification
+   is incomplete, label the candidate as a team rehearsal, not a public release.
+2. Show a private negotiation and local proof from recorded evidence. Label replayed output
+   HISTORICAL or CACHED; do not imply that a cached proof is a new live payment.
+3. Read the real WMON payment receipt from Monad. This is HISTORICAL evidence, not a new submission:
+
+   ```sh
+   cast receipt 0xe01666d8c4e16efe8195da8047674c71a325ee20ff250f02f4fdf570a04934fa \
+     --rpc-url https://testnet-rpc.monad.xyz
+   ```
+
+   Expected historical receipt: success, block `69939428`, pool
+   `0x8868f35140f3602c80e2c76132740b6f0c0b409d`. Check the actual result before recording.
+   Native transaction value is zero because the transfer moves shielded WMON notes inside the pool.
+   The outer gas sender is public. No stealth-address or relayer claim applies.
+4. Show retained recovery with one broadcast, resource retrieval after seller restart,
+   and recipient-only verification. Label late retrieval and `delivery_verified: false` accurately.
+5. Show withdrawal/unwrap only after finalized live evidence exists. These steps remain
+   open today; a local test or synthetic witness cannot stand in for a Monad withdrawal.
+
+Keep the recording within three minutes. State: Monad testnet, test-only single-operator setup,
+unaudited, visible funding/withdrawals, and a small anonymity set. Never display keys,
+note openings, witnesses, grants or authenticated configuration files.
+
 ## Preconditions
 
 - A fresh install from the public index (the dev5 environment used here is

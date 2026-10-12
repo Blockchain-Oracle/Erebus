@@ -6,6 +6,8 @@
 
 use std::collections::HashSet;
 
+use serde::{Deserialize, Serialize};
+
 use erebus_coordinator::Coordinator;
 use erebus_core::{
     commitment::DealNullifier,
@@ -20,7 +22,7 @@ use crate::{
     index_store::IndexStore,
     indexer::{DealTransfer, PoolBlock, PoolEvent, PoolIndex},
     recovery::{sync_public_index_step, RecoveryError},
-    rpc::{PoolFinalizedBlock, PoolIdentity, PoolRpc, RpcError},
+    rpc::{PoolFinalizedBlock, PoolIdentity, PoolRpc, PoolSnapshot, RpcError},
 };
 
 /// Pool observations cannot safely decide this deal.
@@ -47,6 +49,40 @@ pub enum ObservationError {
     /// The indexed event and consumed-state reads disagree.
     #[error("shielded pool event and consumed state disagree")]
     Inconsistent,
+}
+
+/// Where the pool event that consumed a deal sits on the canonical chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SettlementLocation {
+    /// Canonical block holding the pool event.
+    pub block_number: u64,
+    /// Hash of that block, rechecked against the canonical numeric lookup.
+    pub block_hash: [u8; 32],
+    /// Transaction that emitted the pool event.
+    pub transaction_hash: [u8; 32],
+    /// Log position of the pool event in its block.
+    pub log_index: u32,
+}
+
+/// One deal observation together with the anchors it was read at.
+///
+/// The paired observer returns this only when both providers produced every field identically,
+/// including the settlement location and pool identity. It is still not a consensus proof.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnchoredDealObservation {
+    /// RPC-finalized anchor the consumed state and finality decision were read at.
+    pub finalized: PoolFinalizedBlock,
+    /// Head block number the history was synchronized to.
+    pub head_number: u64,
+    /// Head block hash the history was synchronized to.
+    pub head_hash: [u8; 32],
+    /// Pool asset and verifier version read at the finalized anchor.
+    pub pool: PoolIdentity,
+    /// The indexed pool event that consumed the deal, if any.
+    pub settlement: Option<SettlementLocation>,
+    /// Deal evidence derived from the same reads.
+    pub evidence: DealEvidence,
 }
 
 /// Reconciles one shielded operation using only its durable openings and verified pool reads.
@@ -106,15 +142,21 @@ pub async fn observe_shielded_deal_bounded(
     revisions: &[SignedRevision],
     max_blocks: u64,
 ) -> Result<DealEvidence, ObservationError> {
-    Ok(
-        anchored_shielded_deal(rpc, index_store, context, nullifier, revisions, max_blocks)
-            .await?
-            .2,
+    Ok(anchored_shielded_deal(
+        rpc,
+        index_store,
+        context,
+        nullifier,
+        revisions,
+        max_blocks,
+        None,
     )
+    .await?
+    .evidence)
 }
 
 /// Opt-in observation through two RPCs with separate index caches and matching deployment anchors.
-/// Differing heads, finalized anchors, or deal reads are errors, never evidence of nonpayment.
+/// Honest tip lag uses a shared canonical snapshot; differing block or deal reads are errors.
 /// The operator must arrange independent providers; this does not prove their honesty.
 #[allow(clippy::too_many_arguments)]
 pub async fn observe_shielded_deal_agreed(
@@ -152,6 +194,84 @@ pub async fn observe_shielded_deal_agreed_bounded(
     revisions: &[SignedRevision],
     max_blocks: u64,
 ) -> Result<DealEvidence, ObservationError> {
+    let (first, second) = paired_observations(
+        rpc,
+        index_store,
+        peer_rpc,
+        peer_index,
+        context,
+        nullifier,
+        revisions,
+        max_blocks,
+        false,
+    )
+    .await?;
+    // Compares exactly what this function has always compared; the stricter certified variant
+    // below also requires agreement on the settlement location and pool identity.
+    if (
+        first.finalized,
+        first.head_number,
+        first.head_hash,
+        &first.evidence,
+    ) != (
+        second.finalized,
+        second.head_number,
+        second.head_hash,
+        &second.evidence,
+    ) {
+        return Err(ObservationError::Inconsistent);
+    }
+    recheck_anchors(rpc, peer_rpc, &first).await?;
+    Ok(first.evidence)
+}
+
+/// Paired observation that also returns the anchors and settlement location it agreed on.
+///
+/// Both providers must agree on every returned field, including the settlement block, its
+/// transaction hash and log index, and the pool identity at the finalized anchor. A
+/// disagreement on any of them is [`ObservationError::Inconsistent`], never unpaid evidence.
+#[allow(clippy::too_many_arguments)]
+pub async fn observe_shielded_deal_certified_bounded(
+    rpc: &PoolRpc,
+    index_store: &IndexStore,
+    peer_rpc: &PoolRpc,
+    peer_index: &IndexStore,
+    context: &SettlementContext,
+    nullifier: &DealNullifier,
+    revisions: &[SignedRevision],
+    max_blocks: u64,
+) -> Result<AnchoredDealObservation, ObservationError> {
+    let (first, second) = paired_observations(
+        rpc,
+        index_store,
+        peer_rpc,
+        peer_index,
+        context,
+        nullifier,
+        revisions,
+        max_blocks,
+        true,
+    )
+    .await?;
+    if first != second {
+        return Err(ObservationError::Inconsistent);
+    }
+    recheck_anchors(rpc, peer_rpc, &first).await?;
+    Ok(first)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn paired_observations(
+    rpc: &PoolRpc,
+    index_store: &IndexStore,
+    peer_rpc: &PoolRpc,
+    peer_index: &IndexStore,
+    context: &SettlementContext,
+    nullifier: &DealNullifier,
+    revisions: &[SignedRevision],
+    max_blocks: u64,
+    certify_cached_payment: bool,
+) -> Result<(AnchoredDealObservation, AnchoredDealObservation), ObservationError> {
     if index_store.domain() != peer_index.domain()
         || rpc.endpoint() == peer_rpc.endpoint()
         || index_store
@@ -160,24 +280,81 @@ pub async fn observe_shielded_deal_agreed_bounded(
     {
         return Err(ObservationError::Context);
     }
-    let (first, second) = tokio::join!(
-        anchored_shielded_deal(rpc, index_store, context, nullifier, revisions, max_blocks),
-        anchored_shielded_deal(peer_rpc, peer_index, context, nullifier, revisions, max_blocks)
-    );
-    let first = first?;
-    if first != second? {
-        return Err(ObservationError::Inconsistent);
+    let mut snapshot = rpc
+        .shared_snapshot(peer_rpc)
+        .await
+        .map_err(|error| match error {
+            RpcError::Evidence(_) => ObservationError::Inconsistent,
+            other => ObservationError::Rpc(other),
+        })?;
+    if certify_cached_payment {
+        let first = index_store.load().map_err(RecoveryError::from)?;
+        let second = peer_index.load().map_err(RecoveryError::from)?;
+        if let (Some(first_tip), Some(second_tip), Some(first_payment), Some(second_payment)) = (
+            first.tip(),
+            second.tip(),
+            first.deal_transfer(nullifier.as_bytes()),
+            second.deal_transfer(nullifier.as_bytes()),
+        ) {
+            // A known finalized winner needs its complete prefix, not unrelated later activity.
+            // Absence evidence and wallet/coordinator recovery still scan to the current head.
+            if first_tip.number == second_tip.number
+                && first_tip.hash == second_tip.hash
+                && first_tip.number <= snapshot.finalized.number
+                && first_payment == second_payment
+                && revisions.iter().any(|revision| {
+                    revision.commitment().as_bytes() == &first_payment.deal_commitment
+                })
+            {
+                snapshot = rpc
+                    .shared_finalized_prefix(peer_rpc, snapshot, first_tip.number, first_tip.hash)
+                    .await?;
+            }
+        }
     }
+    let (first, second) = tokio::join!(
+        anchored_shielded_deal(
+            rpc,
+            index_store,
+            context,
+            nullifier,
+            revisions,
+            max_blocks,
+            Some(snapshot)
+        ),
+        anchored_shielded_deal(
+            peer_rpc,
+            peer_index,
+            context,
+            nullifier,
+            revisions,
+            max_blocks,
+            Some(snapshot)
+        )
+    );
+    Ok((first?, second?))
+}
+
+/// Rechecks both agreed anchors on both providers after every dependent read.
+async fn recheck_anchors(
+    rpc: &PoolRpc,
+    peer_rpc: &PoolRpc,
+    observed: &AnchoredDealObservation,
+) -> Result<(), ObservationError> {
     for source in [rpc, peer_rpc] {
-        if source.canonical_block_hash(first.0.number).await? != first.0.hash
-            || source.canonical_block_hash(first.1 .0).await? != first.1 .1
+        if source
+            .canonical_block_hash(observed.finalized.number)
+            .await?
+            != observed.finalized.hash
+            || source.canonical_block_hash(observed.head_number).await? != observed.head_hash
         {
             return Err(ObservationError::Inconsistent);
         }
     }
-    Ok(first.2)
+    Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn anchored_shielded_deal(
     rpc: &PoolRpc,
     index_store: &IndexStore,
@@ -185,7 +362,8 @@ async fn anchored_shielded_deal(
     nullifier: &DealNullifier,
     revisions: &[SignedRevision],
     max_blocks: u64,
-) -> Result<(PoolFinalizedBlock, (u64, [u8; 32]), DealEvidence), ObservationError> {
+    snapshot: Option<PoolSnapshot>,
+) -> Result<AnchoredDealObservation, ObservationError> {
     if context.mode != SettlementMode::Shielded
         || context.suite_id != SHIELDED_POSEIDON_EDDSA_SUITE_ID
         || context.required_guarantees.bits() != SHIELDED_GUARANTEES
@@ -207,7 +385,10 @@ async fn anchored_shielded_deal(
         return Err(ObservationError::Revisions);
     }
 
-    let finalized = rpc.finalized_head().await?;
+    let finalized = match snapshot {
+        Some(snapshot) => snapshot.finalized,
+        None => rpc.finalized_head().await?,
+    };
     if finalized.number < index_store.domain().first_block {
         return Err(ObservationError::FinalityPending);
     }
@@ -215,7 +396,10 @@ async fn anchored_shielded_deal(
     if !matches_pool_identity(context, identity) {
         return Err(ObservationError::Context);
     }
-    let head_number = rpc.head().await?;
+    let head_number = match snapshot {
+        Some(snapshot) => snapshot.head_number,
+        None => rpc.head().await?,
+    };
     if head_number < finalized.number {
         return Err(ObservationError::Inconsistent);
     }
@@ -226,12 +410,21 @@ async fn anchored_shielded_deal(
     let consumed_at_head = rpc
         .consumed_deal_at(*nullifier.as_bytes(), report.block_hash)
         .await?;
-    if let Some(transfer) = index.deal_transfer(nullifier.as_bytes()) {
-        let canonical = rpc.read_block(transfer.block_number).await?;
-        if !matches_canonical_transfer(transfer, &canonical) {
-            return Err(ObservationError::Inconsistent);
+    let settlement = match index.deal_transfer(nullifier.as_bytes()) {
+        Some(transfer) => {
+            let canonical = rpc.read_block(transfer.block_number).await?;
+            if !matches_canonical_transfer(transfer, &canonical) {
+                return Err(ObservationError::Inconsistent);
+            }
+            Some(SettlementLocation {
+                block_number: transfer.block_number,
+                block_hash: transfer.block_hash,
+                transaction_hash: transfer.tx_hash,
+                log_index: transfer.log_index,
+            })
         }
-    }
+        None => None,
+    };
     let evidence = indexed_evidence(
         &index,
         nullifier,
@@ -241,7 +434,8 @@ async fn anchored_shielded_deal(
         consumed_at_head,
     )?;
 
-    if rpc.canonical_block_hash(head_number).await? != report.block_hash
+    if snapshot.is_some_and(|snapshot| snapshot.head_hash != report.block_hash)
+        || rpc.canonical_block_hash(head_number).await? != report.block_hash
         || rpc.canonical_block_hash(finalized.number).await? != finalized.hash
     {
         return Err(ObservationError::Inconsistent);
@@ -252,7 +446,14 @@ async fn anchored_shielded_deal(
     {
         return Err(ObservationError::Inconsistent);
     }
-    Ok((finalized, (head_number, report.block_hash), evidence))
+    Ok(AnchoredDealObservation {
+        finalized,
+        head_number,
+        head_hash: report.block_hash,
+        pool: identity,
+        settlement,
+        evidence,
+    })
 }
 
 fn matches_pool_identity(context: &SettlementContext, identity: PoolIdentity) -> bool {

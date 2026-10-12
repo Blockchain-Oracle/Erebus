@@ -57,7 +57,11 @@ enum Request {
         namespace: String,
         assets: Vec<String>,
         descriptor_lifetime_seconds: u64,
+        #[serde(default = "operator::default_suite")]
+        suite_id: u16,
     },
+    /// Private, deployment-bound attestation for suite-2 template preparation.
+    PrepareBinding(Box<operator::BindingRequest>),
     /// The canonical service template, from both verified descriptors.
     PrepareTerms(Box<operator::TermsRequest>),
     Negotiate {
@@ -497,14 +501,14 @@ fn negotiate(
         } else {
             None
         };
-        NegotiationBootstrap::shielded(
+        NegotiationBootstrap::shielded_with_clock(
             channel,
             context.clone(),
             buyer,
             seller,
             &binding,
             recipient,
-            current,
+            || now().map_err(|_| erebus_transport::negotiation::peer::PeerError::Binding),
         )
     }
     .map_err(|_| "negotiation identity binding failed")?;
@@ -656,7 +660,11 @@ fn negotiate(
                 .map_err(|_| "invalid chain id")?;
             let wallet = WalletStore::new(
                 wallet_file,
-                WalletDomain { chain_id, pool },
+                WalletDomain {
+                    chain_id,
+                    pool,
+                    verifier_version: context.domain.verifier_version,
+                },
                 *encryption_key,
             )
             .map_err(|_| "seller wallet unavailable")?;
@@ -871,6 +879,7 @@ fn main() {
                 namespace,
                 assets,
                 descriptor_lifetime_seconds,
+                suite_id,
             } => operator::prepare_operator(
                 &directory,
                 &role,
@@ -878,7 +887,9 @@ fn main() {
                 &namespace,
                 &assets,
                 descriptor_lifetime_seconds,
+                suite_id,
             ),
+            Request::PrepareBinding(request) => operator::prepare_binding(*request),
             Request::PrepareTerms(request) => operator::prepare_terms(*request),
         }
     })();

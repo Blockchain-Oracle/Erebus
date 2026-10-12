@@ -32,7 +32,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         first_hash: fixed_hex::<32>(&args[5])?,
     };
     let index = IndexStore::new(&args[6], domain)?;
-    let wallet = WalletStore::new(&args[7], WalletDomain { chain_id, pool }, [8; 32])?;
+    let wallet = WalletStore::new(
+        &args[7],
+        WalletDomain {
+            chain_id,
+            pool,
+            verifier_version: 2,
+        },
+        [8; 32],
+    )?;
     let fixture: Value = serde_json::from_str(include_str!(
         "../../core/tests/fixtures/m5-note-vector.json"
     ))?;
@@ -45,6 +53,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         fixed_hex::<64>(string("ownerHex")?)?,
         fixed_hex::<32>(string("spendSecretHex")?)?,
         fixed_hex::<32>(string("saltHex")?)?,
+        fixed_hex::<32>(
+            fixture["noteDomainHex"]
+                .as_str()
+                .ok_or("missing note domain")?,
+        )?,
     )?;
     wallet.update(|snapshot| {
         if snapshot.notes().is_empty() {

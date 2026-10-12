@@ -10,6 +10,7 @@ use std::{
 
 use erebus_core::{shielded_auth, terms::AgreementTerms};
 use erebus_shielded_prover::access::{request_digest, AccessRequest};
+use erebus_shielded_prover::rpc::PoolRpc;
 use erebus_transport::disclosure::{verify_selected_agreement, SelectedAgreement};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -52,7 +53,12 @@ async fn start(config: &Path, url: &str, client: &reqwest::Client) -> Service {
             service.0.try_wait().unwrap().is_none(),
             "access service stopped"
         );
-        if client.get(format!("{url}/healthz")).send().await.is_ok() {
+        if client
+            .get(format!("{url}/healthz"))
+            .send()
+            .await
+            .is_ok_and(|response| response.status().is_success())
+        {
             return service;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -135,6 +141,17 @@ pub async fn run(
         .parse()
         .unwrap();
     let config = root.join("access-config.json");
+    let pool = terms.domain.pool.as_ref().expect("shielded pool");
+    // This local fixture derives pins from its own deployment, not a release trust root.
+    let runtime = PoolRpc::new(
+        rpc_url,
+        chain_id,
+        pool.as_bytes().try_into().expect("20-byte pool address"),
+    )
+    .expect("fixture pool RPC")
+    .runtime_pins_at(first_hash)
+    .await
+    .expect("fixture deployment runtimes");
     private_file(
         &config,
         &serde_json::to_vec(&json!({
@@ -142,9 +159,14 @@ pub async fn run(
             "suite_id":2, "resource":terms.service.resource, "payload_file":payload_file,
             "evidence_root":directory, "state_root":root.join("access-state"), "port":port,
             "backend":{"mode":"shielded", "chain_id":chain_id,
-                "pool":format!("0x{}",hex::encode(terms.domain.pool.as_ref().expect("shielded pool").as_bytes())),
+                "pool":format!("0x{}",hex::encode(pool.as_bytes())),
                 "rpc_url":rpc_url, "peer_rpc_url":peer_rpc_url,
-                "first_block":first_block, "first_hash":first_hash}
+                "first_block":first_block, "first_hash":first_hash,
+                "runtime_keccak256":hex::encode(runtime.pool),
+                "poseidon_keccak256":hex::encode(runtime.poseidon),
+                "deposit_verifier_keccak256":hex::encode(runtime.deposit),
+                "transfer_verifier_keccak256":hex::encode(runtime.transfer),
+                "withdraw_verifier_keccak256":hex::encode(runtime.withdraw)}
         }))
         .unwrap(),
     );

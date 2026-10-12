@@ -76,7 +76,7 @@ impl NegotiationBootstrap {
     /// Identity exchange neither proves possession nor authorizes or settles a payment.
     #[allow(clippy::too_many_arguments)]
     pub fn shielded(
-        mut channel: SocketChannel,
+        channel: SocketChannel,
         context: SettlementContext,
         buyer: &ServiceDescriptor,
         seller: &ServiceDescriptor,
@@ -84,6 +84,40 @@ impl NegotiationBootstrap {
         seller_recipient: Option<KeyBytes>,
         now: u64,
     ) -> Result<Self, PeerError> {
+        Self::shielded_with_clock(
+            channel,
+            context,
+            buyer,
+            seller,
+            local_binding,
+            seller_recipient,
+            || Ok(now),
+        )
+    }
+
+    /// Exchanges shielded identities using fresh validation time after blocking reads.
+    /// The clock must not move backward or fail; validity windows are never widened.
+    /// Use `shielded` only when a fixed logical time is intended.
+    #[allow(clippy::too_many_arguments)]
+    pub fn shielded_with_clock(
+        mut channel: SocketChannel,
+        context: SettlementContext,
+        buyer: &ServiceDescriptor,
+        seller: &ServiceDescriptor,
+        local_binding: &AgreementKeyBinding,
+        seller_recipient: Option<KeyBytes>,
+        mut clock: impl FnMut() -> Result<u64, PeerError>,
+    ) -> Result<Self, PeerError> {
+        let now = clock()?;
+        let mut last_validation = now;
+        let mut validation_clock = || {
+            let next = clock()?;
+            if next < last_validation {
+                return Err(PeerError::Binding);
+            }
+            last_validation = next;
+            Ok(next)
+        };
         Self::check_connection(&channel, &context, buyer, seller, now)?;
         if context.suite_id != 2
             || context.mode != SettlementMode::Shielded
@@ -123,17 +157,36 @@ impl NegotiationBootstrap {
         .map_err(|_| PeerError::Binding)?;
         let remote = if channel.local_role() == Role::Buyer {
             channel.send(&message)?;
-            read_identity(&mut channel, &context, remote_descriptor, now)?
+            read_identity(
+                &mut channel,
+                &context,
+                remote_descriptor,
+                &mut validation_clock,
+            )?
         } else {
-            let remote = read_identity(&mut channel, &context, remote_descriptor, now)?;
+            let remote = read_identity(
+                &mut channel,
+                &context,
+                remote_descriptor,
+                &mut validation_clock,
+            )?;
             channel.send(&message)?;
             remote
         };
+        let completed_at = validation_clock()?;
+        Self::check_connection(&channel, &context, buyer, seller, completed_at)?;
+        local_binding
+            .attested_key(local_descriptor, &context.domain, completed_at)
+            .map_err(|_| PeerError::Binding)?;
+        let remote_key = remote
+            .0
+            .attested_key(remote_descriptor, &context.domain, completed_at)
+            .map_err(|_| PeerError::Binding)?;
         let (buyer_key, seller_key, recipient) = if channel.local_role() == Role::Buyer {
-            (local_key, remote.0, remote.1.ok_or(PeerError::Binding)?)
+            (local_key, remote_key, remote.1.ok_or(PeerError::Binding)?)
         } else {
             (
-                remote.0,
+                remote_key,
                 local_key,
                 seller_recipient.ok_or(PeerError::Binding)?,
             )
@@ -329,8 +382,8 @@ fn read_identity(
     channel: &mut SocketChannel,
     context: &SettlementContext,
     descriptor: &ServiceDescriptor,
-    now: u64,
-) -> Result<(KeyBytes, Option<KeyBytes>), PeerError> {
+    clock: &mut impl FnMut() -> Result<u64, PeerError>,
+) -> Result<(AgreementKeyBinding, Option<KeyBytes>), PeerError> {
     let message = channel.receive()?;
     if message.deal_id != [0; 16]
         || message.revision != 1
@@ -357,8 +410,8 @@ fn read_identity(
                 .map_err(|_| PeerError::Binding)?,
         )
         .map_err(|_| PeerError::Binding)?;
-        let key = binding
-            .attested_key(descriptor, &context.domain, now)
+        binding
+            .attested_key(descriptor, &context.domain, clock()?)
             .map_err(|_| PeerError::Binding)?;
         let recipient = reader
             .bytes("recipient", 0, 32)
@@ -375,7 +428,7 @@ fn read_identity(
             Some(KeyBytes::new(recipient.to_vec()).map_err(|_| PeerError::Binding)?)
         };
         reader.finish().map_err(|_| PeerError::Binding)?;
-        Ok((key, recipient))
+        Ok((binding, recipient))
     })();
     if parse.is_err() {
         channel.close();

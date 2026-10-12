@@ -92,6 +92,37 @@ fn field<'a>(value: &'a Value, key: &str) -> &'a str {
     value[key].as_str().expect("pinned string")
 }
 
+#[test]
+fn private_agreement_objects_redact_normal_and_pretty_debug() {
+    let (terms, _, _) = fixture_terms();
+    let mapped = ShieldedDeal::from_terms(&terms).unwrap();
+    for (normal, pretty, expected) in [
+        (
+            format!("{terms:?}"),
+            format!("{terms:#?}"),
+            "AgreementTerms { <redacted> }",
+        ),
+        (
+            format!("{:?}", terms.service),
+            format!("{:#?}", terms.service),
+            "ServiceRecord { <redacted> }",
+        ),
+        (
+            format!("{:?}", terms.fee_policy),
+            format!("{:#?}", terms.fee_policy),
+            "FeePolicy { <redacted> }",
+        ),
+        (
+            format!("{mapped:?}"),
+            format!("{mapped:#?}"),
+            "ShieldedDeal { <redacted> }",
+        ),
+    ] {
+        assert_eq!(normal, expected);
+        assert_eq!(pretty, expected);
+    }
+}
+
 fn fixture_terms() -> (AgreementTerms, CommitmentBlinding, Value) {
     let vector: Value = serde_json::from_str(FIXTURE).expect("pinned JSON");
     let input = &vector["terms"];
@@ -370,4 +401,139 @@ fn shielded_agreement_requires_both_roles_and_the_exact_opening() {
     let mut bad = seller.clone();
     bad.signature = SignatureBytes::new(vec![0; 96]).expect("length");
     assert!(verify_agreement(&terms, &blinding, &buyer, &bad, 1).is_err());
+}
+
+#[test]
+fn identity_authorization_keys_cannot_authorize_any_agreement() {
+    // `(0, 1)` is on-curve and in the prime-order subgroup, so the EdDSA check accepts it,
+    // but with `A` the identity the verification equation reduces to `S*Base8 == R8`.
+    // The publicly known `(R8 = Base8, S = 1)` therefore forges any message.
+    let mut identity = [0u8; 64];
+    identity[63] = 1;
+    let message = [0x11; 32];
+    let mut forgery = [0u8; 96];
+    forgery[..32].copy_from_slice(&fixed::<32>(
+        "0bb77a6ad63e739b4eacb2e09d6277c12ab8d8010534e0b62893f3f6bb957051",
+    ));
+    forgery[32..64].copy_from_slice(&fixed::<32>(
+        "25797203f7a0b24925572e1cd16bf9edfce0051fb9e133774b3c257a872d7d8b",
+    ));
+    forgery[95] = 1;
+    assert!(
+        verify_message(&identity, &message, &forgery).is_err(),
+        "identity key must never verify a signature"
+    );
+
+    let (terms, blinding, _) = fixture_terms();
+    for role in [Role::Buyer, Role::Seller] {
+        let mut candidate = terms.clone();
+        match role {
+            Role::Buyer => {
+                candidate.buyer_authorization_key =
+                    KeyBytes::new(identity.to_vec()).expect("bounded identity key")
+            }
+            Role::Seller => {
+                candidate.seller_authorization_key =
+                    KeyBytes::new(identity.to_vec()).expect("bounded identity key")
+            }
+        }
+        assert!(ShieldedDeal::from_terms(&candidate).is_err());
+        assert!(erebus_core::commitment::commit_agreement(&candidate, &blinding).is_err());
+    }
+}
+
+/// The compiled circomlib `EdDSAPoseidonVerifier` was probed with these exact vectors
+/// (scalar u=7, r=11, message 0x3039): the valid and torsion-shifted witnesses were accepted
+/// by the circuit, the identity and order-2 keys were rejected by the `8A.x != 0` check, and
+/// `S = subOrder` was rejected by the scalar bound. Rust verification must accept the control
+/// and reject the torsion-shifted key, the off-curve key, and the out-of-range scalars.
+#[test]
+fn circuit_probe_vectors_show_the_exact_circuit_rust_divergence() {
+    let message = fixed("0000000000000000000000000000000000000000000000000000000000003039");
+    let build = |ax: &str, ay: &str, r8x: &str, r8y: &str, s: &str| {
+        let mut key = [0u8; 64];
+        key[..32].copy_from_slice(&fixed::<32>(ax));
+        key[32..].copy_from_slice(&fixed::<32>(ay));
+        let mut signature = [0u8; 96];
+        signature[..32].copy_from_slice(&fixed::<32>(r8x));
+        signature[32..64].copy_from_slice(&fixed::<32>(r8y));
+        signature[64..].copy_from_slice(&fixed::<32>(s));
+        (key, signature)
+    };
+    let (valid_key, valid_signature) = build(
+        "2c6bfc7fe056ed38e26ec136ec8aec5f63ecc4b52c44afba967649cf1e6e2311",
+        "1ac7675df6265f6e12d1c79a2b3b6658a0d46a320fba497ad0b817f9b19e0f21",
+        "2fc449e2dd0c5349d06092adc126e213858984584e429842d87bcc705837c765",
+        "29b060ee13f1da3bde25e0e11c23a145656ede61710ed78593d69b8bdbc1a581",
+        "026d7d9c96207d442cfb81d682e7a20e0ba5596b77e6593cc6e412df0ae75c0e",
+    );
+    assert!(
+        verify_message(&valid_key, &message, &valid_signature).is_ok(),
+        "prime-order control must verify in Rust"
+    );
+
+    let (torsion_key, torsion_signature) = build(
+        "03f851f300dab2f0d5e1847f94f66bfdc44723934d74c0d6ad6babc4d191dcf0",
+        "159ce714eb0b40bba57e7e1c5645f204875f7e1669ff27167329dd9a3e61f0e0",
+        "2fc449e2dd0c5349d06092adc126e213858984584e429842d87bcc705837c765",
+        "29b060ee13f1da3bde25e0e11c23a145656ede61710ed78593d69b8bdbc1a581",
+        "000d56b420978461b973793e381de98bc30ec281fa5a6282825376d21ddd5a6c",
+    );
+    assert!(
+        verify_message(&torsion_key, &message, &torsion_signature).is_err(),
+        "Rust must reject a torsion-shifted key the circuit probe accepted"
+    );
+
+    let one = "0000000000000000000000000000000000000000000000000000000000000001";
+    let (off_curve_key, _) = build(one, one, one, one, one);
+    assert!(verify_message(&off_curve_key, &message, &valid_signature).is_err());
+
+    let mut zero_s = valid_signature;
+    zero_s[64..].fill(0);
+    assert!(verify_message(&valid_key, &message, &zero_s).is_err());
+
+    let (_, suborder_s) = build(
+        "2c6bfc7fe056ed38e26ec136ec8aec5f63ecc4b52c44afba967649cf1e6e2311",
+        "1ac7675df6265f6e12d1c79a2b3b6658a0d46a320fba497ad0b817f9b19e0f21",
+        "2fc449e2dd0c5349d06092adc126e213858984584e429842d87bcc705837c765",
+        "29b060ee13f1da3bde25e0e11c23a145656ede61710ed78593d69b8bdbc1a581",
+        "060c89ce5c263405370a08b6d0302b0bab3eedb83920ee0a677297dc392126f1",
+    );
+    assert!(verify_message(&valid_key, &message, &suborder_s).is_err());
+}
+
+/// Rust's exact identity handling: `erebus-core` rejects only the identity authorization key
+/// (`A = (0,1)`); the dependency has no R8 identity check, and the circomlib verifier's
+/// `8A.x != 0` likewise rejects only A. Both sides therefore accept an identity R8 signature
+/// that a keyholder can produce, and both reject off-curve points. The circuit probe accepts
+/// the same identity-R8 vector (`identity_r8` → WITNESS_OK for the plain and strict verifiers).
+#[test]
+fn identity_r8_is_accepted_by_both_sides_and_off_curve_r8_is_rejected() {
+    let message = fixed("0000000000000000000000000000000000000000000000000000000000003039");
+    let mut key = [0u8; 64];
+    key[..32].copy_from_slice(&fixed::<32>(
+        "2c6bfc7fe056ed38e26ec136ec8aec5f63ecc4b52c44afba967649cf1e6e2311",
+    ));
+    key[32..].copy_from_slice(&fixed::<32>(
+        "1ac7675df6265f6e12d1c79a2b3b6658a0d46a320fba497ad0b817f9b19e0f21",
+    ));
+    let mut identity_r8 = [0u8; 96];
+    identity_r8[63] = 1;
+    identity_r8[64..].copy_from_slice(&fixed::<32>(
+        "01bf40e60d413d071d3fb7c89716a969b4b2f619b57b40f6383e740087a8a5e9",
+    ));
+    assert!(
+        verify_message(&key, &message, &identity_r8).is_ok(),
+        "identity R8 with a matching signature is accepted, matching the circuit"
+    );
+
+    // Off-curve R8 = (1,1) is rejected by the on-curve check.
+    let mut off_curve_r8 = identity_r8;
+    off_curve_r8[31] = 1;
+    assert!(verify_message(&key, &message, &off_curve_r8).is_err());
+
+    // Identity A remains rejected by the core boundary.
+    let mut identity_a = [0u8; 64];
+    identity_a[63] = 1;
+    assert!(verify_message(&identity_a, &message, &identity_r8).is_err());
 }

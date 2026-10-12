@@ -26,6 +26,7 @@ class AccessSettings:
     binary: str | None = None
     allow_loopback_http: bool = False
     x402_exact: bool = False
+    profile: str = "snapshot"
 
     @classmethod
     def from_env(cls) -> AccessSettings:
@@ -51,10 +52,16 @@ class AccessSettings:
         development = os.environ.get("EREBUS_ALLOW_LOOPBACK_ACCESS_HTTP", "0")
         if development not in {"0", "1"}:
             raise ConfigError("loopback access exception must be 0 or 1")
+        profile = os.environ.get("EREBUS_ACCESS_PROFILE", "snapshot")
+        if profile not in {"snapshot", "metered"}:
+            raise ConfigError("access profile must be snapshot or metered")
         rail = os.environ.get("EREBUS_ACCESS_PAYMENT_RAIL", "observe")
         if rail not in {"observe", "x402-exact"}:
             raise ConfigError("access payment rail must be observe or x402-exact")
-        return cls(directory.resolve(), key_file, url, service_id, Path(cache).expanduser(), os.environ.get("EREBUS_ACCESS_CLI"), development == "1", rail == "x402-exact")
+        if profile == "metered" and rail == "x402-exact":
+            raise ConfigError("metered access cannot use the x402-exact rail")
+        return cls(directory.resolve(), key_file, url, service_id, Path(cache).expanduser(),
+                   os.environ.get("EREBUS_ACCESS_CLI"), development == "1", rail == "x402-exact", profile)
 
     def evidence(self, name: str) -> str:
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,95}", name, flags=re.ASCII):
@@ -65,14 +72,26 @@ class AccessSettings:
 def build_access_server(settings: AccessSettings | None = None) -> MCPServer:
     """Rust handles key access, signatures, payload verification, and durable storage."""
     settings = settings or AccessSettings.from_env()
-    server = MCPServer(name="erebus-access", instructions=(
-        ("The operator selected x402-exact: the first retrieval locally authorizes payment and asks the seller to submit once. Retries reuse the durable permit. " if settings.x402_exact else "This server retrieves already paid resources and cannot authorize payment. ") +
-        "Retrieve one immutable snapshot using the existing buyer agreement key. "
-        "The endpoint, key path, and private evidence directory are fixed by the operator. "
-        "Private keys and payloads stay in local files. Rust verifies content against the signed agreement. "
-        "The seller's payment claim is not independent chain verification or a delivery audit. "
-        "Pending or failed access must not trigger another payment rail."
-    ))
+    if settings.profile == "metered":
+        instructions = (
+            "This server consumes prepaid metered calls and cannot authorize payment. "
+            "Rust keeps the durable cursor, signs each call with the existing buyer agreement key, "
+            "and retries the same in-flight index after a timeout, pending payment, or lost reply. "
+            "The endpoint, key path, and private evidence directory are fixed by the operator. "
+            "Private keys and response bodies stay in local files. "
+            "The seller's payment claim is not independent chain verification or a delivery audit. "
+            "Pending or failed calls must not trigger another payment rail."
+        )
+    else:
+        instructions = (
+            ("The operator selected x402-exact: the first retrieval locally authorizes payment and asks the seller to submit once. Retries reuse the durable permit. " if settings.x402_exact else "This server retrieves already paid resources and cannot authorize payment. ") +
+            "Retrieve one immutable snapshot using the existing buyer agreement key. "
+            "The endpoint, key path, and private evidence directory are fixed by the operator. "
+            "Private keys and payloads stay in local files. Rust verifies content against the signed agreement. "
+            "The seller's payment claim is not independent chain verification or a delivery audit. "
+            "Pending or failed access must not trigger another payment rail."
+        )
+    server = MCPServer(name="erebus-access", instructions=instructions)
     register_access_tools(server, settings)
     return server
 
@@ -85,6 +104,18 @@ def register_access_tools(server: MCPServer, settings: AccessSettings) -> None:
     except AccessError:
         raise ConfigError("configured access binary is unavailable or incompatible") from None
 
+    if settings.profile == "metered":
+        _register_metered_tools(server, settings, seam)
+    else:
+        _register_retrieval_tool(server, settings, seam)
+
+
+def _access_unavailable(error: AccessError) -> dict[str, Any]:
+    failure = {"code": "ACCESS_UNAVAILABLE", **error.public_failure(), "retry_without_payment": True}
+    return {"ok": False, "error": failure}
+
+
+def _register_retrieval_tool(server: MCPServer, settings: AccessSettings, seam: AccessSeam) -> None:
     @server.tool()
     async def retrieve_service_access(evidence_name: str) -> dict[str, Any]:
         """Retrieve a resource; operator-selected x402 mode authorizes its first payment.
@@ -105,4 +136,41 @@ def register_access_tools(server: MCPServer, settings: AccessSettings) -> None:
                     "verification_meaning": "resource_verified checks the resource hash; seller_reported_payment_finalized is the seller's claim; "
                     f"payment_verified comes only from {payment_source}; delivery_verified requires a separate delivery audit, not a successful download."}
         except AccessError as error:
-            return {"ok": False, "error": {"code": "ACCESS_UNAVAILABLE", "message": str(error), "retry_without_payment": True}}
+            return _access_unavailable(error)
+
+
+def _register_metered_tools(server: MCPServer, settings: AccessSettings, seam: AccessSeam) -> None:
+    @server.tool()
+    async def call_metered_service(evidence_name: str, call_index: int | None = None) -> dict[str, Any]:
+        """Consume one prepaid call, finish the call in flight, or return an earlier index.
+
+        A timeout, pending payment, or lost reply keeps the same index in flight; retry it,
+        never a new payment.
+        """
+        try:
+            response = await asyncio.to_thread(
+                seam.metered_call, evidence_file=settings.evidence(evidence_name), buyer_key_file=str(settings.buyer_key_file),
+                service_url=settings.service_url, service_id=settings.service_id, cache_root=str(settings.cache_root),
+                allow_loopback_http=settings.allow_loopback_http, call_index=call_index,
+            )
+            return {"ok": response["status"] == "issued", "result": response,
+                    "verification_meaning": "response_hash_consistent checks the bytes against the seller-reported hash; "
+                    "payment_verified is false: this server does not observe the chain; "
+                    "delivery_verified requires a separate delivery audit, not a successful download."}
+        except AccessError as error:
+            return _access_unavailable(error)
+
+    @server.tool()
+    async def metered_service_status(evidence_name: str) -> dict[str, Any]:
+        """Report the seller's allowance and reconcile the local cursor. Consumes nothing."""
+        try:
+            response = await asyncio.to_thread(
+                seam.metered_status, evidence_file=settings.evidence(evidence_name), buyer_key_file=str(settings.buyer_key_file),
+                service_url=settings.service_url, service_id=settings.service_id, cache_root=str(settings.cache_root),
+                allow_loopback_http=settings.allow_loopback_http,
+            )
+            return {"ok": response["status"] == "allowance", "result": response,
+                    "verification_meaning": "seller_next_call_index is the seller's report and next_call_index is the local cursor; "
+                    "payment_verified is false: this server does not observe the chain."}
+        except AccessError as error:
+            return _access_unavailable(error)

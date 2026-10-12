@@ -36,14 +36,21 @@ template DepositNote() {
     spendTagZero.in <== spendTag;
     spendTagZero.out === 0;
 
-    component note = Poseidon(7);
-    note.inputs[0] <== 2007;
-    note.inputs[1] <== asset;
-    note.inputs[2] <== amount;
-    note.inputs[3] <== ownerAx;
-    note.inputs[4] <== ownerAy;
-    note.inputs[5] <== spendTag;
-    note.inputs[6] <== salt;
+    // Notes are bound to one deployment domain so identical openings cannot produce
+    // identical commitments across chains, pools, or verifier versions.
+    component noteDomain = Poseidon(3);
+    noteDomain.inputs[0] <== chainId;
+    noteDomain.inputs[1] <== contractAddress;
+    noteDomain.inputs[2] <== verifierVersion;
+    component note = Poseidon(8);
+    note.inputs[0] <== 2010;
+    note.inputs[1] <== noteDomain.out;
+    note.inputs[2] <== asset;
+    note.inputs[3] <== amount;
+    note.inputs[4] <== ownerAx;
+    note.inputs[5] <== ownerAy;
+    note.inputs[6] <== spendTag;
+    note.inputs[7] <== salt;
     note.out === noteCommitment;
 
     // The pool checks these against its deployment. These constraints also ensure the

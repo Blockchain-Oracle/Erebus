@@ -98,6 +98,35 @@ The service record is part of the committed terms, so changing any field changes
 
 Payment and delivery are not fields of the service record. They are outcome states on the receipt (section 9); a receipt with a finalized payment and no delivery is representable and is not completion.
 
+### 4.1 Candidate prepaid profile (`http-metered-v1`)
+
+This unreleased profile uses the existing service record, without changing agreement encoding.
+It buys `quantity` calls (1..=4096), with `unit = call`, from one seller-configured feed.
+The access recipient must be the buyer's existing suite-2 agreement key. Calls accept no
+buyer parameters. A profile caps each response at 1..=65536 bytes.
+
+`fulfillment_digest` is SHA-256 of `EREBUS_HTTP_METERED_PROFILE_V1` followed by the
+big-endian `u16` version (1), big-endian `u32` response cap, and `u8` parameter mode (0).
+Changing the cap or profile changes the authorized agreement. The feed contents can change
+between calls; this digest binds the profile, not future content.
+
+A signed request binds the service, deployment, commitment, nullifier, operation, call index,
+zero parameter digest, request nonce, and expiry. Suite-2 authorization uses Poseidon tag
+3003 over both halves of the request digest. It cannot authorize a payment or disclosure.
+`sdk/shielded/tests/fixtures/metered-v1-vectors.json` and
+`scripts/check_agreement_vectors.py` check the byte and field mappings independently.
+
+The service certifies payment once from pinned finalized observations at both configured RPCs.
+It stores the canonical settlement location and runtime identities beside the entitlement.
+Each consumed index stores its original response before acknowledgment. Retries return those
+bytes; they do not consume another call or trigger payment. Exhaustion returns HTTP 403,
+not a payment challenge. This is private prepaid HTTP access, not standard x402 compatibility.
+
+The certificate trusts configured providers, their finalized anchors, and local durable state.
+Distinct endpoint fingerprints do not prove independent providers. The seller sees the
+agreement and each authenticated call. Timing and network metadata remain exposed.
+Content-hash verification is not independent payment verification or proof of service delivery.
+
 ## 5. Canonical encoding rules
 
 1. Every integer is big-endian at its full fixed width (`u8`, `u16`, `u32`, `u64`, `u128`).
@@ -124,6 +153,8 @@ not apply the suite-1 byte-hash formula to the canonical encoding. `sdk/core` co
 suite-2 commitment, nullifier, and BabyJubJub role authorizations and checks them against pinned
 JS/Circom vectors ([status](metropolis-status.md)). The `transcript_root` field is not
 hashed by the suite: it is produced by the transport's own versioned keccak256 derivation.
+Suite-2 authorization keys must be valid BabyJubJub points outside the identity; the Rust verifier
+rejects the identity key at verification and at commitment construction (M5A review).
 
 ## 7. Deal identity and revisions
 

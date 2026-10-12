@@ -947,6 +947,7 @@ async fn prepared_routing_fields_must_match_the_evidence() {
             nonce: 0,
             fees: Eip1559Fees::new(2_000_000_000, 1_000_000_000).unwrap(),
             gas_limit: 1_000_000,
+            value: 0,
         },
     )
     .unwrap();

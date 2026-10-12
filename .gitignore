@@ -29,6 +29,9 @@ contracts/evm/cache/
 circuits/m4/build/
 circuits/m5/build/
 
+# Operator-local Metropolis keys, witnesses, caches and qualification outputs.
+.local/metropolis/
+
 # Editor / local agent tooling. Skills are reproducible from skills-lock.json.
 .vscode/
 .agents/

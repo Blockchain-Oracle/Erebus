@@ -82,6 +82,13 @@ fn input_field(bytes: &[u8], label: &'static str) -> Result<String, ShieldedAuth
     Ok(field.to_string())
 }
 
+/// The identity point `(0, 1)` is on-curve and in the prime-order subgroup, so the
+/// underlying EdDSA check accepts it, but every message verifies under it with the
+/// publicly known signature `R8 = Base8, S = 1`. No participant may authorize with it.
+pub(crate) fn is_identity_key(key: &[u8]) -> bool {
+    key.len() == SHIELDED_KEY_BYTES && key[..63].iter().all(|byte| *byte == 0) && key[63] == 1
+}
+
 /// Derives the circuit's `(Ax, Ay)` key from a 32-byte seed.
 pub fn derive_key(seed: &[u8; 32]) -> Result<[u8; SHIELDED_KEY_BYTES], ShieldedAuthError> {
     let encoded = Zeroizing::new(hex::encode(seed));
@@ -132,6 +139,9 @@ pub fn verify_message(
 ) -> Result<(), ShieldedAuthError> {
     if key.len() != SHIELDED_KEY_BYTES || signature.len() != SHIELDED_SIGNATURE_BYTES {
         return Err(ShieldedAuthError::Length);
+    }
+    if is_identity_key(key) {
+        return Err(ShieldedAuthError::Field("identity authorization key"));
     }
     let request = serde_json::json!({
         "operation": "verify",

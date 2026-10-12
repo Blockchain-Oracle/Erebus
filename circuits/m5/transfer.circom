@@ -1,7 +1,7 @@
 pragma circom 2.2.3;
 
 include "circomlib/circuits/poseidon.circom";
-include "circomlib/circuits/eddsaposeidon.circom";
+include "eddsa_strict.circom";
 include "circomlib/circuits/bitify.circom";
 
 // Domain tags are distinct field elements; all hashes use circomlib Poseidon on BN254.
@@ -47,6 +47,7 @@ template PrivateTransfer(depth) {
     signal input pathIndices[depth];
     signal input changeAmount;
     signal input changeSpendTag;
+    signal input changeSpendSecret;
     signal input changeSalt;
 
     // Fixed shape for the prototype: one ERC-20 asset, one input, one recipient,
@@ -165,7 +166,7 @@ template PrivateTransfer(depth) {
     sellerMessage.inputs[0] <== 2005;
     sellerMessage.inputs[1] <== domain.out;
     sellerMessage.inputs[2] <== dealCommitment;
-    component buyerAuth = EdDSAPoseidonVerifier();
+    component buyerAuth = EddsaStrictVerifier();
     buyerAuth.enabled <== 1;
     buyerAuth.Ax <== buyerAx;
     buyerAuth.Ay <== buyerAy;
@@ -173,7 +174,7 @@ template PrivateTransfer(depth) {
     buyerAuth.R8y <== buyerR8y;
     buyerAuth.S <== buyerS;
     buyerAuth.M <== buyerMessage.out;
-    component sellerAuth = EdDSAPoseidonVerifier();
+    component sellerAuth = EddsaStrictVerifier();
     sellerAuth.enabled <== 1;
     sellerAuth.Ax <== sellerAx;
     sellerAuth.Ay <== sellerAy;
@@ -185,18 +186,20 @@ template PrivateTransfer(depth) {
     component spendTag = Poseidon(2);
     spendTag.inputs[0] <== 2006;
     spendTag.inputs[1] <== inputSpendSecret;
-    component inputNote = Poseidon(7);
-    inputNote.inputs[0] <== 2007;
-    inputNote.inputs[1] <== asset;
-    inputNote.inputs[2] <== inputAmount;
-    inputNote.inputs[3] <== buyerAx;
-    inputNote.inputs[4] <== buyerAy;
-    inputNote.inputs[5] <== spendTag.out;
-    inputNote.inputs[6] <== inputSalt;
-    component inputNull = Poseidon(3);
-    inputNull.inputs[0] <== 2008;
-    inputNull.inputs[1] <== inputSpendSecret;
-    inputNull.inputs[2] <== inputNote.out;
+    component inputNote = Poseidon(8);
+    inputNote.inputs[0] <== 2010;
+    inputNote.inputs[1] <== domain.out;
+    inputNote.inputs[2] <== asset;
+    inputNote.inputs[3] <== inputAmount;
+    inputNote.inputs[4] <== buyerAx;
+    inputNote.inputs[5] <== buyerAy;
+    inputNote.inputs[6] <== spendTag.out;
+    inputNote.inputs[7] <== inputSalt;
+    component inputNull = Poseidon(4);
+    inputNull.inputs[0] <== 2011;
+    inputNull.inputs[1] <== domain.out;
+    inputNull.inputs[2] <== inputSpendSecret;
+    inputNull.inputs[3] <== inputNote.out;
     inputNull.out === inputNullifier;
 
     signal pathNode[depth + 1];
@@ -211,24 +214,36 @@ template PrivateTransfer(depth) {
     }
     pathNode[depth] === root;
 
-    component paymentNote = Poseidon(7);
-    paymentNote.inputs[0] <== 2007;
-    paymentNote.inputs[1] <== asset;
-    paymentNote.inputs[2] <== amount;
-    paymentNote.inputs[3] <== sellerAx;
-    paymentNote.inputs[4] <== sellerAy;
-    paymentNote.inputs[5] <== recipientSpendTag;
-    paymentNote.inputs[6] <== paymentSalt.out;
+    component paymentNote = Poseidon(8);
+    paymentNote.inputs[0] <== 2010;
+    paymentNote.inputs[1] <== domain.out;
+    paymentNote.inputs[2] <== asset;
+    paymentNote.inputs[3] <== amount;
+    paymentNote.inputs[4] <== sellerAx;
+    paymentNote.inputs[5] <== sellerAy;
+    paymentNote.inputs[6] <== recipientSpendTag;
+    paymentNote.inputs[7] <== paymentSalt.out;
     paymentNote.out === paymentCommitment;
 
-    component changeNote = Poseidon(7);
-    changeNote.inputs[0] <== 2007;
-    changeNote.inputs[1] <== asset;
-    changeNote.inputs[2] <== changeAmount;
-    changeNote.inputs[3] <== buyerAx;
-    changeNote.inputs[4] <== buyerAy;
-    changeNote.inputs[5] <== changeSpendTag;
-    changeNote.inputs[6] <== changeSalt;
+    // The change tag is derived from the change spending secret, so a fabricated tag cannot
+    // leave the prover with unrecoverable change.
+    component changeTag = Poseidon(2);
+    changeTag.inputs[0] <== 2006;
+    changeTag.inputs[1] <== changeSpendSecret;
+    changeTag.out === changeSpendTag;
+    component changeSecretZero = IsZero();
+    changeSecretZero.in <== changeSpendSecret;
+    changeSecretZero.out === 0;
+
+    component changeNote = Poseidon(8);
+    changeNote.inputs[0] <== 2010;
+    changeNote.inputs[1] <== domain.out;
+    changeNote.inputs[2] <== asset;
+    changeNote.inputs[3] <== changeAmount;
+    changeNote.inputs[4] <== buyerAx;
+    changeNote.inputs[5] <== buyerAy;
+    changeNote.inputs[6] <== changeSpendTag;
+    changeNote.inputs[7] <== changeSalt;
     changeNote.out === changeCommitment;
 }
 

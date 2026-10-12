@@ -40,6 +40,8 @@ struct ShieldedConfig {
     wallet_key_file: PathBuf,
     manifest_file: PathBuf,
     manifest_sha256: String,
+    #[serde(default)]
+    manifest_authorization: Option<erebus_shielded_prover::artifacts::ManifestAuthorization>,
     artifact_cache: PathBuf,
     #[serde(default)]
     allow_test_artifacts: bool,
@@ -240,7 +242,11 @@ pub(super) async fn run(
     let wallet_key = read(&config.wallet_key_file, 32)?;
     let wallet = WalletStore::new(
         &config.wallet_file,
-        WalletDomain { chain_id, pool },
+        WalletDomain {
+            chain_id,
+            pool,
+            verifier_version: config.verifier_version,
+        },
         wallet_key
             .as_slice()
             .try_into()
@@ -351,12 +357,15 @@ pub(super) async fn run(
             "agent",
         )
         .map_err(|_| "authorized agreement does not match retained negotiation")?;
-        let release = ArtifactRelease::authenticate(
+        let release = ArtifactRelease::authenticate_authorized(
             &read(&config.manifest_file, MAX_MANIFEST_BYTES)?,
             digest(&config.manifest_sha256)?,
+            config.manifest_authorization.as_ref(),
         )
         .map_err(|_| "artifact manifest not authenticated")?;
-        if !release.matches_deployment(chain_id, pool, config.verifier_version) {
+        if !release.matches_deployment(chain_id, pool, config.verifier_version)
+            || !release.matches_verifier_pins(&pins)
+        {
             return Err("artifact release differs from authorized deployment");
         }
         let started = Instant::now();

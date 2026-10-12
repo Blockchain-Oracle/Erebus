@@ -8,6 +8,44 @@ use erebus_core::{
 use erebus_transport::identity::AuthorizationIdentity;
 use std::sync::Mutex;
 
+#[test]
+fn retrieval_budget_leaves_an_authentication_margin() {
+    assert_eq!(MAX_REQUEST_LIFETIME - client::RETRIEVAL_TIMEOUT_SECONDS, 60);
+}
+
+#[test]
+fn late_issuance_preserves_the_signed_deadline_and_recovers_after_restart() {
+    for suite in [1, 2] {
+        let (policy, paid, mut request) = fixture(suite);
+        let deadline = paid.evidence.terms.service.delivery_deadline;
+        let now = deadline + 1;
+        request.expires_at = now + MAX_REQUEST_LIFETIME;
+        request.signature = signature(
+            suite,
+            [1; 32],
+            &request_digest(
+                &paid.evidence,
+                policy.service_id,
+                request.nonce,
+                request.expires_at,
+                None,
+            )
+            .unwrap(),
+        );
+        let root = tempfile::tempdir().unwrap();
+        let issuer = AccessIssuer::open(root.path(), policy.clone()).unwrap();
+        let first = issuer.issue(&paid, &request, now).unwrap();
+        assert!(first.late);
+        drop(issuer);
+        let restarted = AccessIssuer::open(root.path(), policy).unwrap();
+        let repeated = restarted.issue(&paid, &request, now + 1).unwrap();
+        assert!(repeated.late && repeated.repeated);
+        assert_eq!(first.issued_at, repeated.issued_at);
+        assert_eq!(paid.evidence.terms.service.delivery_deadline, deadline);
+        assert_eq!(restarted.store.records().unwrap().len(), 1);
+    }
+}
+
 fn signature(suite: u16, seed: [u8; 32], digest: &[u8; 32]) -> Vec<u8> {
     if suite == 1 {
         AuthorizationIdentity::from_bytes(&seed)
@@ -128,6 +166,86 @@ fn lost_response_and_restart_reuse_one_durable_issuance() {
         assert_eq!(first.issuance_id, repeated.issuance_id);
         assert_eq!(first.issued_at, repeated.issued_at);
         assert_eq!(fresh.store.records().unwrap().len(), 1);
+    }
+}
+
+#[test]
+fn separately_authorized_neighboring_deals_cannot_share_access_or_issuance() {
+    for suite in [1, 2] {
+        let (policy, first, first_request) = fixture(suite);
+        let mut evidence = first.evidence.clone();
+        evidence.terms.deal_id[0] ^= 1;
+        evidence.terms.settlement_nonce[0] ^= 1;
+        let commitment = commit_agreement(&evidence.terms, &evidence.blinding).unwrap();
+        for (authorization, role, seed) in [
+            (&mut evidence.buyer, Role::Buyer, [1; 32]),
+            (&mut evidence.seller, Role::Seller, [2; 32]),
+        ] {
+            authorization.commitment = commitment;
+            authorization.signature = SignatureBytes::new(signature(
+                suite,
+                seed,
+                &authorization_digest(&evidence.terms.domain, role, &commitment, suite).unwrap(),
+            ))
+            .unwrap();
+        }
+        let second = PaidAccess {
+            agreement: verify_selected_agreement(&evidence).unwrap(),
+            evidence,
+        };
+        assert_ne!(first.agreement.commitment, second.agreement.commitment);
+        assert_ne!(first.agreement.nullifier, second.agreement.nullifier);
+        let mut second_request = first_request.clone();
+        second_request.deal_commitment = commitment.to_hex();
+        second_request.signature = signature(
+            suite,
+            [1; 32],
+            &request_digest(
+                &second.evidence,
+                policy.service_id,
+                second_request.nonce,
+                second_request.expires_at,
+                None,
+            )
+            .unwrap(),
+        );
+        let root = tempfile::tempdir().unwrap();
+        let issuer = AccessIssuer::open(root.path(), policy.clone()).unwrap();
+        issuer
+            .authenticate(&first.evidence, &first_request, 1000)
+            .unwrap();
+        issuer
+            .authenticate(&second.evidence, &second_request, 1000)
+            .unwrap();
+        for (paid, request) in [(&first, &second_request), (&second, &first_request)] {
+            assert_eq!(
+                issuer.issue(paid, request, 1000),
+                Err(AccessError::Authentication)
+            );
+        }
+        // Swapping only the identifier still cannot transplant a valid signature.
+        let mut transplanted = first_request.clone();
+        transplanted.deal_commitment = second_request.deal_commitment.clone();
+        assert_eq!(
+            issuer.issue(&second, &transplanted, 1000),
+            Err(AccessError::Authentication)
+        );
+        assert!(issuer.store.records().unwrap().is_empty());
+        let issued_first = issuer.issue(&first, &first_request, 1000).unwrap();
+        let issued_second = issuer.issue(&second, &second_request, 1000).unwrap();
+        assert_ne!(issued_first.issuance_id, issued_second.issuance_id);
+        assert_eq!(issuer.store.records().unwrap().len(), 2);
+        drop(issuer);
+        let restarted = AccessIssuer::open(root.path(), policy).unwrap();
+        for (paid, request, issued) in [
+            (&first, &first_request, &issued_first),
+            (&second, &second_request, &issued_second),
+        ] {
+            let retry = restarted.issue(paid, request, 1001).unwrap();
+            assert!(retry.repeated);
+            assert_eq!(retry.issuance_id, issued.issuance_id);
+            assert_eq!(retry.issued_at, issued.issued_at);
+        }
     }
 }
 
@@ -284,6 +402,14 @@ impl Drop for ResourceServer {
 }
 
 async fn resource_server(policy: &AccessPolicy, paid: &PaidAccess) -> ResourceServer {
+    resource_server_with_delay(policy, paid, std::time::Duration::ZERO).await
+}
+
+async fn resource_server_with_delay(
+    policy: &AccessPolicy,
+    paid: &PaidAccess,
+    delay: std::time::Duration,
+) -> ResourceServer {
     use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
     use std::sync::atomic::{AtomicUsize, Ordering};
     let calls = Arc::new(AtomicUsize::new(0));
@@ -297,20 +423,27 @@ async fn resource_server(policy: &AccessPolicy, paid: &PaidAccess) -> ResourceSe
             }, "payload_hex":hex::encode(&policy.payload), "payment_verified":true,"delivery_verified":false
         }),
     )));
-    type Shared = (Arc<AtomicUsize>, Arc<Mutex<(u16, serde_json::Value)>>);
+    type Shared = (
+        Arc<AtomicUsize>,
+        Arc<Mutex<(u16, serde_json::Value)>>,
+        std::time::Duration,
+    );
     async fn handle(
         State(state): State<Shared>,
         Json(_request): Json<AccessRequest>,
     ) -> (StatusCode, Json<serde_json::Value>) {
         state.0.fetch_add(1, Ordering::SeqCst);
         let (status, body) = state.1.lock().unwrap().clone();
+        tokio::time::sleep(state.2).await;
         (StatusCode::from_u16(status).unwrap(), Json(body))
     }
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}/v1/access", listener.local_addr().unwrap());
-    let router = Router::new()
-        .route("/v1/access", post(handle))
-        .with_state((calls.clone(), response.clone()));
+    let router = Router::new().route("/v1/access", post(handle)).with_state((
+        calls.clone(),
+        response.clone(),
+        delay,
+    ));
     let task = tokio::spawn(async move {
         axum::serve(listener, router).await.unwrap();
     });
@@ -320,6 +453,22 @@ async fn resource_server(policy: &AccessPolicy, paid: &PaidAccess) -> ResourceSe
         response,
         task,
     }
+}
+
+#[tokio::test]
+async fn retrieval_waits_past_the_old_timeout_without_another_request() {
+    let (policy, paid, _) = fixture(2);
+    let server =
+        resource_server_with_delay(&policy, &paid, std::time::Duration::from_secs(31)).await;
+    let root = tempfile::tempdir().unwrap();
+    let buyer =
+        client::AccessClient::open(&server.endpoint, policy.service_id, root.path(), true).unwrap();
+    let receipt = buyer
+        .retrieve(&paid.evidence, &[1; 32], 1000)
+        .await
+        .unwrap();
+    assert!(receipt.resource_verified && !receipt.payment_verified && !receipt.delivery_verified);
+    assert_eq!(server.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -573,4 +722,88 @@ fn x402_payment_block_is_bound_to_the_request_signature() {
         Err(AccessError::Authentication)
     );
     assert_eq!(issuer.store.records().unwrap().len(), 1);
+}
+
+#[test]
+fn the_profile_check_is_separate_from_payment_verification() {
+    for suite in [1, 2] {
+        let (policy, paid, _) = fixture(suite);
+        let checked = policy.check_agreement(paid.evidence.clone()).unwrap();
+        assert_eq!(checked.agreement(), &policy.check(&paid.evidence).unwrap());
+        assert_eq!(checked.agreement(), &paid.agreement);
+        assert_eq!(
+            checked.evidence().encode().unwrap(),
+            paid.evidence.encode().unwrap()
+        );
+        assert_eq!(format!("{checked:?}"), "CheckedAgreement { <redacted> }");
+        let mut changed = policy.clone();
+        changed.payload.push(0);
+        assert_eq!(
+            changed.check_agreement(paid.evidence.clone()).unwrap_err(),
+            AccessError::Agreement
+        );
+    }
+}
+
+#[test]
+fn pending_finality_lag_is_pending_access_not_an_observation_failure() {
+    use crate::{
+        disclosure::ShieldedDisclosureError, observation::ObservationError, recovery::RecoveryError,
+    };
+    // A finalized anchor below the deployment block is progress, not a failed observation:
+    // it must map to 202 pending, exactly like a bounded history scan.
+    assert_eq!(
+        shielded_access_error(ShieldedDisclosureError::Observation(
+            ObservationError::FinalityPending
+        )),
+        AccessError::Pending
+    );
+    assert_eq!(
+        shielded_access_error(ShieldedDisclosureError::Observation(
+            ObservationError::Recovery(RecoveryError::HistoryPending {
+                next_block: 10,
+                through: 20,
+            })
+        )),
+        AccessError::Pending
+    );
+    // Every other observation failure stays unavailable.
+    assert_eq!(
+        shielded_access_error(ShieldedDisclosureError::Observation(
+            ObservationError::Inconsistent
+        )),
+        AccessError::Observation
+    );
+    assert_eq!(
+        shielded_access_error(ShieldedDisclosureError::Payment),
+        AccessError::Pending
+    );
+}
+
+#[tokio::test]
+async fn an_unreachable_observer_never_turns_a_checked_agreement_into_access() {
+    let (policy, paid, _) = fixture(2);
+    let directory = tempfile::tempdir().unwrap();
+    let domain = crate::index_store::IndexDomain {
+        chain_id: 31_337,
+        pool: [3; 20],
+        first_block: 1,
+        first_hash: [1; 32],
+    };
+    let backend = AccessBackend::Shielded {
+        rpc: Box::new(PoolRpc::new("http://127.0.0.1:1", 31_337, [3; 20]).unwrap()),
+        index: IndexStore::new(directory.path().join("first/index.json"), domain).unwrap(),
+        peer_rpc: Box::new(PoolRpc::new("http://127.0.0.1:2", 31_337, [3; 20]).unwrap()),
+        peer_index: IndexStore::new(directory.path().join("peer/index.json"), domain).unwrap(),
+        runtime: Box::new(crate::rpc::PoolRuntimePins {
+            pool: [0x71; 32],
+            poseidon: [0x72; 32],
+            deposit: [0x73; 32],
+            transfer: [0x74; 32],
+            withdraw: [0x75; 32],
+        }),
+    };
+    let checked = policy.check_agreement(paid.evidence.clone()).unwrap();
+    assert!(backend.verify_checked(checked).await.is_err());
+    assert!(backend.verify(&policy, paid.evidence).await.is_err());
 }

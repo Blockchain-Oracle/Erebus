@@ -10,10 +10,22 @@ import { buildEddsa, poseidonContract } from "circomlibjs";
 import { ContractFactory, JsonRpcProvider, getCreateAddress } from "ethers";
 import * as snarkjs from "snarkjs";
 import solc from "solc";
+import { stageTestBundle } from "./stage-test-bundle.mjs";
 
 const dir = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const root = resolve(dir, "../..");
-const build = resolve(dir, "build");
+const bundleDirectory = process.env.EREBUS_M5_TEST_BUNDLE;
+const bundlePin = process.env.EREBUS_M5_TEST_BUNDLE_SHA256;
+if (Boolean(bundleDirectory) !== Boolean(bundlePin)) throw new Error("test bundle requires both directory and manifest pin");
+const stagedBundle = bundleDirectory ? await stageTestBundle(bundleDirectory, bundlePin) : null;
+const build = stagedBundle?.build ?? resolve(dir, "build");
+export const artifactBuild = build;
+if (stagedBundle) {
+  if (process.env.EREBUS_M5_NATIVE_PROOF === "1" && process.env.EREBUS_M6_COORDINATED !== "1") {
+    throw new Error("external test bundle native proving requires the coordinated path");
+  }
+  process.env.EREBUS_M5_TEST_BUILD = build;
+}
 const snarkjsBin = resolve(dir, "node_modules/.bin/snarkjs");
 const prime = BigInt("21888242871839275222246405745257275088548364400416034343698204186575808495617");
 
@@ -69,6 +81,7 @@ function fieldHex(value, bytes = 32) {
 }
 
 async function setup() {
+  if (stagedBundle) return stagedBundle.artifacts;
   mkdirSync(build, { recursive: true });
   const tau = resolve(build, "pot16_final.ptau");
   if (!existsSync(tau)) {
@@ -83,7 +96,7 @@ async function setup() {
   const oldManifest = existsSync(manifestPath) ? JSON.parse(readFileSync(manifestPath, "utf8")) : {};
   const manifest = { version: "m5-local-prototype-v1", circuits: {} };
   for (const name of ["deposit", "transfer", "withdraw"]) {
-    run("circom", [`${name}.circom`, "--r1cs", "--wasm", "-l", "node_modules", "-o", "build"]);
+    run("circom", [`${name}.circom`, "--r1cs", "--wasm", "-l", "node_modules", "-l", "lib", "-o", "build"]);
     const r1cs = resolve(build, `${name}.r1cs`);
     const wasm = resolve(build, `${name}_js/${name}.wasm`);
     const zkey = resolve(build, `${name}.zkey`);
@@ -120,10 +133,10 @@ async function setup() {
 
 export function compileContracts() {
   const sources = {};
-  for (const name of ["deposit", "transfer", "withdraw"]) {
+  for (const name of stagedBundle ? [] : ["deposit", "transfer", "withdraw"]) {
     sources[`${name}-verifier.sol`] = { content: readFileSync(resolve(build, `${name}-verifier.sol`), "utf8") };
   }
-  for (const name of ["ErebusShieldedPool", "MockERC20"]) {
+  for (const name of ["ErebusShieldedPool", "MockERC20", "MockWMON"]) {
     sources[`${name}.sol`] = { content: readFileSync(resolve(root, `contracts/evm/src/${name}.sol`), "utf8") };
   }
   const output = JSON.parse(solc.compile(JSON.stringify({
@@ -132,6 +145,11 @@ export function compileContracts() {
   })));
   if (output.errors?.some((entry) => entry.severity === "error")) {
     throw new Error(output.errors.map((entry) => entry.formattedMessage).join("\n"));
+  }
+  if (stagedBundle) {
+    for (const name of ["deposit", "transfer", "withdraw"]) {
+      output.contracts[`${name}-verifier.sol`] = { Groth16Verifier: stagedBundle.verifiers[name] };
+    }
   }
   return output.contracts;
 }
@@ -144,19 +162,24 @@ async function freePort() {
   return port;
 }
 
-async function prove(name, input, publicSignals) {
+const measurements = {};
+
+export async function prove(name, input, publicSignals) {
   const wasm = resolve(build, `${name}_js/${name}.wasm`);
   const zkey = resolve(build, `${name}.zkey`);
+  const started = Date.now();
   const { proof, publicSignals: generated } = await snarkjs.groth16.fullProve(stringify(input), wasm, zkey);
   if (JSON.stringify(generated) !== JSON.stringify(publicSignals.map(String))) {
     throw new Error(`${name} generated different public inputs`);
   }
   const key = JSON.parse(readFileSync(resolve(build, `${name}-verification-key.json`), "utf8"));
   if (!await snarkjs.groth16.verify(key, generated, proof)) throw new Error(`${name} proof failed offchain`);
+  const proveMs = Date.now() - started;
+  measurements[name] = { prove_and_verify_ms: proveMs };
   return JSON.parse(`[${await snarkjs.groth16.exportSolidityCallData(proof, generated)}]`);
 }
 
-function tree(poseidon, leaves, selectedIndex) {
+export function tree(poseidon, leaves, selectedIndex) {
   const zero = [0n];
   for (let level = 0; level < 20; level += 1) zero.push(poseidon([zero[level], zero[level]]));
   let nodes = new Map(leaves.map((leaf, index) => [index, leaf]));
@@ -238,10 +261,11 @@ async function main() {
     const inputAmount = 150n;
     const amount = 70n;
     const changeAmount = inputAmount - amount;
+    const domain = poseidon([chainId, contractAddress, version]);
     const inputSpendSecret = testField("buyer-spend");
     const inputSpendTag = poseidon([2006n, inputSpendSecret]);
     const inputSalt = testField("input-salt");
-    const inputNote = poseidon([2007n, asset, inputAmount, ...buyer, inputSpendTag, inputSalt]);
+    const inputNote = poseidon([2010n, domain, asset, inputAmount, ...buyer, inputSpendTag, inputSalt]);
     const depositInput = {
       chainId, contractAddress, verifierVersion: version, asset, amount: inputAmount,
       noteCommitment: inputNote, ownerAx: buyer[0], ownerAy: buyer[1],
@@ -265,7 +289,6 @@ async function main() {
     const firstTree = tree(poseidon, [inputNote], 0);
     if (await pool.currentRoot() !== firstTree.root) throw new Error("deposit tree root differs from Poseidon path");
 
-    const domain = poseidon([chainId, contractAddress, version]);
     const dealId = BigInt(`0x${sha256("EREBUS_M5_DEAL_TEST_ONLY").slice(0, 32)}`);
     const transcript = JSON.parse(execFileSync("cargo", [
       "run", "--locked", "--quiet", "--manifest-path", resolve(root, "sdk/transport/Cargo.toml"),
@@ -289,7 +312,8 @@ async function main() {
     const [settlementNonceLo, settlementNonceHi] = limbs("nonce");
     const recipientSpendSecret = testField("seller-spend");
     const recipientSpendTag = poseidon([2006n, recipientSpendSecret]);
-    const changeSpendTag = poseidon([2006n, testField("change-spend")]);
+    const changeSpendSecret = testField("change-spend");
+    const changeSpendTag = poseidon([2006n, changeSpendSecret]);
     const changeSalt = testField("change-salt");
     const blinding = testField("blinding");
     const expiry = 4102444800n;
@@ -299,9 +323,9 @@ async function main() {
     const termsC = poseidon([...buyer, ...seller, recipientSpendTag, paymentSalt]);
     const dealCommitment = poseidon([2002n, termsA, termsB, termsC, blinding, expiry]);
     const dealNullifier = poseidon([2003n, domain, ...buyer, settlementNonceLo, settlementNonceHi]);
-    const inputNullifier = poseidon([2008n, inputSpendSecret, inputNote]);
-    const paymentNote = poseidon([2007n, asset, amount, ...seller, recipientSpendTag, paymentSalt]);
-    const changeNote = poseidon([2007n, asset, changeAmount, ...buyer, changeSpendTag, changeSalt]);
+    const inputNullifier = poseidon([2011n, domain, inputSpendSecret, inputNote]);
+    const paymentNote = poseidon([2010n, domain, asset, amount, ...seller, recipientSpendTag, paymentSalt]);
+    const changeNote = poseidon([2010n, domain, asset, changeAmount, ...buyer, changeSpendTag, changeSalt]);
     const buyerMessage = eddsa.poseidon([2004n, domain, dealCommitment]);
     const sellerMessage = eddsa.poseidon([2005n, domain, dealCommitment]);
     const buyerSignature = eddsa.signPoseidon(buyerPrivate, buyerMessage);
@@ -345,7 +369,7 @@ async function main() {
       sellerR8x: F.toObject(sellerSignature.R8[0]), sellerR8y: F.toObject(sellerSignature.R8[1]), sellerS: sellerSignature.S,
       inputAmount, inputSalt, inputSpendSecret,
       pathElements: firstTree.pathElements, pathIndices: firstTree.pathIndices,
-      changeAmount, changeSpendTag, changeSalt,
+      changeAmount, changeSpendTag, changeSpendSecret, changeSalt,
     };
     writeFileSync(resolve(build, "transfer-input.json"), `${JSON.stringify(stringify(transferInput), null, 2)}\n`);
     const transferPublic = [
@@ -397,8 +421,32 @@ async function main() {
         await reject("asset-changing transaction", async () => pool.transferPrivate(...changed));
       }
     }
+    // An otherwise valid proof must expire at the contract boundary. Revert the
+    // local clock experiment before the normal funded flow and recovery tests.
+    const expirySnapshot = await provider.send("evm_snapshot", []);
+    try {
+      await provider.send("evm_setNextBlockTimestamp", [Number(expiry)]);
+      await provider.send("evm_mine", []);
+      let rejectedForExpiry = false;
+      try {
+        await pool.transferPrivate.staticCall(...settlementProof);
+      } catch (error) {
+        if (error.reason !== "expired") throw error;
+        rejectedForExpiry = true;
+      }
+      if (!rejectedForExpiry) throw new Error("valid proof accepted at its expiry boundary");
+      if (await pool.consumedDeals(dealNullifier) || await pool.consumedNotes(inputNullifier)) {
+        throw new Error("expired proof consumed settlement state");
+      }
+    } finally {
+      if (!await provider.send("evm_revert", [expirySnapshot])) {
+        throw new Error("could not restore local expiry experiment");
+      }
+    }
+    await pool.transferPrivate.staticCall(...settlementProof);
     let fundedMatrix = null;
     let fundedDisclosure = null;
+    let transferReceipt = null;
     if (process.env.EREBUS_M6_COORDINATED === "1") {
       if (process.env.EREBUS_M5_NATIVE_PROOF !== "1") {
         throw new Error("coordinated transfer requires the native Rust proof");
@@ -436,7 +484,7 @@ async function main() {
         }
       }
     } else {
-      await (await pool.transferPrivate(...settlementProof)).wait();
+      transferReceipt = await (await pool.transferPrivate(...settlementProof)).wait();
     }
     if (!await pool.insertedCommitments(paymentNote) || !await pool.insertedCommitments(changeNote)) {
       throw new Error("transfer outputs were not registered");
@@ -448,6 +496,10 @@ async function main() {
     const finalTree = tree(poseidon, [inputNote, paymentNote, changeNote], 1);
     if (await pool.currentRoot() !== finalTree.root) throw new Error("transfer tree root differs");
     const noteVector = {
+      chainId: chainId.toString(),
+      poolHex: fieldHex(poolAddress, 20),
+      verifierVersion: version.toString(),
+      noteDomainHex: fieldHex(domain),
       assetHex: fieldHex(asset, 20),
       input: {
         amount: String(inputAmount), ownerHex: fieldHex(buyer[0]) + fieldHex(buyer[1]),
@@ -460,8 +512,14 @@ async function main() {
         amount: String(amount), ownerHex: fieldHex(seller[0]) + fieldHex(seller[1]),
         spendSecretHex: fieldHex(recipientSpendSecret), spendTagHex: fieldHex(recipientSpendTag),
         saltHex: fieldHex(paymentSalt), commitmentHex: fieldHex(paymentNote),
-        nullifierHex: fieldHex(poseidon([2008n, recipientSpendSecret, paymentNote])), index: 1,
+        nullifierHex: fieldHex(poseidon([2011n, domain, recipientSpendSecret, paymentNote])), index: 1,
         rootHex: fieldHex(finalTree.root),
+      },
+      change: {
+        amount: String(changeAmount), ownerHex: fieldHex(buyer[0]) + fieldHex(buyer[1]),
+        spendSecretHex: fieldHex(changeSpendSecret), spendTagHex: fieldHex(changeSpendTag),
+        saltHex: fieldHex(changeSalt), commitmentHex: fieldHex(changeNote),
+        nullifierHex: fieldHex(poseidon([2011n, domain, changeSpendSecret, changeNote])),
       },
       changeCommitmentHex: fieldHex(changeNote),
     };
@@ -491,9 +549,9 @@ async function main() {
     // A recipient restarting with its own secret and the agreement can find this output.
     const recoveredTag = poseidon([2006n, recipientSpendSecret]);
     const recoveredSalt = poseidon([2009n, domain, settlementNonceLo, settlementNonceHi]);
-    const recoveredNote = poseidon([2007n, asset, amount, ...seller, recoveredTag, recoveredSalt]);
+    const recoveredNote = poseidon([2010n, domain, asset, amount, ...seller, recoveredTag, recoveredSalt]);
     if (recoveredNote !== paymentNote) throw new Error("recipient could not rediscover its output");
-    const paymentNullifier = poseidon([2008n, recipientSpendSecret, paymentNote]);
+    const paymentNullifier = poseidon([2011n, domain, recipientSpendSecret, paymentNote]);
     const recipient = BigInt(await signer.getAddress());
     const withdrawInput = {
       chainId, contractAddress, verifierVersion: version, asset, root: finalTree.root,
@@ -621,6 +679,12 @@ async function main() {
       deposit: inputAmount.toString(), privatePayment: amount.toString(),
       finalVaultBalance: (await token.balanceOf(poolAddress)).toString(), artifacts,
       testOnly: true,
+      gas: {
+        deposit: depositReceipt.gasUsed.toString(),
+        transfer: transferReceipt?.gasUsed?.toString() ?? null,
+        withdraw: withdrawalReceipt.gasUsed.toString(),
+      },
+      measurements_ms: measurements,
       fundedMatrix,
       fundedDisclosure,
     }, null, 2)}\n`);

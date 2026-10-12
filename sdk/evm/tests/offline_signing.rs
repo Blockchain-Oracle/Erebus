@@ -52,6 +52,7 @@ fn params() -> TransactionParams {
         nonce: 7,
         fees: Eip1559Fees::new(3_000_000_000, 1_000_000_000).unwrap(),
         gas_limit: 300_000,
+        value: 0,
     }
 }
 

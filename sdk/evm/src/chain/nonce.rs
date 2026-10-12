@@ -191,8 +191,7 @@ impl SignerJournal {
         )
     }
 
-    /// Reserves the shared gas-payer nonce for a backend-validated contract call.
-    /// The backend must first verify the target and calldata against `prepared`.
+    /// Reserves the shared gas-payer nonce for a zero-value backend-validated contract call.
     #[allow(clippy::too_many_arguments)]
     pub fn reserve_call(
         &self,
@@ -204,11 +203,42 @@ impl SignerJournal {
         fees: Eip1559Fees,
         gas_limit: u64,
     ) -> Result<SigningPlan, NonceError> {
+        self.reserve_call_with_value(
+            deployment,
+            prepared,
+            target,
+            calldata,
+            0,
+            observed_nonce,
+            fees,
+            gas_limit,
+        )
+    }
+
+    /// Reserves the shared gas-payer nonce for a backend-validated contract call.
+    ///
+    /// The backend must validate the target, calldata, and value before reserving. The claim
+    /// binds the full call, so no later operation can reuse this nonce lane for a different
+    /// target, calldata, or value; it is not restricted to the settlement contract so explicit
+    /// wallet operations such as ERC-20 approval and native wrapping can share the same
+    /// dedicated signer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn reserve_call_with_value(
+        &self,
+        deployment: &EvmDeployment,
+        prepared: &PreparedSettlement,
+        target: [u8; 20],
+        calldata: &[u8],
+        value: u128,
+        observed_nonce: u64,
+        fees: Eip1559Fees,
+        gas_limit: u64,
+    ) -> Result<SigningPlan, NonceError> {
         if deployment.chain_id != self.chain_id || prepared.operation_ref == [0; 32] {
             return Err(NonceError::Conflict);
         }
         deployment.matches_domain(&prepared.domain)?;
-        if target != deployment.settlement_contract {
+        if target == [0; 20] {
             return Err(NonceError::Conflict);
         }
         let plan = SigningPlan::new(
@@ -217,6 +247,7 @@ impl SignerJournal {
                 nonce: observed_nonce,
                 fees,
                 gas_limit,
+                value,
             },
         )?;
         let _lock = self
@@ -233,6 +264,7 @@ impl SignerJournal {
                 || claim.calldata_hash != keccak256(calldata).0
                 || saved.params().fees != fees
                 || saved.params().gas_limit != gas_limit
+                || saved.params().value != value
             {
                 return Err(NonceError::Conflict);
             }
@@ -248,6 +280,21 @@ impl SignerJournal {
         });
         self.store.write(&state).map_err(|_| NonceError::Storage)?;
         Ok(plan)
+    }
+
+    /// Returns the currently claimed nonce, if any, without modifying state.
+    pub fn claim_nonce(&self) -> Result<Option<u64>, NonceError> {
+        let _lock = self
+            .store
+            .lock_identity()
+            .map_err(|_| NonceError::Storage)?;
+        let state = self.load()?;
+        state
+            .claim
+            .as_ref()
+            .map(|claim| SigningPlan::decode(&claim.plan).map(|plan| plan.params().nonce))
+            .transpose()
+            .map_err(|_| NonceError::Storage)
     }
 
     /// Releases the claim once finalized evidence proves the claimed nonce was consumed.
@@ -306,7 +353,7 @@ impl SignerJournal {
             return Err(NonceError::Conflict);
         }
         deployment.matches_domain(&prepared.domain)?;
-        if target != deployment.settlement_contract {
+        if target == [0; 20] {
             return Err(NonceError::Conflict);
         }
         let _lock = self

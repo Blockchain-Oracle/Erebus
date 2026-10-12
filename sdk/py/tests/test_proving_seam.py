@@ -39,11 +39,48 @@ def test_paths_only_with_development_exceptions_off_by_default(monkeypatch):
     assert payload["allow_test_artifacts"] is False and payload["allow_loopback_http"] is False
 
 
+def test_undecodable_process_output_is_redacted(monkeypatch):
+    def run(*args, **kwargs):
+        raise UnicodeDecodeError("utf-8", b"private-witness-marker\xff", 22, 23, "invalid byte")
+    monkeypatch.setattr(subprocess, "run", run)
+    with pytest.raises(LocalProvingError) as error:
+        LocalProvingSeam(binary="local-prove").prove(**request())
+    assert "private-witness-marker" not in str(error.value)
+
+
 def test_version_checks_protocol_without_reading_a_witness(monkeypatch):
     seen = fake(monkeypatch, {"status": "ok", "protocol": 1, "methods": ["prove"]})
     assert LocalProvingSeam(binary="local-prove").version()["protocol"] == 1
     assert seen[0][0] == ["local-prove", "--version"]
     assert seen[0][1]["input"] is None
+
+
+def authorization():
+    return {"publisher": "0x" + "12" * 20, "signature": {
+        "version": 1, "manifest_sha256": "ab" * 32, "signature_hex": "cd" * 65,
+    }}
+
+
+def test_publisher_authorization_is_forwarded_unchanged(monkeypatch):
+    seen = fake(monkeypatch, response())
+    LocalProvingSeam(binary="local-prove").prove(**request(), manifest_authorization=authorization())
+    assert json.loads(seen[0][1]["input"])["manifest_authorization"] == authorization()
+
+
+@pytest.mark.parametrize("mutation", [
+    lambda value: value.update(publisher="0x" + "00" * 20),
+    lambda value: value.update(extra=True),
+    lambda value: value["signature"].update(version=True),
+    lambda value: value["signature"].update(manifest_sha256="ef" * 32),
+    lambda value: value["signature"].update(signature_hex="invalid"),
+])
+def test_invalid_publisher_authorization_never_spawns(monkeypatch, mutation):
+    seen = fake(monkeypatch, response())
+    value = authorization()
+    mutation(value)
+    with pytest.raises(LocalProvingError):
+        LocalProvingSeam(binary="local-prove").prove(**request(), manifest_authorization=value)
+    assert seen == []
 
 
 @pytest.mark.parametrize("field,value", [

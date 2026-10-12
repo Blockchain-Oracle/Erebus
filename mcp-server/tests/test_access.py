@@ -90,6 +90,112 @@ def test_x402_tool_uses_only_the_operator_selected_rail(monkeypatch, tmp_path):
     assert "first payment" in server.retrieve.__doc__
 
 
+def test_metered_profile_registers_only_the_metered_tools(monkeypatch, tmp_path):
+    from erebus_mcp import access
+
+    seen = []
+
+    class Seam:
+        def __init__(self, **kwargs):
+            pass
+
+        def version(self):
+            return {}
+
+        def metered_call(self, **kwargs):
+            seen.append(kwargs)
+            return {"status": "issued", "result": {"payment_verified": False, "delivery_verified": False}}
+
+        def metered_status(self, **kwargs):
+            return {"status": "allowance", "result": {"payment_verified": False, "delivery_verified": False}}
+
+    class Server:
+        def tool(self):
+            def register(function):
+                setattr(self, function.__name__, function)
+                return function
+            return register
+
+    monkeypatch.setattr(access, "AccessSeam", Seam)
+    server = Server()
+    access.register_access_tools(server, AccessSettings(tmp_path, tmp_path / "key", "https://example.com/v1/metered",
+                                                        "ab" * 32, tmp_path / "cache", profile="metered"))
+    assert not hasattr(server, "retrieve_service_access")
+    reply = asyncio.run(server.call_metered_service("deal.evidence", 2))
+    assert reply["ok"] is True
+    assert reply["result"]["result"]["payment_verified"] is False
+    assert "does not observe the chain" in reply["verification_meaning"]
+    assert seen[0]["call_index"] == 2
+    status = asyncio.run(server.metered_service_status("deal.evidence"))
+    assert status["ok"] is True
+    assert status["result"]["result"]["payment_verified"] is False
+
+
+def test_metered_errors_keep_the_rust_code(monkeypatch, tmp_path):
+    from erebus_mcp import access
+
+    class Seam:
+        def __init__(self, **kwargs):
+            pass
+
+        def version(self):
+            return {}
+
+        def metered_call(self, **kwargs):
+            raise AccessError("seller ledger is behind the local cursor; stop and report it, do not pay again",
+                              "seller_ledger_behind")
+
+    class Server:
+        def tool(self):
+            def register(function):
+                setattr(self, function.__name__, function)
+                return function
+            return register
+
+    monkeypatch.setattr(access, "AccessSeam", Seam)
+    server = Server()
+    access.register_access_tools(server, AccessSettings(tmp_path, tmp_path / "key", "https://example.com/v1/metered",
+                                                        "ab" * 32, tmp_path / "cache", profile="metered"))
+    reply = asyncio.run(server.call_metered_service("deal.evidence"))
+    assert reply["ok"] is False
+    assert reply["error"]["code"] == "ACCESS_UNAVAILABLE"
+    assert reply["error"]["error_code"] == "seller_ledger_behind"
+    assert reply["error"]["retry_without_payment"] is True
+
+
+def test_metered_profile_rejects_the_x402_rail(monkeypatch, tmp_path):
+    key = tmp_path / "buyer.key"
+    key.write_bytes(b"x" * 32)
+    key.chmod(0o600)
+    monkeypatch.setenv("EREBUS_ACCESS_EVIDENCE_DIR", str(tmp_path))
+    monkeypatch.setenv("EREBUS_ACCESS_BUYER_KEY_FILE", str(key))
+    monkeypatch.setenv("EREBUS_ACCESS_SERVICE_URL", "https://example.com/v1/metered")
+    monkeypatch.setenv("EREBUS_ACCESS_SERVICE_ID", "ab" * 32)
+    monkeypatch.setenv("EREBUS_ACCESS_CACHE", str(tmp_path / "cache"))
+    monkeypatch.setenv("EREBUS_ACCESS_PROFILE", "metered")
+    monkeypatch.setenv("EREBUS_ACCESS_PAYMENT_RAIL", "x402-exact")
+    with pytest.raises(ConfigError, match="metered access cannot use the x402-exact rail"):
+        AccessSettings.from_env()
+    monkeypatch.setenv("EREBUS_ACCESS_PAYMENT_RAIL", "observe")
+    assert AccessSettings.from_env().profile == "metered"
+    monkeypatch.setenv("EREBUS_ACCESS_PROFILE", "streaming")
+    with pytest.raises(ConfigError, match="profile"):
+        AccessSettings.from_env()
+
+
+@pytest.mark.parametrize("code", [None, "seller_ledger_behind", "private_marker_code"])
+def test_model_visible_failure_redacts_arbitrary_sdk_details(code):
+    from erebus_mcp.access import _access_unavailable
+
+    reply = _access_unavailable(AccessError("private-provider-marker", code))
+    assert "private-provider-marker" not in json.dumps(reply)
+    assert "private_marker_code" not in json.dumps(reply)
+    assert reply["error"]["retry_without_payment"] is True
+    assert reply["error"].get("error_code") == (code if code == "seller_ledger_behind" else None)
+    if code == "seller_ledger_behind":
+        assert "stop and report" in reply["error"]["message"]
+
+
 @pytest.mark.parametrize("name", ["../secret", "/secret", "x/y", ".", "..", "x" * 97])
 def test_evidence_names_cannot_escape_the_operator_directory(tmp_path, name):
     settings = AccessSettings(tmp_path, tmp_path / "buyer.key", "https://example.com/v1/access", "ab" * 32, tmp_path / "cache")

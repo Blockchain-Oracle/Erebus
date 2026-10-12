@@ -290,6 +290,7 @@ impl ShieldedChain {
                 nonce: original.params().nonce,
                 gas_limit: original.params().gas_limit,
                 fees,
+                value: 0,
             },
         )?;
         let chain_id = self.evm.deployment().chain_id;

@@ -140,9 +140,10 @@ async fn recover_finalized_wallet_inner(
         } => nullifiers.contains(input_nullifier),
     };
     let (index, report) = if let Some((peer_rpc, peer_index)) = peer {
+        let anchor = rpc.shared_snapshot(peer_rpc).await?.finalized;
         let (first, second) = tokio::join!(
-            sync_finalized_public_index_inner(rpc, index_store, max_blocks),
-            sync_finalized_public_index_inner(peer_rpc, peer_index, max_blocks)
+            sync_finalized_public_index_at(rpc, index_store, max_blocks, anchor),
+            sync_finalized_public_index_at(peer_rpc, peer_index, max_blocks, anchor)
         );
         let (index, report) = first?;
         let (peer_index, peer_report) = second?;
@@ -367,6 +368,24 @@ async fn sync_finalized_public_index_inner(
     max_blocks: Option<u64>,
 ) -> Result<(PoolIndex, RecoveryReport), RecoveryError> {
     let anchor = rpc.finalized_head().await?;
+    sync_finalized_public_index_at(rpc, index_store, max_blocks, anchor).await
+}
+
+async fn sync_finalized_public_index_at(
+    rpc: &PoolRpc,
+    index_store: &IndexStore,
+    max_blocks: Option<u64>,
+    anchor: crate::rpc::PoolFinalizedBlock,
+) -> Result<(PoolIndex, RecoveryReport), RecoveryError> {
+    if index_store
+        .load()?
+        .tip()
+        .is_some_and(|tip| tip.number > anchor.number)
+    {
+        return Err(RecoveryError::Rpc(RpcError::Evidence(
+            "finalized wallet history cannot regress to a lagging anchor",
+        )));
+    }
     let (index, report) = match max_blocks {
         Some(limit) => sync_public_index_step(rpc, index_store, anchor.number, limit).await?,
         None => sync_public_index_through(rpc, index_store, anchor.number).await?,
@@ -386,4 +405,53 @@ async fn sync_finalized_public_index_inner(
         )));
     }
     Ok((index, report))
+}
+
+#[cfg(test)]
+mod finalized_prefix_tests {
+    use super::*;
+    use crate::{index_store::IndexDomain, indexer::PoolBlock, rpc::PoolFinalizedBlock};
+
+    #[tokio::test]
+    async fn lagging_finality_cannot_rewind_a_retained_wallet_prefix() {
+        let directory = tempfile::tempdir().unwrap();
+        let domain = IndexDomain {
+            chain_id: 31337,
+            pool: [3; 20],
+            first_block: 2,
+            first_hash: [2; 32],
+        };
+        let store = IndexStore::new(directory.path().join("index.json"), domain).unwrap();
+        let mut index = PoolIndex::new(2).unwrap();
+        for number in 2..=3 {
+            index
+                .apply_block(PoolBlock {
+                    number,
+                    hash: [number as u8; 32],
+                    parent_hash: [(number - 1) as u8; 32],
+                    events: Vec::new(),
+                })
+                .unwrap();
+        }
+        store.save_if_unchanged(&index, None).unwrap();
+        let rpc = PoolRpc::new("http://127.0.0.1:9", 31337, domain.pool).unwrap();
+        let result = sync_finalized_public_index_at(
+            &rpc,
+            &store,
+            Some(10),
+            PoolFinalizedBlock {
+                number: 2,
+                hash: [2; 32],
+                timestamp: 100,
+            },
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(RecoveryError::Rpc(RpcError::Evidence(
+                "finalized wallet history cannot regress to a lagging anchor"
+            )))
+        ));
+        assert_eq!(store.load().unwrap().blocks(), index.blocks());
+    }
 }

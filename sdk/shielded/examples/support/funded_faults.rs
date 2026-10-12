@@ -193,6 +193,7 @@ impl Case<'_> {
             WalletDomain {
                 chain_id: self.index_domain.chain_id,
                 pool: self.index_domain.pool,
+                verifier_version: 2,
             },
             [7; 32],
             hook.clone(),

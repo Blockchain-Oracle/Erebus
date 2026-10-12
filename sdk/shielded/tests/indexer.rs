@@ -27,6 +27,7 @@ fn fixture() -> (OwnedNote, [u8; 32]) {
         bytes(value("ownerHex")),
         bytes(value("spendSecretHex")),
         bytes(value("saltHex")),
+        bytes(vector["noteDomainHex"].as_str().expect("note domain")),
     )
     .expect("note");
     let root = bytes(value("rootHex"));

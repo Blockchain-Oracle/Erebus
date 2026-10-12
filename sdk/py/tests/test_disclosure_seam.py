@@ -19,6 +19,16 @@ def reply(monkeypatch, payload, *, returncode=0, stderr=""):
     return calls
 
 
+def test_undecodable_disclosure_output_is_redacted(monkeypatch):
+    def run(*args, **kwargs):
+        raise UnicodeDecodeError("utf-8", b"private-grant-marker\xff", 20, 21, "invalid byte")
+    monkeypatch.setattr(subprocess, "run", run)
+    with pytest.raises(DisclosureError) as error:
+        DisclosureSeam(binary="local-rust").call("key_info", key_file="/operator/auditor.key")
+    assert "private-grant-marker" not in str(error.value)
+    assert "retain evidence" in str(error.value)
+
+
 def test_only_paths_are_forwarded_and_no_key_is_read(monkeypatch):
     calls = reply(monkeypatch, {"status": "ok", "recipient_public_key": "ab" * 32})
     result = DisclosureSeam(binary="local-rust").call("key_info", key_file="/does/not/exist.key")

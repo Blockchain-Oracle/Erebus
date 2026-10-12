@@ -39,23 +39,30 @@ impl SigningPlan {
         Ok(Self { sender, params })
     }
 
-    /// Encodes version 1, sender, nonce, max fee, priority fee, and gas limit, in that order.
+    /// Encodes version 2: version, sender, nonce, fees, gas limit, and native value.
+    ///
+    /// Version 1 carried no value field. Version 1 plans can only have been produced before
+    /// value support existed, so decoding one means zero value unambiguously.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         let mut w = Writer::new();
-        w.u8(1);
+        w.u8(2);
         w.fixed(&self.sender);
         w.u64(self.params.nonce);
         w.u128(self.params.fees.max_fee_per_gas());
         w.u128(self.params.fees.max_priority_fee_per_gas());
         w.u64(self.params.gas_limit);
+        w.u128(self.params.value);
         w.finish()
     }
 
     /// Decodes canonical local metadata; unknown versions and trailing bytes fail closed.
+    ///
+    /// Version 1 is still readable and means zero value. It is never re-encoded as version 1.
     pub fn decode(bytes: &[u8]) -> Result<Self, EvmError> {
         let mut r = Reader::new(bytes);
-        if r.u8("plan_version")? != 1 {
+        let version = r.u8("plan_version")?;
+        if version != 1 && version != 2 {
             return Err(EvmError::TransactionEncoding(
                 "unknown signing plan version".into(),
             ));
@@ -64,6 +71,7 @@ impl SigningPlan {
         let nonce = r.u64("nonce")?;
         let fees = Eip1559Fees::new(r.u128("max_fee")?, r.u128("priority_fee")?)?;
         let gas_limit = r.u64("gas_limit")?;
+        let value = if version >= 2 { r.u128("value")? } else { 0 };
         r.finish()?;
         Self::new(
             sender,
@@ -71,6 +79,7 @@ impl SigningPlan {
                 nonce,
                 fees,
                 gas_limit,
+                value,
             },
         )
     }
@@ -146,11 +155,12 @@ mod tests {
                 nonce: 7,
                 fees: Eip1559Fees::new(100, 10).unwrap(),
                 gas_limit: 300_000,
+                value: 0,
             },
         )
         .unwrap();
         let bytes = plan.encode();
-        assert_eq!(bytes.len(), 69);
+        assert_eq!(bytes.len(), 85);
         assert_eq!(SigningPlan::decode(&bytes).unwrap(), plan);
         for end in 0..bytes.len() {
             assert!(SigningPlan::decode(&bytes[..end]).is_err());
@@ -159,13 +169,53 @@ mod tests {
         changed.push(0);
         assert!(SigningPlan::decode(&changed).is_err());
         let mut changed = bytes.clone();
-        changed[0] = 2;
+        changed[0] = 3;
         assert!(SigningPlan::decode(&changed).is_err());
         let mut changed = bytes.clone();
         changed[61..].fill(0);
         assert!(SigningPlan::decode(&changed).is_err());
         let mut changed = bytes;
         changed[29..45].fill(0);
+        assert!(SigningPlan::decode(&changed).is_err());
+    }
+
+    #[test]
+    fn legacy_version_one_plans_decode_as_zero_value() {
+        let mut w = Writer::new();
+        w.u8(1);
+        w.fixed(&[1; 20]);
+        w.u64(7);
+        w.u128(100);
+        w.u128(10);
+        w.u64(300_000);
+        let legacy = w.finish();
+        assert_eq!(legacy.len(), 69);
+        let decoded = SigningPlan::decode(&legacy).unwrap();
+        assert_eq!(decoded.params().value, 0);
+        // Re-encoding a legacy plan writes the version-2 form.
+        assert_eq!(decoded.encode().len(), 85);
+        assert_eq!(SigningPlan::decode(&decoded.encode()).unwrap(), decoded);
+    }
+
+    #[test]
+    fn nonzero_values_round_trip_and_are_bounded_by_the_reader() {
+        let plan = SigningPlan::new(
+            [1; 20],
+            TransactionParams {
+                nonce: 7,
+                fees: Eip1559Fees::new(100, 10).unwrap(),
+                gas_limit: 300_000,
+                value: 123_456,
+            },
+        )
+        .unwrap();
+        let bytes = plan.encode();
+        assert_eq!(SigningPlan::decode(&bytes).unwrap(), plan);
+        for end in 0..bytes.len() {
+            assert!(SigningPlan::decode(&bytes[..end]).is_err());
+        }
+        let mut changed = bytes;
+        changed.push(0);
         assert!(SigningPlan::decode(&changed).is_err());
     }
 }

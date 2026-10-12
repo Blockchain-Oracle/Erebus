@@ -89,6 +89,121 @@ fn bootstraps(suite: u16) -> (NegotiationBootstrap, NegotiationBootstrap) {
     (buyer, seller_worker.join().unwrap())
 }
 
+fn exchange_at_times(
+    remote_issued: u64,
+    remote_expires: u64,
+    local_expires: u64,
+    times: Vec<Result<u64, PeerError>>,
+) -> bool {
+    let (buyer, seller, buyer_descriptor, seller_descriptor) = connections(2);
+    let draft = proposal(2);
+    let buyer_binding = AgreementKeyBinding::sign(
+        &buyer_descriptor,
+        context(2).domain,
+        draft.terms().buyer_authorization_key.clone(),
+        &AuthorizationIdentity::from_bytes(&[Role::Buyer.tag(); 32]).unwrap(),
+        NOW,
+        local_expires,
+    )
+    .unwrap();
+    let seller_binding = AgreementKeyBinding::sign(
+        &seller_descriptor,
+        context(2).domain,
+        draft.terms().seller_authorization_key.clone(),
+        &AuthorizationIdentity::from_bytes(&[Role::Seller.tag(); 32]).unwrap(),
+        remote_issued,
+        remote_expires,
+    )
+    .unwrap();
+    let b = buyer_descriptor.clone();
+    let s = seller_descriptor.clone();
+    let worker = thread::spawn(move || {
+        NegotiationBootstrap::shielded(
+            seller,
+            context(2),
+            &b,
+            &s,
+            &seller_binding,
+            Some(proposal(2).terms().payment_recipient.clone()),
+            remote_issued,
+        )
+    });
+    let mut times = times.into_iter();
+    let accepted = NegotiationBootstrap::shielded_with_clock(
+        buyer,
+        context(2),
+        &buyer_descriptor,
+        &seller_descriptor,
+        &buyer_binding,
+        None,
+        || times.next().expect("bounded identity validation clock"),
+    )
+    .is_ok();
+    let _ = worker.join().unwrap();
+    accepted
+}
+
+#[test]
+fn shielded_exchange_refreshes_time_after_receive_without_allowing_future_bindings() {
+    // A valid peer creates its binding after the caller starts the handshake.
+    assert!(!exchange_at_times(
+        NOW + 1,
+        NOW + 300,
+        NOW + 300,
+        vec![Ok(NOW), Ok(NOW)],
+    ));
+    assert!(exchange_at_times(
+        NOW + 1,
+        NOW + 300,
+        NOW + 300,
+        vec![Ok(NOW), Ok(NOW + 1), Ok(NOW + 1)],
+    ));
+    assert!(!exchange_at_times(
+        NOW + 2,
+        NOW + 300,
+        NOW + 300,
+        vec![Ok(NOW), Ok(NOW + 1)],
+    ));
+}
+
+#[test]
+fn shielded_exchange_rejects_expiry_during_receive_or_completion() {
+    assert!(!exchange_at_times(
+        NOW,
+        NOW + 1,
+        NOW + 300,
+        vec![Ok(NOW), Ok(NOW + 1)],
+    ));
+    assert!(!exchange_at_times(
+        NOW,
+        NOW + 2,
+        NOW + 300,
+        vec![Ok(NOW), Ok(NOW + 1), Ok(NOW + 2)],
+    ));
+    assert!(!exchange_at_times(
+        NOW,
+        NOW + 300,
+        NOW + 2,
+        vec![Ok(NOW), Ok(NOW + 1), Ok(NOW + 2)],
+    ));
+}
+
+#[test]
+fn shielded_exchange_rejects_clock_failure_or_rollback() {
+    assert!(!exchange_at_times(
+        NOW,
+        NOW + 300,
+        NOW + 300,
+        vec![Ok(NOW), Err(PeerError::Binding)],
+    ));
+    assert!(!exchange_at_times(
+        NOW,
+        NOW + 300,
+        NOW + 300,
+        vec![Ok(NOW + 1), Ok(NOW)],
+    ));
+}
+
 fn private_draft(bootstrap: &NegotiationBootstrap, suite: u16) -> Proposal {
     let mut terms = proposal(suite).terms().clone();
     terms.buyer_authorization_key = bootstrap.buyer_key().clone();

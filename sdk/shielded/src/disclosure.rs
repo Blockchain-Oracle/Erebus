@@ -7,18 +7,27 @@
 
 use erebus_core::{
     deal_state::{DealEvidence, DealReads, RevisionError, SignedRevision},
+    ids::AssetId,
     settlement::SettlementContext,
     shielded::{ShieldedDeal, ShieldedMapError},
+    suite,
 };
 use erebus_transport::disclosure::{
     verify_selected_agreement, DisclosureError, SelectedAgreement, VerifiedAgreement,
 };
+use serde::{Deserialize, Serialize};
 
 use crate::{
     index_store::IndexStore,
-    observation::{observe_shielded_deal_agreed, ObservationError},
-    rpc::PoolRpc,
+    observation::{
+        observe_shielded_deal_agreed, observe_shielded_deal_certified_bounded, ObservationError,
+        SettlementLocation,
+    },
+    rpc::{PoolRpc, PoolRuntimePins},
 };
+
+/// New pool blocks each provider may scan in one certified verification before it is pending.
+const CERTIFIED_SCAN_BLOCKS: u64 = 1_000;
 
 /// One selected agreement whose payment matches independently observed finalized pool state.
 /// This does not establish the identity of the grant issuer or service delivery.
@@ -34,6 +43,95 @@ pub struct FinalizedShieldedPayment {
 impl core::fmt::Debug for FinalizedShieldedPayment {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         formatter.write_str("FinalizedShieldedPayment { <redacted> }")
+    }
+}
+
+/// Facts a paired finalized observation established about one selected agreement's payment.
+///
+/// Every field except `observers` was read from both providers or the verified opening, never
+/// copied from configuration. `observers` names the two configured RPC endpoints by
+/// fingerprint. A certificate records what was observed once; it is not a consensus proof and
+/// it assumes the finalized anchor does not revert.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PaymentCertificate {
+    /// EVM chain id the pool observers were configured for and checked against.
+    pub chain_id: u64,
+    /// Pool contract that emitted the settlement event.
+    pub pool: [u8; 20],
+    /// Keccak-256 of the agreement's canonical deployment domain encoding.
+    pub domain_digest: [u8; 32],
+    /// Pool verifier version read at the finalized anchor.
+    pub verifier_version: u32,
+    /// Pool ERC-20 asset read at the finalized anchor.
+    pub asset: [u8; 20],
+    /// Paid agreement commitment from the verified opening.
+    pub commitment: [u8; 32],
+    /// Deal nullifier from the verified opening.
+    pub nullifier: [u8; 32],
+    /// Paid amount in base units from the verified opening.
+    pub amount: u128,
+    /// RPC-finalized anchor number.
+    pub finalized_number: u64,
+    /// RPC-finalized anchor hash.
+    pub finalized_hash: [u8; 32],
+    /// RPC-finalized anchor timestamp.
+    pub finalized_timestamp: u64,
+    /// Canonical location of the settlement event, at or before the finalized anchor.
+    pub settlement: SettlementLocation,
+    /// Fingerprints of the first and second configured pool RPC endpoints.
+    pub observers: [[u8; 32]; 2],
+    /// Pool and dependency runtime pins read back from both providers at the finalized anchor.
+    /// These are the verified pins, not the configuration they were checked against.
+    pub runtime: PoolRuntimePins,
+}
+
+impl core::fmt::Debug for PaymentCertificate {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str("PaymentCertificate { <redacted> }")
+    }
+}
+
+impl PaymentCertificate {
+    /// Whether this certificate describes exactly this verified agreement and is internally
+    /// consistent. It checks binding only; it does not observe the chain again.
+    #[must_use]
+    pub fn binds(&self, evidence: &SelectedAgreement, agreement: &VerifiedAgreement) -> bool {
+        let terms = &evidence.terms;
+        let Ok(domain) = terms.domain.encode() else {
+            return false;
+        };
+        let pool_matches = terms
+            .domain
+            .pool
+            .as_ref()
+            .is_some_and(|pool| pool.as_bytes() == self.pool.as_slice());
+        let chain_matches = terms.domain.namespace.family() == "eip155"
+            && terms.domain.namespace.reference().parse::<u64>().ok() == Some(self.chain_id);
+        self.commitment == *agreement.commitment.as_bytes()
+            && self.nullifier == *agreement.nullifier.as_bytes()
+            && self.amount == terms.amount.get()
+            && Some(self.asset) == erc20_address(&terms.asset)
+            && self.verifier_version == terms.domain.verifier_version
+            && self.domain_digest == suite::keccak256(&[&domain])
+            && pool_matches
+            && chain_matches
+            && self.settlement.block_number <= self.finalized_number
+            && self.observers[0] != self.observers[1]
+    }
+}
+
+/// A finalized shielded payment and the certificate of the observation that established it.
+pub struct CertifiedShieldedPayment {
+    /// The verified payment, exactly as [`verify_shielded_payment`] returns it.
+    pub payment: FinalizedShieldedPayment,
+    /// Anchors, settlement location, and observer fingerprints of that verification.
+    pub certificate: PaymentCertificate,
+}
+
+impl core::fmt::Debug for CertifiedShieldedPayment {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str("CertifiedShieldedPayment { <redacted> }")
     }
 }
 
@@ -90,6 +188,99 @@ pub async fn verify_shielded_payment(
         agreement: claim.agreement,
         settlement,
     })
+}
+
+/// [`verify_shielded_payment`] that also returns a [`PaymentCertificate`].
+///
+/// The payment checks are the same. The pairing is stricter: both providers must also agree on
+/// the settlement block, transaction hash, log index, and pool identity. Both providers must
+/// also run the pinned pool and dependency code at the finalized anchor: a permissive verifier
+/// behind a matching ABI would otherwise accept proofs the reviewed deployment would reject.
+/// Scans at most 1000 new blocks per provider; a longer history is reported as pending and
+/// resumes from the same caches on retry.
+pub async fn verify_shielded_payment_certified(
+    evidence: SelectedAgreement,
+    rpc: &PoolRpc,
+    index: &IndexStore,
+    peer_rpc: &PoolRpc,
+    peer_index: &IndexStore,
+    pins: PoolRuntimePins,
+) -> Result<CertifiedShieldedPayment, ShieldedDisclosureError> {
+    let claim = PaymentClaim::from_evidence(&evidence)?;
+    let observed = observe_shielded_deal_certified_bounded(
+        rpc,
+        index,
+        peer_rpc,
+        peer_index,
+        &claim.context,
+        &claim.agreement.nullifier,
+        std::slice::from_ref(&claim.revision),
+        CERTIFIED_SCAN_BLOCKS,
+    )
+    .await?;
+    claim.verify_payment(&observed.evidence)?;
+    let DealEvidence::Observed(settlement) = observed.evidence else {
+        return Err(ShieldedDisclosureError::Payment);
+    };
+    let Some(location) = observed.settlement else {
+        return Err(ShieldedDisclosureError::Payment);
+    };
+    // The certificate claims a runtime pin, so read the code back from both providers before
+    // recording it. A zero pin or a mismatch is an error, never a silent skip.
+    rpc.authenticate_runtime_at(observed.finalized.hash, pins)
+        .await
+        .map_err(ObservationError::from)?;
+    peer_rpc
+        .authenticate_runtime_at(observed.finalized.hash, pins)
+        .await
+        .map_err(ObservationError::from)?;
+    let certificate = PaymentCertificate {
+        chain_id: rpc.chain_id(),
+        pool: rpc.pool(),
+        domain_digest: suite::keccak256(&[&evidence
+            .terms
+            .domain
+            .encode()
+            .map_err(|_| ShieldedDisclosureError::Payment)?]),
+        verifier_version: observed.pool.verifier_version,
+        asset: observed.pool.asset,
+        commitment: *claim.agreement.commitment.as_bytes(),
+        nullifier: *claim.agreement.nullifier.as_bytes(),
+        amount: claim.revision.amount().get(),
+        finalized_number: observed.finalized.number,
+        finalized_hash: observed.finalized.hash,
+        finalized_timestamp: observed.finalized.timestamp,
+        settlement: location,
+        observers: [rpc.endpoint_fingerprint(), peer_rpc.endpoint_fingerprint()],
+        runtime: pins,
+    };
+    let payment = FinalizedShieldedPayment {
+        evidence,
+        agreement: claim.agreement,
+        settlement,
+    };
+    if !certificate.binds(&payment.evidence, &payment.agreement) {
+        return Err(ShieldedDisclosureError::Payment);
+    }
+    Ok(CertifiedShieldedPayment {
+        payment,
+        certificate,
+    })
+}
+
+fn erc20_address(asset: &AssetId) -> Option<[u8; 20]> {
+    if asset.asset_namespace() != "erc20" {
+        return None;
+    }
+    let token = asset.asset_reference().strip_prefix("0x")?;
+    if token.len() != 40
+        || !token
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return None;
+    }
+    hex::decode(token).ok()?.try_into().ok()
 }
 
 struct PaymentClaim {
@@ -396,7 +587,10 @@ mod tests {
         paid: bool,
         omit_log: bool,
         finalized: u64,
+        head: u64,
         asset: [u8; 20],
+        tx_hash: [u8; 32],
+        code: Vec<u8>,
     }
 
     fn rpc_fixture(claim: &PaymentClaim) -> RpcFixture {
@@ -406,7 +600,23 @@ mod tests {
             paid: true,
             omit_log: false,
             finalized: 4,
+            head: 4,
             asset: [0xaa; 20],
+            tx_hash: [9; 32],
+            code: vec![0x60, 0x00],
+        }
+    }
+
+    /// Pins for the fixture code: the pool and its four dependencies all serve it.
+    fn pins_for(code: &[u8]) -> PoolRuntimePins {
+        use sha3::{Digest, Keccak256};
+        let hash: [u8; 32] = Keccak256::digest(code).into();
+        PoolRuntimePins {
+            pool: hash,
+            poseidon: hash,
+            deposit: hash,
+            transfer: hash,
+            withdraw: hash,
         }
     }
 
@@ -432,7 +642,7 @@ mod tests {
         use sha3::{Digest, Keccak256};
         let result = match request["method"].as_str().unwrap() {
             "eth_chainId" => json!("0x7a69"),
-            "eth_blockNumber" => json!("0x4"),
+            "eth_blockNumber" => json!(format!("0x{:x}", state.head)),
             "eth_getBlockByNumber" => {
                 let tag = request["params"][0].as_str().unwrap();
                 let number = if tag == "finalized" {
@@ -448,12 +658,20 @@ mod tests {
                 })
             }
             "eth_getLogs" => {
-                if request["params"][0]["fromBlock"] == "0x3" && state.paid && !state.omit_log {
+                let bound = |key: &str| {
+                    let value = request["params"][0][key].as_str().unwrap();
+                    u64::from_str_radix(value.strip_prefix("0x").unwrap(), 16).unwrap()
+                };
+                // Ranged queries are allowed; the payment log lives in block 3.
+                if (bound("fromBlock")..=bound("toBlock")).contains(&3)
+                    && state.paid
+                    && !state.omit_log
+                {
                     json!([{
                         "address": format!("0x{}", hex::encode([3; 20])),
                         "blockNumber": "0x3",
                         "blockHash": format!("0x{}", hex::encode(block_hash(3))),
-                        "transactionHash": format!("0x{}", hex::encode([9; 32])),
+                        "transactionHash": format!("0x{}", hex::encode(state.tx_hash)),
                         "logIndex": "0x0",
                         "topics": [
                             format!("0x{}", hex::encode(Keccak256::digest(b"DealTransferred(uint256,uint256,uint256)"))),
@@ -467,6 +685,10 @@ mod tests {
                 } else {
                     json!([])
                 }
+            }
+            "eth_getCode" => {
+                assert_eq!(request["params"][1]["requireCanonical"], true);
+                json!(format!("0x{}", hex::encode(&state.code)))
             }
             "eth_call" => {
                 let data = request["params"][0]["data"].as_str().unwrap();
@@ -483,6 +705,16 @@ mod tests {
                         json!(format!("0x{:0>64}", hex::encode(state.asset)))
                     } else if data == rpc_selector("verifierVersion()") {
                         json!(format!("0x{:064x}", 2))
+                    } else if [
+                        rpc_selector("poseidonTwo()"),
+                        rpc_selector("depositVerifier()"),
+                        rpc_selector("transferVerifier()"),
+                        rpc_selector("withdrawVerifier()"),
+                    ]
+                    .iter()
+                    .any(|selector| data == selector)
+                    {
+                        json!(format!("0x{:0>64}", hex::encode([0x99; 20])))
                     } else {
                         assert!(data.starts_with(&rpc_selector("consumedDeals(uint256)")));
                         let hash = hex::decode(
@@ -597,6 +829,306 @@ mod tests {
             .is_err());
             server.abort();
             peer_server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn cached_finalized_payment_does_not_chase_later_activity() {
+        let evidence = fixture();
+        let claim = PaymentClaim::from_evidence(&evidence).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let first_index = auditor_index(directory.path(), "first");
+        let peer_index = auditor_index(directory.path(), "peer");
+        let (rpc, server) = start_rpc(rpc_fixture(&claim)).await;
+        let (peer_rpc, peer_server) = start_rpc(rpc_fixture(&claim)).await;
+        verify_shielded_payment_certified(
+            evidence.clone(),
+            &rpc,
+            &first_index,
+            &peer_rpc,
+            &peer_index,
+            pins_for(&[0x60, 0x00]),
+        )
+        .await
+        .unwrap();
+        server.abort();
+        peer_server.abort();
+
+        let mut advanced = rpc_fixture(&claim);
+        advanced.head = 2_000;
+        advanced.finalized = 2_000;
+        let (rpc, server) = start_rpc(advanced.clone()).await;
+        let (peer_rpc, peer_server) = start_rpc(advanced.clone()).await;
+        let certified = verify_shielded_payment_certified(
+            evidence.clone(),
+            &rpc,
+            &first_index,
+            &peer_rpc,
+            &peer_index,
+            pins_for(&[0x60, 0x00]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(certified.certificate.finalized_number, 4);
+        assert_eq!(first_index.load().unwrap().tip().unwrap().number, 4);
+        assert_eq!(peer_index.load().unwrap().tip().unwrap().number, 4);
+        server.abort();
+        peer_server.abort();
+
+        let empty = tempfile::tempdir().unwrap();
+        let empty_first = auditor_index(empty.path(), "first");
+        let empty_peer = auditor_index(empty.path(), "peer");
+        let (rpc, server) = start_rpc(advanced.clone()).await;
+        let (peer_rpc, peer_server) = start_rpc(advanced.clone()).await;
+        assert!(matches!(
+            verify_shielded_payment_certified(
+                evidence.clone(),
+                &rpc,
+                &empty_first,
+                &peer_rpc,
+                &empty_peer,
+                pins_for(&[0x60, 0x00]),
+            )
+            .await,
+            Err(ShieldedDisclosureError::Observation(
+                ObservationError::Recovery(crate::recovery::RecoveryError::HistoryPending { .. })
+            ))
+        ));
+        server.abort();
+        peer_server.abort();
+
+        for fault in 0..3 {
+            let mut broken = advanced.clone();
+            match fault {
+                0 => broken.paid = false,
+                1 => broken.omit_log = true,
+                _ => broken.code = vec![0x60, 0x01],
+            }
+            let (rpc, server) = start_rpc(advanced.clone()).await;
+            let (peer_rpc, peer_server) = start_rpc(broken).await;
+            assert!(verify_shielded_payment_certified(
+                evidence.clone(),
+                &rpc,
+                &first_index,
+                &peer_rpc,
+                &peer_index,
+                pins_for(&[0x60, 0x00]),
+            )
+            .await
+            .is_err());
+            server.abort();
+            peer_server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn certified_verification_returns_the_agreed_anchors_and_settlement_location() {
+        let evidence = fixture();
+        let claim = PaymentClaim::from_evidence(&evidence).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let first_index = auditor_index(directory.path(), "first");
+        let peer_index = auditor_index(directory.path(), "peer");
+        let (rpc, server) = start_rpc(rpc_fixture(&claim)).await;
+        let (peer_rpc, peer_server) = start_rpc(rpc_fixture(&claim)).await;
+        let certified = verify_shielded_payment_certified(
+            evidence.clone(),
+            &rpc,
+            &first_index,
+            &peer_rpc,
+            &peer_index,
+            pins_for(&[0x60, 0x00]),
+        )
+        .await
+        .unwrap();
+        let certificate = &certified.certificate;
+        assert_eq!(certificate.runtime, pins_for(&[0x60, 0x00]));
+        assert_eq!(certificate.chain_id, 31_337);
+        assert_eq!(certificate.pool, [3; 20]);
+        assert_eq!(certificate.asset, [0xaa; 20]);
+        assert_eq!(certificate.verifier_version, 2);
+        assert_eq!(certificate.amount, 70);
+        assert_eq!(
+            certificate.commitment,
+            *claim.agreement.commitment.as_bytes()
+        );
+        assert_eq!(certificate.nullifier, *claim.agreement.nullifier.as_bytes());
+        assert_eq!(certificate.finalized_number, 4);
+        assert_eq!(certificate.finalized_hash, block_hash(4));
+        assert_eq!(certificate.finalized_timestamp, 300);
+        assert_eq!(
+            certificate.settlement,
+            SettlementLocation {
+                block_number: 3,
+                block_hash: block_hash(3),
+                transaction_hash: [9; 32],
+                log_index: 0,
+            }
+        );
+        assert_eq!(
+            certificate.observers,
+            [rpc.endpoint_fingerprint(), peer_rpc.endpoint_fingerprint()]
+        );
+        assert_ne!(certificate.observers[0], certificate.observers[1]);
+        assert!(certificate.binds(&evidence, &claim.agreement));
+        assert_eq!(certified.payment.agreement, claim.agreement);
+        assert_eq!(
+            format!("{certified:?}"),
+            "CertifiedShieldedPayment { <redacted> }"
+        );
+        let encoded = serde_json::to_vec(certificate).unwrap();
+        let decoded: PaymentCertificate = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(&decoded, certificate);
+        server.abort();
+        peer_server.abort();
+    }
+
+    #[tokio::test]
+    async fn certified_pairing_is_stricter_and_the_legacy_result_is_unchanged() {
+        let evidence = fixture();
+        let claim = PaymentClaim::from_evidence(&evidence).unwrap();
+        let mut peer = rpc_fixture(&claim);
+        peer.tx_hash = [5; 32];
+        let directory = tempfile::tempdir().unwrap();
+        let (rpc, server) = start_rpc(rpc_fixture(&claim)).await;
+        let (peer_rpc, peer_server) = start_rpc(peer).await;
+        // The legacy predicate compares anchors and deal reads only, as it always has.
+        verify_shielded_payment(
+            evidence.clone(),
+            &rpc,
+            &auditor_index(directory.path(), "legacy-first"),
+            &peer_rpc,
+            &auditor_index(directory.path(), "legacy-peer"),
+        )
+        .await
+        .unwrap();
+        // A certificate needs the providers to agree on where the settlement is too.
+        assert!(matches!(
+            verify_shielded_payment_certified(
+                evidence,
+                &rpc,
+                &auditor_index(directory.path(), "first"),
+                &peer_rpc,
+                &auditor_index(directory.path(), "peer"),
+                pins_for(&[0x60, 0x00]),
+            )
+            .await,
+            Err(ShieldedDisclosureError::Observation(
+                ObservationError::Inconsistent
+            ))
+        ));
+        server.abort();
+        peer_server.abort();
+    }
+
+    #[tokio::test]
+    async fn certified_verification_rejects_unpaid_and_nonfinal_payments() {
+        let evidence = fixture();
+        let claim = PaymentClaim::from_evidence(&evidence).unwrap();
+        let original = rpc_fixture(&claim);
+        let mut unpaid = original.clone();
+        unpaid.paid = false;
+        let mut omitted_settlement = original.clone();
+        omitted_settlement.omit_log = true;
+        let mut nonfinal = original;
+        nonfinal.finalized = 2;
+        // A consumed deal without its settlement log cannot certify entitlement.
+        for state in [unpaid, nonfinal, omitted_settlement] {
+            let directory = tempfile::tempdir().unwrap();
+            let (rpc, server) = start_rpc(state.clone()).await;
+            let (peer_rpc, peer_server) = start_rpc(state).await;
+            assert!(verify_shielded_payment_certified(
+                evidence.clone(),
+                &rpc,
+                &auditor_index(directory.path(), "first"),
+                &peer_rpc,
+                &auditor_index(directory.path(), "peer"),
+                pins_for(&[0x60, 0x00]),
+            )
+            .await
+            .is_err());
+            server.abort();
+            peer_server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn certified_verification_rejects_a_runtime_that_differs_from_the_pin() {
+        let evidence = fixture();
+        let claim = PaymentClaim::from_evidence(&evidence).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let (rpc, server) = start_rpc(rpc_fixture(&claim)).await;
+        let (peer_rpc, peer_server) = start_rpc(rpc_fixture(&claim)).await;
+        // The providers serve [0x60, 0x00]; a pin for other code must fail closed, and a zero
+        // pin is a configuration error rather than a skipped check.
+        for wrong in [
+            pins_for(&[0x60, 0x01]),
+            PoolRuntimePins {
+                pool: [0; 32],
+                ..pins_for(&[0x60, 0x00])
+            },
+        ] {
+            assert!(matches!(
+                verify_shielded_payment_certified(
+                    evidence.clone(),
+                    &rpc,
+                    &auditor_index(directory.path(), "first"),
+                    &peer_rpc,
+                    &auditor_index(directory.path(), "peer"),
+                    wrong,
+                )
+                .await,
+                Err(ShieldedDisclosureError::Observation(ObservationError::Rpc(
+                    _
+                )))
+            ));
+        }
+        server.abort();
+        peer_server.abort();
+    }
+
+    #[test]
+    fn a_certificate_binds_only_its_own_agreement() {
+        let evidence = fixture();
+        let claim = PaymentClaim::from_evidence(&evidence).unwrap();
+        let certificate = PaymentCertificate {
+            chain_id: 31_337,
+            pool: [3; 20],
+            domain_digest: suite::keccak256(&[&evidence.terms.domain.encode().unwrap()]),
+            verifier_version: 2,
+            asset: [0xaa; 20],
+            commitment: *claim.agreement.commitment.as_bytes(),
+            nullifier: *claim.agreement.nullifier.as_bytes(),
+            amount: 70,
+            finalized_number: 4,
+            finalized_hash: block_hash(4),
+            finalized_timestamp: 300,
+            settlement: SettlementLocation {
+                block_number: 3,
+                block_hash: block_hash(3),
+                transaction_hash: [9; 32],
+                log_index: 0,
+            },
+            observers: [[1; 32], [2; 32]],
+            runtime: pins_for(&[0x60, 0x00]),
+        };
+        assert!(certificate.binds(&evidence, &claim.agreement));
+        assert_eq!(
+            format!("{certificate:?}"),
+            "PaymentCertificate { <redacted> }"
+        );
+        let mut cases = vec![certificate.clone(); 10];
+        cases[0].chain_id += 1;
+        cases[1].pool[0] ^= 1;
+        cases[2].domain_digest[0] ^= 1;
+        cases[3].verifier_version += 1;
+        cases[4].asset[0] ^= 1;
+        cases[5].commitment[0] ^= 1;
+        cases[6].nullifier[0] ^= 1;
+        cases[7].amount += 1;
+        cases[8].settlement.block_number = 5;
+        cases[9].observers = [[1; 32], [1; 32]];
+        for case in cases {
+            assert!(!case.binds(&evidence, &claim.agreement));
         }
     }
 }

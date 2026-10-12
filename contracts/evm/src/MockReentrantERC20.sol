@@ -2,7 +2,7 @@
 pragma solidity ^0.8.24;
 
 /// @title MockReentrantERC20
-/// @notice A token that attempts a reentrant call during `transferFrom`.
+/// @notice A token that attempts reentry during `transferFrom` or an explicitly armed `transfer`.
 /// @dev Used to prove the settlement contract's replay state is written before any external
 ///      call, so a token cannot re-enter `settle` and pay the same deal twice.
 contract MockReentrantERC20 {
@@ -17,12 +17,20 @@ contract MockReentrantERC20 {
     address public reentryTarget;
     bytes public reentryCalldata;
     bool private reentered;
+    bool private callbackOnTransfer;
 
     event Transfer(address indexed from, address indexed to, uint256 value);
 
     function arm(address target, bytes calldata data) external {
         reentryTarget = target;
         reentryCalldata = data;
+        callbackOnTransfer = false;
+    }
+
+    function armTransfer(address target, bytes calldata data) external {
+        reentryTarget = target;
+        reentryCalldata = data;
+        callbackOnTransfer = true;
     }
 
     function mint(address to, uint256 value) external {
@@ -38,6 +46,7 @@ contract MockReentrantERC20 {
 
     function transfer(address to, uint256 value) external returns (bool) {
         _move(msg.sender, to, value);
+        if (callbackOnTransfer) _callback();
         return true;
     }
 
@@ -48,7 +57,11 @@ contract MockReentrantERC20 {
             allowance[from][msg.sender] = allowed - value;
         }
         _move(from, to, value);
+        _callback();
+        return true;
+    }
 
+    function _callback() private {
         // Attempt the armed reentrant call once. Its revert is bubbled, so a reentrant attempt
         // that fails also reverts the outer settlement.
         if (reentryTarget != address(0) && !reentered) {
@@ -56,7 +69,6 @@ contract MockReentrantERC20 {
             (bool ok,) = reentryTarget.call(reentryCalldata);
             require(ok, "reentry reverted");
         }
-        return true;
     }
 
     function _move(address from, address to, uint256 value) private {

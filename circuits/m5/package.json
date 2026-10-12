@@ -3,7 +3,11 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "prototype": "node scripts/pool.mjs"
+    "prototype": "node scripts/pool.mjs",
+    "test:negative-witness": "node scripts/negative-witness.mjs",
+    "test:deployment": "node scripts/prepare-testnet-deployment.test.mjs",
+    "test:stateful-proof": "node scripts/stateful-proof.mjs",
+    "test:live-amounts": "node scripts/live-amounts.test.mjs"
   },
   "dependencies": {
     "circomlib": "2.0.5",

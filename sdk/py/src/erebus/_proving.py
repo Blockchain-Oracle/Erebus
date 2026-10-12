@@ -31,7 +31,7 @@ class LocalProvingSeam:
                 input=None if request is None else json.dumps(request),
                 capture_output=True, text=True, timeout=self._timeout, check=False,
             )
-        except (OSError, subprocess.TimeoutExpired):
+        except (OSError, subprocess.TimeoutExpired, UnicodeError):
             raise LocalProvingError("local proving unavailable; retain the witness and retry") from None
         if output.returncode != 0 or output.stderr or len(output.stdout) > 16_384:
             raise LocalProvingError("local proving or artifact installation failed")
@@ -54,6 +54,7 @@ class LocalProvingSeam:
         self, *, manifest_file: str, manifest_sha256: str, circuit: str,
         cache_root: str, witness_file: str, expected_public: list[str],
         allow_test_artifacts: bool = False, allow_loopback_http: bool = False,
+        manifest_authorization: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Forward local paths; return only public proof coordinates and measurements."""
         count = {"deposit": 6, "transfer": 11, "withdraw": 8}.get(circuit) if isinstance(circuit, str) else None
@@ -65,11 +66,30 @@ class LocalProvingSeam:
             or any(not isinstance(path, str) or not path or len(path) > 4096 for path in (manifest_file, cache_root, witness_file))
         ):
             raise LocalProvingError("invalid local proving request")
-        response = self._run({
+        if manifest_authorization is not None:
+            signature = manifest_authorization.get("signature") if isinstance(manifest_authorization, dict) else None
+            if (
+                not isinstance(manifest_authorization, dict)
+                or set(manifest_authorization) != {"publisher", "signature"}
+                or not isinstance(manifest_authorization["publisher"], str)
+                or not re.fullmatch(r"0x[a-f0-9]{40}", manifest_authorization["publisher"])
+                or manifest_authorization["publisher"] == "0x" + "0" * 40
+                or not isinstance(signature, dict)
+                or set(signature) != {"version", "manifest_sha256", "signature_hex"}
+                or type(signature["version"]) is not int or signature["version"] != 1
+                or signature["manifest_sha256"] != manifest_sha256
+                or not isinstance(signature["signature_hex"], str)
+                or not re.fullmatch(r"[a-f0-9]{130}", signature["signature_hex"])
+            ):
+                raise LocalProvingError("invalid artifact publisher authorization")
+        request = {
             "manifest_file": manifest_file, "manifest_sha256": manifest_sha256, "circuit": circuit,
             "cache_root": cache_root, "witness_file": witness_file, "expected_public": expected_public,
             "allow_test_artifacts": allow_test_artifacts, "allow_loopback_http": allow_loopback_http,
-        })
+        }
+        if manifest_authorization is not None:
+            request["manifest_authorization"] = manifest_authorization
+        response = self._run(request)
         if set(response) != {"status", "calldata", "downloaded_bytes", "cache_hits", "installation_ms", "proving_ms"}:
             raise LocalProvingError("unexpected local proving response fields")
         for name, maximum in (("downloaded_bytes", 3 * 256 * 1024 * 1024), ("cache_hits", 3), ("installation_ms", 2**64 - 1), ("proving_ms", 2**64 - 1)):

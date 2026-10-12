@@ -34,7 +34,7 @@ pub enum ShieldedMapError {
 }
 
 /// Validated fields shared by the Rust agreement and the shielded circuit.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ShieldedDeal {
     chain_id: Fr,
     contract_address: Fr,
@@ -56,6 +56,12 @@ pub struct ShieldedDeal {
     seller_ay: Fr,
     recipient_spend_tag: Fr,
     expiry: Fr,
+}
+
+impl core::fmt::Debug for ShieldedDeal {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str("ShieldedDeal { <redacted> }")
+    }
 }
 
 pub(crate) fn field_bytes(value: Fr) -> [u8; 32] {
@@ -110,6 +116,13 @@ pub fn disclosure_message(digest: &[u8; 32]) -> Result<[u8; 32], ShieldedMapErro
 pub fn access_message(digest: &[u8; 32]) -> Result<[u8; 32], ShieldedMapError> {
     let (high, low) = limbs(digest);
     Ok(field_bytes(hash(&[Fr::from(3002u64), high, low])?))
+}
+
+/// Maps a prepaid call request to a signature domain distinct from payment and snapshot access.
+/// Both 128-bit digest limbs are retained.
+pub fn metered_access_message(digest: &[u8; 32]) -> Result<[u8; 32], ShieldedMapError> {
+    let (high, low) = limbs(digest);
+    Ok(field_bytes(hash(&[Fr::from(3003u64), high, low])?))
 }
 
 fn domain_fields(domain: &DeploymentDomain) -> Result<[Fr; 4], ShieldedMapError> {
@@ -175,8 +188,25 @@ pub fn note_spend_tag(spend_secret: &[u8; 32]) -> Result<[u8; 32], ShieldedMapEr
     Ok(field_bytes(hash(&[Fr::from(2006u64), secret])?))
 }
 
-/// Computes an M5 note commitment. `amount` may be zero for a change output.
+/// Computes the deployment domain element bound into every note.
+pub fn note_domain(
+    chain_id: u64,
+    pool: &[u8; 20],
+    verifier_version: u32,
+) -> Result<[u8; 32], ShieldedMapError> {
+    if chain_id == 0 || pool == &[0; 20] || verifier_version == 0 {
+        return Err(ShieldedMapError::Shape("note domain"));
+    }
+    Ok(field_bytes(hash(&[
+        Fr::from(chain_id),
+        Fr::from_be_bytes_mod_order(pool),
+        Fr::from(verifier_version),
+    ])?))
+}
+
+/// Computes an M5 note commitment bound to one deployment domain. `amount` may be zero.
 pub fn note_commitment(
+    note_domain: &[u8; 32],
     asset: &[u8; 20],
     amount: u128,
     owner: &[u8; 64],
@@ -186,12 +216,14 @@ pub fn note_commitment(
     if asset.iter().all(|byte| *byte == 0) {
         return Err(ShieldedMapError::Shape("zero note asset"));
     }
+    let domain = nonzero_field(note_domain, "note domain")?;
     let ax = canonical_field(&owner[..32], "owner Ax")?;
     let ay = canonical_field(&owner[32..], "owner Ay")?;
     let tag = nonzero_field(spend_tag, "spend tag")?;
     let salt = canonical_field(salt, "note salt")?;
     Ok(field_bytes(hash(&[
-        Fr::from(2007u64),
+        Fr::from(2010u64),
+        domain,
         Fr::from_be_bytes_mod_order(asset),
         Fr::from(amount),
         ax,
@@ -201,14 +233,21 @@ pub fn note_commitment(
     ])?))
 }
 
-/// Computes the one-time spend identity for a note opening.
+/// Computes the one-time spend identity for one deployment's note opening.
 pub fn note_nullifier(
+    note_domain: &[u8; 32],
     spend_secret: &[u8; 32],
     commitment: &[u8; 32],
 ) -> Result<[u8; 32], ShieldedMapError> {
+    let domain = nonzero_field(note_domain, "note domain")?;
     let secret = nonzero_field(spend_secret, "spend secret")?;
     let note = canonical_field(commitment, "note commitment")?;
-    Ok(field_bytes(hash(&[Fr::from(2008u64), secret, note])?))
+    Ok(field_bytes(hash(&[
+        Fr::from(2011u64),
+        domain,
+        secret,
+        note,
+    ])?))
 }
 
 /// Hashes two canonical M5 tree nodes in left-to-right order.
@@ -287,6 +326,15 @@ impl ShieldedDeal {
         let buyer_ay = canonical_field(&buyer[32..], "buyer Ay")?;
         let seller_ax = canonical_field(&seller[..32], "seller Ax")?;
         let seller_ay = canonical_field(&seller[32..], "seller Ay")?;
+        let identity = (Fr::from(0u64), Fr::from(1u64));
+        if (buyer_ax, buyer_ay) == identity || (seller_ax, seller_ay) == identity {
+            return Err(ShieldedMapError::Shape("identity authorization key"));
+        }
+        // SDK policy: a two-party agreement requires distinct authorization keys. This is not
+        // a pool invariant; the chain cannot distinguish distinct parties from one owner's keys.
+        if (buyer_ax, buyer_ay) == (seller_ax, seller_ay) {
+            return Err(ShieldedMapError::Shape("buyer and seller keys must differ"));
+        }
         let recipient_spend_tag =
             nonzero_field(terms.payment_recipient.as_bytes(), "recipient spend tag")?;
         let (transcript_lo, transcript_hi) = limbs(&terms.transcript_root);
@@ -385,13 +433,20 @@ impl ShieldedDeal {
         role_message(self.domain, role, commitment)
     }
 
+    /// The deployment domain element bound into every note of this deal.
+    #[must_use]
+    pub fn note_domain(&self) -> [u8; 32] {
+        field_bytes(self.domain)
+    }
+
     /// Predicts the recipient note bound to this deal's seller, amount, and nonce.
     ///
     /// The recipient still needs its private spend secret to recognize and spend the note.
     pub fn payment_note_commitment(&self) -> Result<[u8; 32], ShieldedMapError> {
         let salt = canonical_field(&self.payment_salt()?, "payment salt")?;
         Ok(field_bytes(hash(&[
-            Fr::from(2007u64),
+            Fr::from(2010u64),
+            self.domain,
             self.asset,
             self.amount,
             self.seller_ax,

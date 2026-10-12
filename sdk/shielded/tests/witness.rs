@@ -144,6 +144,7 @@ fn native_input_choice_survives_restart_and_keeps_zero_change_opening() {
                 .as_bytes()
                 .try_into()
                 .unwrap(),
+            verifier_version: terms.domain.verifier_version,
         };
         let store = WalletStore::new(&path, domain, [7; 32]).unwrap();
         let note = OwnedNote::new(
@@ -152,6 +153,7 @@ fn native_input_choice_survives_restart_and_keeps_zero_change_opening() {
             terms.buyer_authorization_key.as_bytes().try_into().unwrap(),
             test_field("choice-secret"),
             test_field("choice-salt"),
+            domain.note_domain().unwrap(),
         )
         .unwrap();
         let input = note.commitment();
@@ -252,6 +254,7 @@ fn durable_preparation_isolates_inputs_and_survives_failure_and_recovery() {
             .as_bytes()
             .try_into()
             .unwrap(),
+        verifier_version: terms.domain.verifier_version,
     };
     for amount in [70, 150] {
         let dir = tempfile::tempdir().unwrap();
@@ -263,6 +266,7 @@ fn durable_preparation_isolates_inputs_and_survives_failure_and_recovery() {
             terms.buyer_authorization_key.as_bytes().try_into().unwrap(),
             test_field("reservation-input"),
             test_field("reservation-salt"),
+            domain.note_domain().unwrap(),
         )
         .unwrap();
         let input = note.commitment();
@@ -602,6 +606,9 @@ fn rust_builds_the_exact_m5_transfer_witness() {
             .expect("buyer key width"),
         note.spend_secret,
         note.salt,
+        ShieldedDeal::from_terms(&terms)
+            .expect("deal shape")
+            .note_domain(),
     )
     .expect("owned input note");
     let mut wallet = WalletSnapshot::default();
@@ -683,6 +690,7 @@ fn rust_builds_the_exact_m5_transfer_witness() {
                 .as_bytes()
                 .try_into()
                 .unwrap(),
+            verifier_version: terms.domain.verifier_version,
         },
         [7; 32],
     )
@@ -811,6 +819,7 @@ fn rust_builds_the_exact_m5_transfer_witness() {
     let dir = tempfile::tempdir().expect("wallet directory");
     let wallet_path = dir.path().join("private/wallet.enc");
     let domain = WalletDomain {
+        verifier_version: terms.domain.verifier_version,
         chain_id: terms
             .domain
             .namespace

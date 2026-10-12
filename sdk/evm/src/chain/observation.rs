@@ -105,8 +105,28 @@ impl Default for ObservationLimits {
     }
 }
 
+/// One receipt log, bounded for wrapper-effect authentication.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InclusionLog {
+    /// Emitting contract.
+    pub address: [u8; 20],
+    /// Indexed topics in order.
+    pub topics: Vec<[u8; 32]>,
+    /// Non-indexed data.
+    pub data: Vec<u8>,
+    /// Log position in the block, when the provider supplies it.
+    pub log_index: u64,
+}
+
+/// Maximum logs retained from one receipt before the evidence is marked truncated.
+pub const MAX_INCLUSION_LOGS: usize = 64;
+/// Maximum topics retained from one log.
+pub const MAX_INCLUSION_LOG_TOPICS: usize = 8;
+/// Maximum non-indexed data retained from one log.
+pub const MAX_INCLUSION_LOG_DATA: usize = 512;
+
 /// A canonical receipt bound to its transaction and block position.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Inclusion {
     /// The including block, checked before and after receipt/transaction reads.
     pub block: BlockRef,
@@ -118,6 +138,12 @@ pub struct Inclusion {
     pub to: Option<[u8; 20]>,
     /// Sender nonce consumed by this transaction.
     pub nonce: u64,
+    /// Native value carried by the transaction.
+    pub value: u128,
+    /// Receipt logs, bounded by [`MAX_INCLUSION_LOGS`] and per-log limits.
+    pub logs: Vec<InclusionLog>,
+    /// True when the receipt exceeded a log bound; effect evidence must not be trusted.
+    pub logs_truncated: bool,
     /// Transaction position in the block.
     pub transaction_index: u64,
 }
@@ -500,6 +526,18 @@ impl EvmChain {
         Ok(())
     }
 
+    /// Reads one canonical finalized block anchor. No transaction is created.
+    pub async fn finalized_block(&self) -> Result<BlockRef, EvmError> {
+        let block = self
+            .observation_block("finalized")
+            .await?
+            .ok_or(EvmError::AnchorNotCanonical)?;
+        if block.hash == B256::ZERO {
+            return Err(EvmError::AnchorNotCanonical);
+        }
+        Ok(block.anchor())
+    }
+
     /// Observes one signed transaction. Errors and missing receipts are not no-effect proof.
     pub async fn observe(&self, transaction_hash: [u8; 32]) -> Result<TxStatus, EvmError> {
         self.check_chain().await?;
@@ -532,12 +570,36 @@ impl EvmChain {
         let (receipt, tx) = self.receipt_pair(hash, &block).await?;
         self.recheck_block(&block).await?;
         self.check_chain().await?;
+        let value: u128 = tx
+            .value()
+            .try_into()
+            .map_err(|_| EvmError::TransactionEncoding("value exceeds u128".to_owned()))?;
+        let mut logs = Vec::new();
+        let mut logs_truncated = false;
+        for log in &receipt.logs {
+            if logs.len() >= MAX_INCLUSION_LOGS
+                || log.topics().len() > MAX_INCLUSION_LOG_TOPICS
+                || log.data().data.len() > MAX_INCLUSION_LOG_DATA
+            {
+                logs_truncated = true;
+                break;
+            }
+            logs.push(InclusionLog {
+                address: log.address().0 .0,
+                topics: log.topics().iter().map(|topic| topic.0).collect(),
+                data: log.data().data.to_vec(),
+                log_index: log.log_index.unwrap_or(0),
+            });
+        }
         Ok(TxStatus::Included(Inclusion {
             block: block.anchor(),
             success: receipt.status == U64::from(1),
             from: tx.from().0 .0,
             to: tx.to().map(|a| a.0 .0),
             nonce: tx.nonce(),
+            value,
+            logs,
+            logs_truncated,
             transaction_index: receipt.transaction_index.to(),
         }))
     }

@@ -79,7 +79,7 @@ fn disclosure_command(
     serde_json::from_slice(&output.stdout).unwrap()
 }
 
-fn funded_disclosure(
+async fn funded_disclosure(
     root: &std::path::Path,
     terms: &AgreementTerms,
     operation_ref: [u8; 32],
@@ -135,11 +135,26 @@ fn funded_disclosure(
     let agreement_request = serde_json::json!({"method":"verify_agreement", "grant_file":"deal.grant", "key_file":"auditor.key", "expected_issuer":issuer});
     let mut payment_request = agreement_request.clone();
     payment_request["method"] = serde_json::json!("verify_payment");
+    let pool = terms.domain.pool.as_ref().expect("shielded pool");
+    let runtime = PoolRpc::new(
+        rpc_url,
+        terms.domain.namespace.reference().parse().unwrap(),
+        pool.as_bytes().try_into().unwrap(),
+    )
+    .unwrap()
+    .runtime_pins_at(first_hash)
+    .await
+    .expect("fixture runtime pins");
     payment_request["deployment"] = serde_json::json!({
         "namespace":terms.domain.namespace.to_string(),
         "settlement_contract":format!("0x{}", hex::encode(terms.domain.settlement_contract.as_ref().unwrap().as_bytes())),
         "verifier_version":terms.domain.verifier_version, "rpc_url":rpc_url, "peer_rpc_url":peer_rpc_url,
         "first_block":first_block, "first_hash":format!("0x{}", hex::encode(first_hash)), "cache_root":auditor.join("public-cache"),
+        "runtime_keccak256":format!("0x{}",hex::encode(runtime.pool)),
+        "poseidon_keccak256":format!("0x{}",hex::encode(runtime.poseidon)),
+        "deposit_verifier_keccak256":format!("0x{}",hex::encode(runtime.deposit)),
+        "transfer_verifier_keccak256":format!("0x{}",hex::encode(runtime.transfer)),
+        "withdraw_verifier_keccak256":format!("0x{}",hex::encode(runtime.withdraw)),
     });
     // The auditor has no path to the participant state under its configured name.
     let offline = root.with_extension("participant-offline");
@@ -392,7 +407,11 @@ async fn main() {
     let key = TransactionKey::from_bytes(&bytes(args[5].strip_prefix("0x").expect("key prefix")))
         .expect("test key");
     let root = PathBuf::from(&args[6]);
-    let build = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../circuits/m5/build");
+    let build = std::env::var_os("EREBUS_M5_TEST_BUILD")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../circuits/m5/build")
+        });
     let agreement: Value =
         serde_json::from_slice(&fs::read(build.join("agreement-input.json")).expect("agreement"))
             .expect("agreement JSON");
@@ -497,6 +516,7 @@ async fn main() {
             .strip_prefix("0x")
             .expect("asset prefix"),
     );
+    let note_domain = erebus_core::shielded::note_domain(10143, &pool, 2).expect("note domain");
     let input = OwnedNote::new(
         asset,
         text(&proof, "inputAmount").parse().expect("input amount"),
@@ -507,12 +527,14 @@ async fn main() {
             .expect("buyer key"),
         word(&proof["inputSpendSecret"]),
         word(&proof["inputSalt"]),
+        note_domain,
     )
     .expect("input note");
     let wallet_path = root.join("private/wallet.enc");
     let wallet_domain = WalletDomain {
         chain_id: 10143,
         pool,
+        verifier_version: 2,
     };
     let wallet =
         WalletStore::new(wallet_path.clone(), wallet_domain, [7; 32]).expect("test wallet");
@@ -847,7 +869,8 @@ async fn main() {
                         &fault_proxy.url,
                         first_block,
                         first_hash,
-                    );
+                    )
+                    .await;
                     if std::env::var("EREBUS_M8_ACCESS").as_deref() == Ok("1") {
                         funded_access::run(
                             &root,

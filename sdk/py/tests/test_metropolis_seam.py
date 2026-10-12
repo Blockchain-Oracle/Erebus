@@ -17,6 +17,19 @@ def seam(role="buyer", mode="shielded"):
                           negotiation_binary="negotiate", payment_binary="payment", timeout=30)
 
 
+def test_undecodable_payment_output_requires_observation_without_retry(monkeypatch):
+    calls = []
+    def run(*args, **kwargs):
+        calls.append(args)
+        raise UnicodeDecodeError("utf-8", b"private-payment-marker\xff", 22, 23, "invalid byte")
+    monkeypatch.setattr(subprocess, "run", run)
+    with pytest.raises(MetropolisError) as error:
+        seam().payment(OPERATION, method="settle")
+    assert len(calls) == 1
+    assert "private-payment-marker" not in str(error.value)
+    assert "recover by observation" in str(error.value)
+
+
 def authorized():
     return {"protocol_version": 1, "status": "authorized", "operation_ref": OPERATION, "deal_id": "12" * 16,
             "deal_commitment": "cd" * 32, "deal_nullifier": "ef" * 32, "agreement_verified": True,

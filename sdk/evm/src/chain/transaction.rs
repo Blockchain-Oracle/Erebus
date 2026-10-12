@@ -120,6 +120,11 @@ pub struct TransactionParams {
     pub fees: Eip1559Fees,
     /// Gas limit.
     pub gas_limit: u64,
+    /// Native value in wei bound to the call.
+    ///
+    /// Settlement, approval, deposit, withdrawal, and unwrap calls must use zero explicitly.
+    /// Only a native wrap may set a nonzero value, equal to the wrapped amount.
+    pub value: u128,
 }
 
 /// A signed EIP-1559 transaction and the fields it commits to.
@@ -151,10 +156,12 @@ impl std::fmt::Debug for SignedTransaction {
 impl SignedTransaction {
     /// Decodes raw bytes produced by [`build_signed`], for example after a restart.
     ///
-    /// Accepts only a canonically encoded, signed EIP-1559 contract call with zero value. The
-    /// hash is recomputed and the sender recovered from the signature; neither is trusted from
-    /// storage. Rejects nonempty access lists, zero gas, and high-s signatures. This only
-    /// decodes the transaction; use [`Self::validate_against`] before rebroadcast.
+    /// Accepts only a canonically encoded, signed EIP-1559 contract call. The hash is
+    /// recomputed and the sender recovered from the signature; neither is trusted from
+    /// storage. Rejects nonempty access lists, zero gas, and high-s signatures. The native
+    /// value is decoded into the parameters; callers that require zero must compare against
+    /// their plan. This only decodes the transaction; use [`Self::validate_against`] before
+    /// rebroadcast.
     pub fn from_raw(raw: &[u8]) -> Result<Self, EvmError> {
         let envelope = TxEnvelope::decode_2718_exact(raw)
             .map_err(|error| EvmError::TransactionEncoding(error.to_string()))?;
@@ -182,11 +189,10 @@ impl SignedTransaction {
                 "contract creation, not a call".to_owned(),
             ));
         };
-        if !transaction.value.is_zero() {
-            return Err(EvmError::TransactionEncoding(
-                "settlement transactions carry no value".to_owned(),
-            ));
-        }
+        let value: u128 = transaction
+            .value
+            .try_into()
+            .map_err(|_| EvmError::TransactionEncoding("value exceeds u128".to_owned()))?;
         let sender = signed
             .signature()
             .recover_address_from_prehash(&transaction.signature_hash())
@@ -204,6 +210,7 @@ impl SignedTransaction {
                 nonce: transaction.nonce,
                 fees,
                 gas_limit: transaction.gas_limit,
+                value,
             },
             to: to.0 .0,
             input: transaction.input.to_vec(),
@@ -234,7 +241,7 @@ impl SignedTransaction {
         self.chain_id
     }
 
-    /// Nonce, fees, and gas limit.
+    /// Nonce, fees, gas limit, and native value.
     #[must_use]
     pub const fn params(&self) -> TransactionParams {
         self.params
@@ -293,8 +300,8 @@ impl SignedTransaction {
         Ok(())
     }
 
-    /// Requires the same payment, signer, nonce, and gas limit, with increased fee caps.
-    /// This local policy does not guarantee that a node will accept the replacement.
+    /// Requires the same payment, signer, nonce, gas limit, and native value, with increased
+    /// fee caps. This local policy does not guarantee that a node will accept the replacement.
     pub fn validate_replacement(&self, previous: &Self) -> Result<(), EvmError> {
         if self.chain_id != previous.chain_id
             || self.sender != previous.sender
@@ -302,6 +309,7 @@ impl SignedTransaction {
             || self.input != previous.input
             || self.params.nonce != previous.params.nonce
             || self.params.gas_limit != previous.params.gas_limit
+            || self.params.value != previous.params.value
             || !self.params.fees.can_replace(&previous.params.fees)
         {
             return Err(EvmError::SignedIntentMismatch);
@@ -373,7 +381,7 @@ fn sign_call(
         max_fee_per_gas: params.fees.max_fee_per_gas,
         max_priority_fee_per_gas: params.fees.max_priority_fee_per_gas,
         to: TxKind::Call(Address::from(to)),
-        value: U256::ZERO,
+        value: U256::from(params.value),
         access_list: Default::default(),
         input: Bytes::from(input.clone()),
     };
@@ -420,6 +428,7 @@ mod tests {
             nonce: 7,
             fees: Eip1559Fees::new(3_000_000_000, 1_000_000_000).expect("fees"),
             gas_limit: 300_000,
+            value: 0,
         }
     }
 
@@ -566,6 +575,29 @@ mod tests {
         ] {
             assert!(changed.validate_replacement(&first).is_err());
         }
+    }
+
+    #[test]
+    fn replacement_preserves_native_value_and_requires_a_fee_bump() {
+        let first = sign_call(&key(), 31_337, kat_target(), kat_input(), kat_params()).unwrap();
+        let mut bumped = kat_params();
+        bumped.fees = kat_params().fees.replacement_floor().unwrap();
+        let second = sign_call(&key(), 31_337, kat_target(), kat_input(), bumped).unwrap();
+        second
+            .validate_replacement(&first)
+            .expect("fee bump with same intent");
+        // An unchanged fee cap cannot replace.
+        assert!(first.validate_replacement(&first).is_err());
+        // A changed native value cannot replace even with a fee bump.
+        let mut changed_value = bumped;
+        changed_value.value = 1;
+        let third = sign_call(&key(), 31_337, kat_target(), kat_input(), changed_value).unwrap();
+        assert!(third.validate_replacement(&first).is_err());
+        // A changed gas limit cannot replace.
+        let mut changed_gas = bumped;
+        changed_gas.gas_limit = 400_000;
+        let fourth = sign_call(&key(), 31_337, kat_target(), kat_input(), changed_gas).unwrap();
+        assert!(fourth.validate_replacement(&first).is_err());
     }
 
     #[test]

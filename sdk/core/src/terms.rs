@@ -182,12 +182,18 @@ impl GuaranteeSet {
 }
 
 /// How relayer or settlement fees are bound into the agreement.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct FeePolicy {
     /// Fixed fee in base units of the agreement asset; zero means no fee.
     pub fee: BaseUnits,
     /// Fee recipient. Present exactly when the fee is non-zero.
     pub recipient: Option<KeyBytes>,
+}
+
+impl core::fmt::Debug for FeePolicy {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str("FeePolicy { <redacted> }")
+    }
 }
 
 impl FeePolicy {
@@ -211,7 +217,7 @@ impl FeePolicy {
 }
 
 /// The complete authorized description of one deal revision.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct AgreementTerms {
     /// Agreement protocol version.
     pub protocol_version: u16,
@@ -248,6 +254,12 @@ pub struct AgreementTerms {
     pub settlement_nonce: [u8; 32],
     /// Service promise bound into the agreement.
     pub service: ServiceRecord,
+}
+
+impl core::fmt::Debug for AgreementTerms {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str("AgreementTerms { <redacted> }")
+    }
 }
 
 /// Agreement terms were internally inconsistent or not decodable.

@@ -11,6 +11,7 @@ pub mod disclosure;
 pub mod index_store;
 pub mod indexer;
 pub mod observation;
+pub mod operations;
 pub mod preparation;
 pub mod recovery;
 pub mod rpc;
@@ -160,8 +161,17 @@ impl ChangeNote {
             .as_bytes()
             .try_into()
             .map_err(|_| ProverError::Transfer("buyer key"))?;
-        let note = OwnedNote::new(asset, amount, owner, self.spend_secret, self.salt)
-            .map_err(|_| ProverError::Transfer("change opening"))?;
+        let deal = ShieldedDeal::from_terms(terms)
+            .map_err(|_| ProverError::Transfer("agreement shape"))?;
+        let note = OwnedNote::new(
+            asset,
+            amount,
+            owner,
+            self.spend_secret,
+            self.salt,
+            deal.note_domain(),
+        )
+        .map_err(|_| ProverError::Transfer("change opening"))?;
         Ok(Some(note))
     }
 }
@@ -269,7 +279,12 @@ fn pool_fields(
     version: u32,
     asset: [u8; 20],
 ) -> Result<(), ProverError> {
-    if domain.chain_id == 0 || domain.pool == [0; 20] || asset == [0; 20] || version == 0 {
+    if domain.chain_id == 0
+        || domain.pool == [0; 20]
+        || asset == [0; 20]
+        || version == 0
+        || version != domain.verifier_version
+    {
         return Err(ProverError::Transfer("invalid pool domain"));
     }
     insert_number(input, "chainId", domain.chain_id);
@@ -294,6 +309,13 @@ pub fn build_deposit_witness(
 ) -> Result<NoteWitness, ProverError> {
     let mut input = Map::new();
     pool_fields(&mut input, domain, version, note.asset())?;
+    if note.note_domain()
+        != domain
+            .note_domain()
+            .map_err(|_| ProverError::Transfer("deposit note domain"))?
+    {
+        return Err(ProverError::Transfer("deposit note domain"));
+    }
     let opening = note.input_note();
     let owner = note.owner();
     let tag = note_spend_tag(&opening.spend_secret)
@@ -346,6 +368,13 @@ pub fn build_withdraw_witness(
     let note = wallet
         .spendable(commitment)
         .ok_or(ProverError::Transfer("no spendable note"))?;
+    if note.note_domain()
+        != domain
+            .note_domain()
+            .map_err(|_| ProverError::Transfer("withdraw note domain"))?
+    {
+        return Err(ProverError::Transfer("withdraw note domain"));
+    }
     let inclusion = note
         .inclusion()
         .ok_or(ProverError::Transfer("note not included"))?;
@@ -521,10 +550,18 @@ pub fn build_transfer_witness(
         .as_bytes()
         .try_into()
         .map_err(|_| ProverError::Transfer("buyer key"))?;
+    let note_domain = deal.note_domain();
     let spend_tag = note_spend_tag(&note.spend_secret)
         .map_err(|_| ProverError::Transfer("input spend secret"))?;
-    let input_note = note_commitment(&asset, note.amount, &buyer_key, &spend_tag, &note.salt)
-        .map_err(|_| ProverError::Transfer("input note"))?;
+    let input_note = note_commitment(
+        &note_domain,
+        &asset,
+        note.amount,
+        &buyer_key,
+        &spend_tag,
+        &note.salt,
+    )
+    .map_err(|_| ProverError::Transfer("input note"))?;
     let computed_root = note_root_from_path(&input_note, path.index, &path.siblings)
         .map_err(|_| ProverError::Transfer("input membership"))?;
     if computed_root != path.root {
@@ -537,6 +574,7 @@ pub fn build_transfer_witness(
     let change_spend_tag = note_spend_tag(&change.spend_secret)
         .map_err(|_| ProverError::Transfer("change spend secret"))?;
     let change_commitment = note_commitment(
+        &note_domain,
         &asset,
         change_amount,
         &buyer_key,
@@ -544,7 +582,7 @@ pub fn build_transfer_witness(
         &change.salt,
     )
     .map_err(|_| ProverError::Transfer("change note"))?;
-    let input_nullifier = note_nullifier(&note.spend_secret, &input_note)
+    let input_nullifier = note_nullifier(&note_domain, &note.spend_secret, &input_note)
         .map_err(|_| ProverError::Transfer("input nullifier"))?;
 
     let mut input = Map::new();
@@ -571,6 +609,7 @@ pub fn build_transfer_witness(
     insert_field(&mut input, "inputSalt", &note.salt);
     insert_field(&mut input, "inputSpendSecret", &note.spend_secret);
     insert_field(&mut input, "changeSpendTag", &change_spend_tag);
+    insert_field(&mut input, "changeSpendSecret", &change.spend_secret);
     insert_field(&mut input, "changeSalt", &change.salt);
     input.insert(
         "inputAmount".to_owned(),
@@ -641,9 +680,20 @@ fn check_artifact(path: &PathBuf, expected: &str, label: &'static str) -> Result
     if expected.len() != 64 || !expected.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(ProverError::Artifact(label));
     }
-    let mut file = File::open(path).map_err(|_| ProverError::Artifact(label))?;
+    let metadata = std::fs::symlink_metadata(path).map_err(|_| ProverError::Artifact(label))?;
+    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > artifacts::MAX_ARTIFACT_BYTES
+    {
+        return Err(ProverError::Artifact(label));
+    }
+    let file = File::open(path).map_err(|_| ProverError::Artifact(label))?;
+    let opened = file.metadata().map_err(|_| ProverError::Artifact(label))?;
+    if !opened.is_file() || opened.len() != metadata.len() {
+        return Err(ProverError::Artifact(label));
+    }
+    let mut file = file.take(artifacts::MAX_ARTIFACT_BYTES + 1);
     let mut hash = Sha256::new();
     let mut buffer = [0u8; 64 * 1024];
+    let mut length = 0;
     loop {
         let count = file
             .read(&mut buffer)
@@ -652,8 +702,10 @@ fn check_artifact(path: &PathBuf, expected: &str, label: &'static str) -> Result
             break;
         }
         hash.update(&buffer[..count]);
+        length += count as u64;
     }
-    if format!("{:x}", hash.finalize()) != expected.to_ascii_lowercase() {
+    if length != metadata.len() || format!("{:x}", hash.finalize()) != expected.to_ascii_lowercase()
+    {
         return Err(ProverError::Artifact(label));
     }
     Ok(())
@@ -664,6 +716,7 @@ fn decimal(value: &Value) -> Result<String, ProverError> {
         .as_str()
         .ok_or(ProverError::Input("expected a decimal string"))?;
     if text.is_empty()
+        || text.len() > 78
         || (text.len() > 1 && text.starts_with('0'))
         || !text.bytes().all(|b| b.is_ascii_digit())
     {
@@ -698,6 +751,34 @@ impl ProvingArtifacts {
         let object = input
             .as_object()
             .ok_or(ProverError::Input("expected object"))?;
+        let expected: Vec<Fr> = expected_public
+            .iter()
+            .map(|value| {
+                let text = decimal(&Value::String((*value).to_owned()))?;
+                Fr::from_str(&text).map_err(|_| ProverError::Input("public field"))
+            })
+            .collect::<Result<_, _>>()?;
+        // Validate every field before starting the witness engine, including public expectations.
+        let inputs = object
+            .iter()
+            .map(|(name, value)| {
+                let values: Vec<&Value> = match value.as_array() {
+                    Some(values) if values.is_empty() => {
+                        return Err(ProverError::Input("empty field array"))
+                    }
+                    Some(values) => values.iter().collect(),
+                    None => vec![value],
+                };
+                let integers = values
+                    .into_iter()
+                    .map(|value| {
+                        let text = decimal(value)?;
+                        BigInt::from_str(&text).map_err(|_| ProverError::Input("invalid integer"))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok((name, integers))
+            })
+            .collect::<Result<Vec<_>, ProverError>>()?;
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -706,18 +787,8 @@ impl ProvingArtifacts {
         let config = CircomConfig::<Fr>::new(&self.wasm, &self.r1cs)
             .map_err(|_| ProverError::Proof("circuit load"))?;
         let mut builder = CircomBuilder::new(config);
-        for (name, value) in object {
-            if let Some(values) = value.as_array() {
-                for value in values {
-                    let text = decimal(value)?;
-                    let integer = BigInt::from_str(&text)
-                        .map_err(|_| ProverError::Input("invalid integer"))?;
-                    builder.push_input(name, integer);
-                }
-            } else {
-                let text = decimal(value)?;
-                let integer =
-                    BigInt::from_str(&text).map_err(|_| ProverError::Input("invalid integer"))?;
+        for (name, values) in inputs {
+            for integer in values {
                 builder.push_input(name, integer);
             }
         }
@@ -727,13 +798,6 @@ impl ProvingArtifacts {
         let public_inputs = circuit
             .get_public_inputs()
             .ok_or(ProverError::Input("circuit has no public inputs"))?;
-        let expected: Vec<Fr> = expected_public
-            .iter()
-            .map(|value| {
-                let text = decimal(&Value::String((*value).to_owned()))?;
-                Fr::from_str(&text).map_err(|_| ProverError::Input("public field"))
-            })
-            .collect::<Result<_, _>>()?;
         if public_inputs != expected {
             return Err(ProverError::PublicInputMismatch);
         }

@@ -11,7 +11,7 @@ use erebus_core::terms::{GuaranteeSet, SettlementMode};
 use erebus_transport::descriptor::{self, Directory, DiscoveryFilter, ServiceDescriptor};
 use erebus_transport::identity::{AuthorizationIdentity, TransportIdentity};
 use erebus_transport::message::{Message, MessageType};
-use erebus_transport::relay::{MailboxId, MemoryRelay, Relay};
+use erebus_transport::relay::{FileRelay, MailboxId, MemoryRelay, Relay};
 use erebus_transport::session::{self, Session};
 use erebus_transport::store::{FileTranscriptStore, TranscriptStore};
 use std::fs;
@@ -273,6 +273,69 @@ fn two_participants_agree_on_one_transcript() {
         buyer_root, seller_root,
         "two independent participants must agree on one transcript root"
     );
+}
+
+#[test]
+fn file_relay_reopens_only_ciphertext_and_unrelated_session_cannot_decrypt_it() {
+    let buyer = participant(0x11);
+    let seller = participant(0x22);
+    let (mut sender, mut recipient) = handshake(&buyer, &seller);
+    let root = tempfile::tempdir().unwrap();
+    let relay = FileRelay::open(root.path()).unwrap();
+    let mailbox = MailboxId::for_session(&sender.session_id(), Role::Buyer);
+    let private_body = b"private-offer-marker-price-and-service-policy";
+    let offer = message(&sender, 1, [0; 32], MessageType::Offer, private_body);
+    send(&mut sender, &buyer.store, &relay, &mailbox, &offer, NOW);
+    drop(relay);
+
+    let relay = FileRelay::open(root.path()).unwrap();
+    let blobs = relay.get(&mailbox, 0, NOW).unwrap();
+    assert_eq!(blobs.len(), 1);
+    assert!(!blobs[0]
+        .blob
+        .windows(private_body.len())
+        .any(|window| window == private_body));
+    assert!(!format!("{:?}", blobs[0]).contains(std::str::from_utf8(private_body).unwrap()));
+    for entry in fs::read_dir(root.path().join(mailbox.to_string())).unwrap() {
+        let path = entry.unwrap().path();
+        let bytes = fs::read(&path).unwrap();
+        assert!(!bytes
+            .windows(private_body.len())
+            .any(|window| window == private_body));
+        if path.file_name().is_some_and(|name| name == "index.json") {
+            let index: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            for entry in index.as_array().unwrap() {
+                assert!(entry.as_object().unwrap().keys().all(|key| [
+                    "cursor",
+                    "expires_at",
+                    "hash",
+                    "size"
+                ]
+                .contains(&key.as_str())));
+            }
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(fs::metadata(path).unwrap().permissions().mode() & 0o077, 0);
+        }
+    }
+    let other_buyer = participant(0x31);
+    let other_seller = participant(0x41);
+    let (other_sender, mut other_recipient) = handshake(&other_buyer, &other_seller);
+    assert!(relay
+        .get(
+            &MailboxId::for_session(&other_sender.session_id(), Role::Buyer),
+            0,
+            NOW
+        )
+        .unwrap()
+        .is_empty());
+    assert!(other_recipient.receive_message(&blobs[0].blob).is_err());
+    let (received, _) = receive(&mut recipient, &seller.store, &relay, &mailbox, 0, NOW);
+    assert_eq!(received.len(), 1);
+    assert_eq!(received[0].body, private_body);
+    assert_eq!(roots(&buyer, &seller).0, roots(&buyer, &seller).1);
 }
 
 #[test]

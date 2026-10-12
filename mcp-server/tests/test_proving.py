@@ -40,6 +40,31 @@ def test_configuration_rejects_insecure_directory(monkeypatch, tmp_path):
         ProvingSettings.from_env()
 
 
+def test_publisher_is_pinned_separately_from_signature_file(monkeypatch, tmp_path):
+    tmp_path.chmod(0o700)
+    for name, value in {
+        "EREBUS_WITNESS_DIR": str(tmp_path),
+        "EREBUS_ARTIFACT_MANIFEST": str(tmp_path / "manifest.json"),
+        "EREBUS_ARTIFACT_MANIFEST_SHA256": "ab" * 32,
+        "EREBUS_ARTIFACT_CACHE": str(tmp_path / "cache"),
+        "EREBUS_ARTIFACT_PUBLISHER": "0x" + "12" * 20,
+    }.items():
+        monkeypatch.setenv(name, value)
+    with pytest.raises(ConfigError, match="together"):
+        ProvingSettings.from_env()
+    signature = {"version": 1, "manifest_sha256": "ab" * 32, "signature_hex": "cd" * 65}
+    path = tmp_path / "signature.json"
+    path.write_text(json.dumps(signature))
+    monkeypatch.setenv("EREBUS_ARTIFACT_SIGNATURE", str(path))
+    assert ProvingSettings.from_env().manifest_authorization == {
+        "publisher": "0x" + "12" * 20, "signature": signature,
+    }
+    signature["manifest_sha256"] = "ef" * 32
+    path.write_text(json.dumps(signature))
+    with pytest.raises(ConfigError, match="invalid"):
+        ProvingSettings.from_env()
+
+
 @pytest.mark.skipif(not BINARY.exists(), reason="build the local proving binary")
 def test_stdio_proving_server_needs_no_starknet_configuration(tmp_path):
     tmp_path.chmod(0o700)

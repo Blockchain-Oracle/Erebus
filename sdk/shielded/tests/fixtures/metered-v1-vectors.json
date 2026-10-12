@@ -1,0 +1,97 @@
+{
+  "description": "Metered access vectors (docs/metropolis-agreement.md). Generated and rechecked by scripts/check_agreement_vectors.py with a standalone Keccak-256, never by the Rust SDK. Request vectors use agreement vector 0 with the service overlay in `terms`.",
+  "terms": {
+    "agreementVector": 0,
+    "transcriptRootHex": "0000000000000000000000000000000000000000000000000000000000000000",
+    "service": {
+      "resource": "data.feed.v1",
+      "quantity": "3",
+      "unit": "call",
+      "fulfillmentMethod": "http-metered-v1",
+      "fulfillmentDigestHex": "bd06c0fdddfa62aab24cfc1ad3514769eef4720b8ff902d453cff327a85d941e"
+    }
+  },
+  "profiles": [
+    {
+      "maxResponseBytes": 65536,
+      "paramsMode": 0,
+      "profileHex": "4552454255535f485454505f4d4554455245445f50524f46494c455f563100010001000000",
+      "profileDigestHex": "bd06c0fdddfa62aab24cfc1ad3514769eef4720b8ff902d453cff327a85d941e"
+    },
+    {
+      "maxResponseBytes": 1024,
+      "paramsMode": 0,
+      "profileHex": "4552454255535f485454505f4d4554455245445f50524f46494c455f563100010000040000",
+      "profileDigestHex": "9cbaae6c5c26eecf4b117446d68a132d616ee4159e43c5d498581cd10000845b"
+    }
+  ],
+  "requests": [
+    {
+      "name": "call index 7",
+      "domainHex": "000c6569703135353a313031343301001411111111111111111111111111111111111111110000000001",
+      "serviceIdHex": "4242424242424242424242424242424242424242424242424242424242424242",
+      "commitmentHex": "f433bccb7a5c90d0fc64cad09e3fba85f6586629dfa7e160c6c434ce348d4fea",
+      "nullifierHex": "bd7d60c68e5eae255b8207de8c3f9d3b9f2b19930eedf4d61ea989967aa41edf",
+      "fulfillmentDigestHex": "bd06c0fdddfa62aab24cfc1ad3514769eef4720b8ff902d453cff327a85d941e",
+      "paramsDigestHex": "0000000000000000000000000000000000000000000000000000000000000000",
+      "nonceHex": "0404040404040404040404040404040404040404040404040404040404040404",
+      "expiresAt": 1100,
+      "operation": "call",
+      "callIndex": 7,
+      "digestHex": "0302e4c5f69b9f771c5719ed1c446862f46c63f533ef7a2c5781ce1e8c452ecd"
+    },
+    {
+      "name": "status",
+      "domainHex": "000c6569703135353a313031343301001411111111111111111111111111111111111111110000000001",
+      "serviceIdHex": "4242424242424242424242424242424242424242424242424242424242424242",
+      "commitmentHex": "f433bccb7a5c90d0fc64cad09e3fba85f6586629dfa7e160c6c434ce348d4fea",
+      "nullifierHex": "bd7d60c68e5eae255b8207de8c3f9d3b9f2b19930eedf4d61ea989967aa41edf",
+      "fulfillmentDigestHex": "bd06c0fdddfa62aab24cfc1ad3514769eef4720b8ff902d453cff327a85d941e",
+      "paramsDigestHex": "0000000000000000000000000000000000000000000000000000000000000000",
+      "nonceHex": "0404040404040404040404040404040404040404040404040404040404040404",
+      "expiresAt": 1100,
+      "operation": "status",
+      "callIndex": 0,
+      "digestHex": "bfd762d97c74f3f6b791b26ca5b051500d46feb56360cb093dd6681d17866f9d"
+    },
+    {
+      "name": "call index max",
+      "domainHex": "000c6569703135353a313031343301001411111111111111111111111111111111111111110000000001",
+      "serviceIdHex": "4242424242424242424242424242424242424242424242424242424242424242",
+      "commitmentHex": "f433bccb7a5c90d0fc64cad09e3fba85f6586629dfa7e160c6c434ce348d4fea",
+      "nullifierHex": "bd7d60c68e5eae255b8207de8c3f9d3b9f2b19930eedf4d61ea989967aa41edf",
+      "fulfillmentDigestHex": "bd06c0fdddfa62aab24cfc1ad3514769eef4720b8ff902d453cff327a85d941e",
+      "paramsDigestHex": "0000000000000000000000000000000000000000000000000000000000000000",
+      "nonceHex": "0404040404040404040404040404040404040404040404040404040404040404",
+      "expiresAt": 1100,
+      "operation": "call",
+      "callIndex": 18446744073709551615,
+      "digestHex": "3c7b140f6af47db9f828bd745bf231328bd22da0324408e81754200d1748e89d"
+    }
+  ],
+  "entitlements": [
+    {
+      "serviceIdHex": "4242424242424242424242424242424242424242424242424242424242424242",
+      "commitmentHex": "f433bccb7a5c90d0fc64cad09e3fba85f6586629dfa7e160c6c434ce348d4fea",
+      "entitlementIdHex": "f2350155c0ed24b7dec44897df173abef19a9d064df32692485a9e7fb0102bc8",
+      "calls": [
+        {
+          "index": 0,
+          "callIdHex": "21d7b73fa70e6c7286705d5298d473ef0a69975d1dc724f46268b826a9d72b62"
+        },
+        {
+          "index": 1,
+          "callIdHex": "923d47ded46ea6e15cb6a3c1cd42ce113840a4e501ba41ff1d761dceb6931f8c"
+        },
+        {
+          "index": 4095,
+          "callIdHex": "f2749d52b897f866f12a19fde2d4581545a58f489ad7262e0805c889ba0b32bb"
+        },
+        {
+          "index": 18446744073709551615,
+          "callIdHex": "8f59fc84255d16e2f2c572b878f1234fe2e8e0cb39e41bf91b1aacef54c4e66b"
+        }
+      ]
+    }
+  ]
+}

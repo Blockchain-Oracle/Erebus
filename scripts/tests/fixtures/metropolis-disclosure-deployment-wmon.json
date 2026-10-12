@@ -1,0 +1,15 @@
+{
+  "namespace": "eip155:10143",
+  "settlement_contract": "0x8868f35140f3602c80e2c76132740b6f0c0b409d",
+  "verifier_version": 2,
+  "rpc_url": "https://primary-rpc.invalid/",
+  "peer_rpc_url": "https://peer-rpc.invalid/",
+  "first_block": 69902653,
+  "first_hash": "0xc9f4a81a42b3505eaccbe105e63082240e32d7a686f13567270bf4ab37af8715",
+  "cache_root": "/nonexistent/fixture-cache",
+  "runtime_keccak256": "0x4965730fb58c3d2685e29f9857074e5b81d4fa0e21926c6e76800e0fa280f679",
+  "poseidon_keccak256": "0x354b26999e434f8256d168395315e1f51fc15bf49bf2e6bb58fc549bd597e7da",
+  "deposit_verifier_keccak256": "0x1fb29f200eb881987ebd09d396687e8499181193f6b479f854619949a7c8ba3c",
+  "transfer_verifier_keccak256": "0x0c79a2c47b4aa8401a3b418ad3d021f168b287dff93f74114794b12115896ad0",
+  "withdraw_verifier_keccak256": "0x450627281b9b24a6167c41975c8ce2e63adfe97d64b8bfa6bf0a45e587319afb"
+}

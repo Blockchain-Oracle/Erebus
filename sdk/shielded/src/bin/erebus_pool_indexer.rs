@@ -36,6 +36,7 @@ struct AppState {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct BlockQuery {
     after: Option<u64>,
     #[serde(default = "default_limit")]
@@ -151,7 +152,17 @@ async fn authorize(
             return Err(StatusCode::UNAUTHORIZED);
         }
     }
-    Ok(next.run(request).await)
+    let (parts, body) = request.into_parts();
+    let body = tokio::time::timeout(Duration::from_secs(1), axum::body::to_bytes(body, 1))
+        .await
+        .map_err(|_| StatusCode::BAD_REQUEST)?
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    if !body.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    Ok(next
+        .run(Request::from_parts(parts, axum::body::Body::empty()))
+        .await)
 }
 
 async fn health(State(state): State<AppState>) -> Json<Value> {
@@ -166,8 +177,9 @@ async fn health(State(state): State<AppState>) -> Json<Value> {
 
 async fn blocks(
     State(state): State<AppState>,
-    Query(query): Query<BlockQuery>,
+    query: Result<Query<BlockQuery>, axum::extract::rejection::QueryRejection>,
 ) -> Result<Json<Value>, StatusCode> {
+    let Query(query) = query.map_err(|_| StatusCode::BAD_REQUEST)?;
     if query.limit == 0 || query.limit > 128 {
         return Err(StatusCode::BAD_REQUEST);
     }
@@ -240,23 +252,110 @@ mod tests {
         };
         let initial = blocks(
             State(state.clone()),
-            Query(BlockQuery {
+            Ok(Query(BlockQuery {
                 after: None,
                 limit: 64,
-            }),
+            })),
         )
         .await
         .expect("initial page");
         assert_eq!(initial.0["blocks"].as_array().expect("blocks").len(), 1);
         let next = blocks(
             State(state),
-            Query(BlockQuery {
+            Ok(Query(BlockQuery {
                 after: Some(0),
                 limit: 64,
-            }),
+            })),
         )
         .await
         .expect("next page");
         assert!(next.0["blocks"].as_array().expect("blocks").is_empty());
+    }
+
+    #[tokio::test]
+    async fn public_index_endpoint_rejects_private_shapes_without_echoing_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let domain = IndexDomain {
+            chain_id: 1,
+            pool: [3; 20],
+            first_block: 0,
+            first_hash: [4; 32],
+        };
+        let store = Arc::new(IndexStore::new(dir.path().join("index.json"), domain).unwrap());
+        let mut index = PoolIndex::new(0).unwrap();
+        index
+            .apply_block(PoolBlock {
+                number: 0,
+                hash: domain.first_hash,
+                parent_hash: [5; 32],
+                events: Vec::new(),
+            })
+            .unwrap();
+        store.save_if_unchanged(&index, None).unwrap();
+        let state = AppState {
+            store,
+            status: Arc::new(RwLock::new(SyncStatus::default())),
+            token: None,
+        };
+        let app = Router::new()
+            .route("/v1/blocks", get(blocks))
+            .route_layer(middleware::from_fn_with_state(state.clone(), authorize))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let response = client
+            .get(format!("{url}/v1/blocks?after=0&limit=64"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.json::<Value>().await.unwrap()["blocks"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        for query in [
+            "witness=private-marker",
+            "after=private-marker",
+            "limit=private-marker",
+            "limit=0",
+            "limit=129",
+        ] {
+            let response = client
+                .get(format!("{url}/v1/blocks?{query}"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert!(!response.text().await.unwrap().contains("private-marker"));
+        }
+        let response = client
+            .get(format!("{url}/v1/blocks"))
+            .body("private-marker")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(!response.text().await.unwrap().contains("private-marker"));
+        // Hold a chunked request open without supplying its first chunk. The service
+        // must answer on its one-second deadline, not wait for the peer to finish.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut socket = tokio::net::TcpStream::connect(url.strip_prefix("http://").unwrap())
+            .await
+            .unwrap();
+        socket.write_all(b"GET /v1/blocks HTTP/1.1\r\nHost: 127.0.0.1\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n").await.unwrap();
+        let mut response = [0; 1024];
+        let length = tokio::time::timeout(Duration::from_secs(3), socket.read(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(response[..length].starts_with(b"HTTP/1.1 400"));
+        task.abort();
     }
 }

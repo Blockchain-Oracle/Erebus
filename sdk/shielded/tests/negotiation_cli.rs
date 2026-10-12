@@ -423,6 +423,7 @@ fn copied_commands_freeze_restart_authorize_and_retain_recoverable_seller_notes_
                 );
                 let domain = WalletDomain {
                     chain_id: 10143,
+                    verifier_version: evidence.terms.domain.verifier_version,
                     pool: evidence
                         .terms
                         .domain
@@ -640,5 +641,148 @@ fn operator_prepared_participants_negotiate_without_test_fixtures() {
             hex::encode(selected.terms.buyer_authorization_key.as_bytes())
         ),
         prepared["buyer"]["agreement_address"]
+    );
+}
+
+#[test]
+fn fresh_shielded_operators_bind_private_keys_and_negotiate() {
+    let root = tempfile::tempdir().unwrap();
+    let binary = native_binary("erebus-negotiate", env!("CARGO_BIN_EXE_erebus-negotiate"));
+    let endpoint = TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let asset = "eip155:31337/erc20:0x1111111111111111111111111111111111111111";
+    let pool = "0x2222222222222222222222222222222222222222";
+    let run = |request: Value| finish(spawn(&binary, root.path(), request));
+    for role in ["buyer", "seller"] {
+        let directory = root.path().join(role);
+        let (ok, response) = run(json!({"method":"prepare_operator","suite_id":2,
+            "directory":directory,"role":role,"endpoint":endpoint,
+            "namespace":"eip155:31337","assets":[asset],"descriptor_lifetime_seconds":86400}));
+        assert!(ok, "{response}");
+        assert!(response.get("agreement_address").is_none());
+        assert!(response.get("agreement_key").is_none());
+        assert_ne!(
+            fs::read(directory.join("agreement.key")).unwrap(),
+            fs::read(directory.join("discovery.key")).unwrap()
+        );
+        let (ok, response) = run(json!({"method":"prepare_binding",
+            "output":directory.join("identity.binding"),
+            "descriptor_file":directory.join(format!("{role}.descriptor.json")),
+            "discovery_key_file":directory.join("discovery.key"),
+            "agreement_key_file":directory.join("agreement.key"),
+            "settlement_contract":pool,"verifier_version":2,"expires_at":clock()+7200}));
+        assert!(ok, "{response}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for name in [
+                "agreement.key",
+                "agreement.public",
+                "discovery.key",
+                "wallet.key",
+                "identity.binding",
+            ] {
+                assert_eq!(
+                    fs::metadata(directory.join(name))
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o077,
+                    0
+                );
+            }
+        }
+        let mut corrupted = fs::read(directory.join("identity.binding")).unwrap();
+        *corrupted.last_mut().unwrap() ^= 1;
+        private(&directory.join("corrupt.binding"), &corrupted);
+    }
+    let digest = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(b"private snapshot"));
+    let delivery = clock() + 7200;
+    for (role, peer, price) in [("buyer", "seller", "60"), ("seller", "buyer", "70")] {
+        let directory = root.path().join(role);
+        let peer_directory = root.path().join(peer);
+        let request = json!({"method":"prepare_terms","suite_id":2,
+            "output":directory.join("service.terms"),"role":role,
+            "local_descriptor_file":directory.join(format!("{role}.descriptor.json")),
+            "peer_descriptor_file":peer_directory.join(format!("{peer}.descriptor.json")),
+            "local_binding_file":directory.join("identity.binding"),
+            "peer_binding_file":peer_directory.join("identity.binding"),
+            "settlement_contract":pool,"verifier_version":2,"asset":asset,
+            "amount":price,"resource":"dataset.snapshot.v1","unit":"snapshot","quantity":"1",
+            "fulfillment_method":"http-access-v1","fulfillment_digest":digest,"delivery_deadline":delivery});
+        for mutation in [
+            "wrong_domain",
+            "missing_binding",
+            "wrong_peer",
+            "tampered_binding",
+            "wrong_suite",
+        ] {
+            let mut invalid = request.clone();
+            invalid["output"] = json!(directory.join("refused.terms"));
+            match mutation {
+                "wrong_domain" => invalid["verifier_version"] = json!(3),
+                "missing_binding" => invalid["peer_binding_file"] = Value::Null,
+                "tampered_binding" => {
+                    invalid["local_binding_file"] = json!(directory.join("corrupt.binding"))
+                }
+                "wrong_suite" => invalid["suite_id"] = json!(1),
+                _ => invalid["peer_binding_file"] = invalid["local_binding_file"].clone(),
+            }
+            let (ok, response) = run(invalid);
+            assert!(!ok, "{mutation}: {response}");
+            assert!(!directory.join("refused.terms").exists());
+        }
+        let (ok, response) = run(request);
+        assert!(ok, "{response}");
+        assert!(response.get("buyer").is_none());
+        assert_eq!(response["payment_recipient_finalized"], false);
+        private(&directory.join("config.json"), json!({"version":1,"role":role,
+            "state_root":directory.join("state"),"transport_key_file":directory.join("transport.key"),
+            "agreement_key_file":directory.join("agreement.key"),"discovery_key_file":directory.join("discovery.key"),
+            "local_descriptor_file":directory.join(format!("{role}.descriptor.json")),
+            "peer_descriptor_file":peer_directory.join(format!("{peer}.descriptor.json")),
+            "terms_template_file":directory.join("service.terms"),"endpoint":endpoint,
+            "maximum_price":"75","minimum_price":"65","max_deal_lifetime_seconds":3600,"timeout_seconds":30,
+            "seller_spend_secret_file":if role=="seller" {Some(directory.join("spend.key"))} else {None},
+            "seller_wallet_file":if role=="seller" {Some(directory.join("state/wallet/notes.enc"))} else {None},
+            "seller_wallet_key_file":if role=="seller" {Some(directory.join("wallet.key"))} else {None}})
+            .to_string().as_bytes());
+    }
+    let request = |role: &str| {
+        json!({"method":"negotiate",
+        "config_file":root.path().join(role).join("config.json"),"operation_ref":hex::encode(OPERATION)})
+    };
+    let seller = spawn(&binary, root.path(), request("seller"));
+    let buyer = spawn(&binary, root.path(), request("buyer"));
+    let (buyer_ok, buyer) = finish(buyer);
+    let (seller_ok, seller) = finish(seller);
+    assert!(buyer_ok && seller_ok, "buyer {buyer}; seller {seller}");
+    assert_eq!(buyer["deal_commitment"], seller["deal_commitment"]);
+    let selected =
+        SelectedAgreement::decode(&fs::read(buyer["evidence_file"].as_str().unwrap()).unwrap())
+            .unwrap();
+    verify_selected_agreement(&selected).unwrap();
+    assert_eq!(selected.terms.suite_id, 2);
+    assert_eq!(selected.terms.amount.get(), 70);
+    assert_ne!(selected.terms.transcript_root, [0; 32]);
+    for (role, expected) in [
+        ("buyer", &selected.terms.buyer_authorization_key),
+        ("seller", &selected.terms.seller_authorization_key),
+    ] {
+        let seed: [u8; 32] = fs::read(root.path().join(role).join("agreement.key"))
+            .unwrap()
+            .try_into()
+            .unwrap();
+        assert_eq!(expected.as_bytes(), derive_key(&seed).unwrap());
+    }
+    let secret: [u8; 32] = fs::read(root.path().join("seller/spend.key"))
+        .unwrap()
+        .try_into()
+        .unwrap();
+    assert_eq!(
+        selected.terms.payment_recipient.as_bytes(),
+        note_spend_tag(&secret).unwrap()
     );
 }

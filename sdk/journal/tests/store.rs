@@ -211,6 +211,88 @@ fn sign(store: &Store<Record>, record: &mut Record, blob: &str) {
 
 #[cfg(unix)]
 #[test]
+fn symlink_root_is_rejected_without_changing_the_target() {
+    use std::os::unix::fs::symlink;
+    let dir = TempDir::new("symlink-root");
+    let target = dir.0.join("outside");
+    std::fs::create_dir_all(&target).unwrap();
+    set_mode(&target, 0o755);
+    symlink(&target, dir.journal()).unwrap();
+    assert!(Store::<Record>::open(dir.journal()).is_err());
+    assert_eq!(mode(&target), 0o755);
+    assert!(names(&target).is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn symlink_records_blobs_and_locks_fail_closed() {
+    use std::os::unix::fs::symlink;
+    let dir = TempDir::new("symlink-entries");
+    let store = open(&dir);
+    let record = Record::new(1, 1);
+    let target = dir.0.join("outside");
+    let bytes = serde_json::to_vec(&record).unwrap();
+    std::fs::write(&target, &bytes).unwrap();
+    set_mode(&target, 0o644);
+    for path in [
+        store.record_path(&record.id),
+        store.blob_path(&record.id, 0),
+        store.lock_path(&record.id),
+        store.root().join(".identity.lock"),
+    ] {
+        symlink(&target, path).unwrap();
+    }
+    assert!(store.read(&record.id).is_err());
+    assert!(store.records().is_err());
+    assert!(store.read_blob(&record.id, 0).is_err());
+    assert!(store.read_blob_to_string(&record.id, 0).is_err());
+    assert!(store.lock_record(&record.id).is_err());
+    assert!(store.lock_identity().is_err());
+    assert_eq!(std::fs::read(&target).unwrap(), bytes);
+    assert_eq!(mode(&target), 0o644);
+}
+
+#[test]
+fn directory_entries_cannot_be_read_as_records_blobs_or_locks() {
+    let dir = TempDir::new("directory-entries");
+    let store = open(&dir);
+    let id = Id::new(1);
+    for path in [
+        store.record_path(&id),
+        store.blob_path(&id, 0),
+        store.lock_path(&id),
+    ] {
+        std::fs::create_dir(path).unwrap();
+    }
+    assert!(store.read(&id).is_err());
+    assert!(store.records().is_err());
+    assert!(store.read_blob(&id, 0).is_err());
+    assert!(store.lock_record(&id).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn dangling_links_are_not_treated_as_absent_records_or_created_locks() {
+    use std::os::unix::fs::symlink;
+    let dir = TempDir::new("dangling-entries");
+    let store = open(&dir);
+    let id = Id::new(1);
+    let target = dir.0.join("missing-outside");
+    for path in [
+        store.record_path(&id),
+        store.blob_path(&id, 0),
+        store.lock_path(&id),
+    ] {
+        symlink(&target, path).unwrap();
+    }
+    assert!(store.read(&id).is_err());
+    assert!(store.read_blob(&id, 0).is_err());
+    assert!(store.lock_record(&id).is_err());
+    assert!(!target.exists());
+}
+
+#[cfg(unix)]
+#[test]
 fn opening_creates_a_private_directory_and_retightens_it() {
     let dir = TempDir::new("open");
     let store = open(&dir);

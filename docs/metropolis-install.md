@@ -2,8 +2,25 @@
 
 Status: M8 external rehearsal guide. The published `0.3.0.dev5` channel exists
 ([section 10](#10-published-metropolis-packages)); the source-build commands below describe the
-local package surface and unreleased changes. Run build commands from the repository root.
+local package surface and unreleased changes. Unpublished shielded-candidate packages and their
+team-rehearsal results are in [section 11](#11-candidate-package-qualification-unreleased). Run build commands from the repository root.
 The request examples require operator configuration from the linked runbooks.
+
+Candidate prepaid access requires the source-built `erebus-access` protocol 2 and matching
+SDK/MCP adapters. Published `0.3.0.dev5` does not contain this feature. Do not mix its
+protocol-1 access binary with the new adapters. Run `erebus-access --version` to check.
+The candidate supports `retrieve`, `metered_call`, and `metered_status`.
+For an unpublished local registry built from this candidate, the optional install gate is:
+
+```sh
+python3 scripts/check-metropolis-install.py --registry /absolute/local-registry --rehearse-metered
+```
+
+This runs installed participant, payment, access, and auditor commands against the Anvil
+fixture. It also checks the installed MCP access-only tools. Cargo, Anvil, Node dependencies,
+and generated M5 prototype artifacts are required by the fixture, not by end users.
+The fixture uses known test secrets and setup keys. It is team-operated local evidence,
+not an independent user run, authenticated release setup, or Monad deployment.
 
 Prerequisites: Rust stable, Node 22 and Foundry v1.5+ for the EVM path (Foundry v1.8+ for
 Monad execution), and a Monad testnet RPC plus faucet funds. Never reuse a key that holds
@@ -14,6 +31,7 @@ value on any network.
 ```sh
 cargo install --path sdk/shielded --locked --bin erebus-negotiate
 cargo install --path sdk/shielded --locked --bin erebus-payment
+cargo install --path sdk/shielded --locked --bin erebus-wallet
 cargo install --path sdk/shielded --locked --bin erebus-local-prove
 cargo install --path sdk/shielded --locked --bin erebus-artifacts
 cargo install --path sdk/shielded --locked --bin erebus-access
@@ -40,6 +58,54 @@ The access service, message relay, and pool indexer are long-running processes, 
   transport and agreement key.
 - Transaction key: a dedicated gas payer, never the buyer's spending identity if a relayer is
   used.
+
+### Candidate shielded operator setup (unreleased)
+
+The working-tree `erebus-negotiate` accepts `suite_id: 2` in `prepare_operator`.
+It creates separate discovery, transport, agreement, and wallet keys. A seller also gets
+a note spending secret. All private files are owner-only. Omitting `suite_id` keeps
+the existing public-bound setup. Published dev5 does not include this new setup path.
+
+The output's `agreement_key_file` contains the 32-byte signing seed for negotiation.
+Its `wallet_agreement_key_file` contains the derived 64-byte public owner key for
+the wallet configuration's `agreement_key_file`. They represent the same identity;
+do not substitute one file format for the other. The public owner key remains an
+owner-only local file because publishing it can link private-payment identities.
+
+```json
+{"method":"prepare_operator","suite_id":2,"directory":"/absolute/new-buyer","role":"buyer","endpoint":"127.0.0.1:9001","namespace":"eip155:10143","assets":["eip155:10143/erc20:<qualified-token-address>"],"descriptor_lifetime_seconds":86400}
+```
+
+After selecting an authenticated pool and verifier version, each operator creates a
+private identity binding with `prepare_binding`:
+
+```json
+{"method":"prepare_binding","output":"/absolute/new-buyer/identity.binding","descriptor_file":"/absolute/new-buyer/buyer.descriptor.json","discovery_key_file":"/absolute/new-buyer/discovery.key","agreement_key_file":"/absolute/new-buyer/agreement.key","settlement_contract":"<authenticated-pool-address>","verifier_version":2,"expires_at":<future-unix-time>}
+```
+
+Replace the placeholders before sending JSON. Exchange binding files privately with
+the counterparty; never publish them in discovery. A binding links a discovery identity
+to its payment key for that counterparty and deployment. It does not prove independent
+parties or hide their identities from each other.
+
+For `prepare_terms`, add `suite_id: 2`, `local_binding_file`, and `peer_binding_file`
+to the existing service request. Both bindings must match their signed descriptors,
+pool, chain, version, and validity window. The template's payment tag is a placeholder:
+the encrypted bootstrap replaces it with the seller's authenticated note tag before
+authorization. Never settle an unsigned template. The existing agreement format is unchanged.
+
+The negotiation config must name `discovery_key_file`. Seller configs also need
+`seller_spend_secret_file`, `seller_wallet_key_file`, and a private `seller_wallet_file`
+path for retained received notes. This setup does not qualify an asset, fund a wallet,
+install proving artifacts, or authorize a chain transaction.
+
+The unpublished macOS candidate can qualify both installed asset workflows with
+`python3 scripts/check-metropolis-install.py --registry /absolute/local-registry --rehearse-assets`.
+The gate uses fresh operator keys and actual wallet deposits, then tests two private
+payments, change reuse, withdrawals, and native wrap/unwrap. It requires Cargo, Anvil,
+Node dependencies, and generated test artifacts for the fixture harness. Product commands
+run from the installed wheel outside the checkout. Passing is local team evidence, not
+real-token qualification, an independent user run, or authorization for a live payment.
 
 ## 3. Local proving artifacts
 
@@ -76,6 +142,33 @@ See [native negotiation](metropolis-operations.md#5-negotiation-command) for bot
 
 ## 6. Fund and pay
 
+Explicit shielded wallet operations (deposit and withdrawal) run through `erebus-wallet`:
+
+```sh
+printf '%s\n' '{"method":"version"}' | erebus-wallet
+printf '%s\n' '{"method":"notes","config_file":"/absolute/wallet.json"}' | erebus-wallet
+printf '%s\n' '{"method":"sync","config_file":"/absolute/wallet.json"}' | erebus-wallet
+printf '%s\n' '{"method":"approve","config_file":"/absolute/wallet.json","amount":"1000000"}' | erebus-wallet
+printf '%s\n' '{"method":"wrap","config_file":"/absolute/wallet.json","amount":"1000000","operation_ref":"<64 lowercase hex digits>"}' | erebus-wallet
+printf '%s\n' '{"method":"unwrap","config_file":"/absolute/wallet.json","amount":"1000000","operation_ref":"<64 lowercase hex digits>"}' | erebus-wallet
+printf '%s\n' '{"method":"deposit","config_file":"/absolute/wallet.json","amount":"1000000"}' | erebus-wallet
+printf '%s\n' '{"method":"withdraw","config_file":"/absolute/wallet.json","commitment":"<64 lowercase hex digits>","recipient":"0x<40 lowercase hex digits>"}' | erebus-wallet
+printf '%s\n' '{"method":"resume","config_file":"/absolute/wallet.json","identity":"<64 lowercase hex digits>"}' | erebus-wallet
+```
+
+`approve` grants the pool an ERC-20 allowance through the same fenced signer lane; `deposit`
+checks the allowance before proving and refuses without it. `wrap` and `unwrap` move native MON
+through the configured wrapper contract; every completion requires finalized mint/burn evidence
+with the matching participant, target, calldata, and value, not receipt success alone. `deposit` generates fresh random note
+material, persists it before proving, and sends at most one transaction. `sync` replays only
+verified finalized history through two distinct RPCs and never signs or submits; a finalized
+reverted transaction returns its operation to a retryable plan, and a withdrawal reservation is
+released only by verified consumption or a finalized revert. After an unknown broadcast, only an
+explicit `resume` resends the exact retained bytes. See
+[wallet operations](metropolis-operations.md#shielded-wallet-operations).
+
+Payment continues through `erebus-payment`:
+
 ```sh
 printf '%s\n' '{"method":"version"}' | erebus-payment
 printf '%s\n' '{"method":"funding","config_file":"/absolute/payment.json","operation_ref":"<64 lowercase hex digits>"}' | erebus-payment
@@ -85,7 +178,6 @@ printf '%s\n' '{"method":"settle","config_file":"/absolute/payment.json","operat
 Operator configuration selects public-bound or shielded settlement without fallback.
 The shielded path requires an existing funded note wallet and reviewed pool, verifier, and artifact pins.
 It installs transfer artifacts and proves locally when no durable preparation exists.
-Wallet funding, deposit, and withdrawal onboarding are not yet a complete installed workflow.
 The public-bound path requires ERC-20 allowance and balance, not a proof.
 See [payment configuration](metropolis-operations.md#3-buyer-payment-and-recovery) before running either method.
 
@@ -213,7 +305,643 @@ uv run --locked python scripts/build-metropolis-registry.py \
 uv run --locked python scripts/check-metropolis-install.py --registry artifacts/metropolis-registry
 ```
 
-## 11. Not yet available
+## 11. Candidate package qualification (unreleased)
+
+This section covers packages built from the current working-tree candidate. They are not published.
+A dirty or mid-merge tree produces **team rehearsal evidence only**. Publication still requires a clean
+approved commit, the two-platform registry workflow, and separate release approval.
+
+### Candidate identity
+
+A commit hash cannot name uncommitted code, so every build records a `candidate` block in `release.json`:
+
+| Field | Meaning |
+|---|---|
+| `source_commit`, `merge_head` | `HEAD`, plus `MERGE_HEAD` when a merge is open |
+| `source_tree_sha256` | SHA-256 over sorted `<path>\0<file sha256>\n` lines for every tracked or untracked non-ignored file that reaches a wheel (Rust crates, Python packages, packaging hook, launcher, `LICENSE`; `tests` directories excluded) |
+| `changed_inputs` | each uncommitted input path with its git status and SHA-256 (`null` if deleted) |
+| `release_eligible`, `evidence_scope` | `true`/`release-candidate` only for a clean tree with no open merge; otherwise `false`/`team-rehearsal` |
+
+The builder computes the identity before compiling and again after packaging. It refuses the build if
+the inputs changed in between. Recompute the identity of a tree without building:
+
+```sh
+python3 scripts/build-metropolis-registry.py --identify --version x --output x
+```
+
+`--proving-manifest` and `--proving-manifest-sha256` record the proving manifest the packages were
+qualified against: digest, `test_only`, domain, and per-circuit file and verifier identities.
+Proving files are never bundled in wheels. A non-test manifest also requires `--proving-signature`.
+The install checker refuses a prover request that names a different manifest.
+
+### Build and check commands
+
+```sh
+B=.local/metropolis/candidate-20261010/bundle-current-source
+PIN=268bf1abe34d738859a20d5db8cee96a30fd4dbb4b2e25b8b5b9da7084d59a4a   # supplied independently, not read from $B
+uv run --frozen python scripts/build-metropolis-registry.py --version 0.3.0.dev2026101002 \
+  --profile release --build --output /private/tmp/erebus-candidate-registry-20261010-r2 \
+  --proving-manifest "$B/manifest.json" --proving-manifest-sha256 "$PIN"
+
+uv run --frozen python scripts/check-metropolis-install.py \
+  --registry /private/tmp/erebus-candidate-registry-20261010-r2 \
+  --proving-bundle "$B" --proving-witnesses circuits/m5/build --prover-timeout-seconds 1800
+uv run --frozen python scripts/check-metropolis-install.py --registry <registry> --rehearse-metered
+uv run --frozen python scripts/check-metropolis-install.py --registry <registry> --rehearse-x402
+uv run --frozen python scripts/check-metropolis-install.py --registry <registry> --rehearse-assets
+```
+
+Every base check also runs installed onboarding with an empty environment. It covers suite-2
+`prepare_operator` for a buyer and a seller, both private identity bindings, and an auditor `keygen`.
+Every private file must be owner-only.
+
+`--proving-bundle` serves the recorded bundle's files over loopback HTTP. It uses a copy of the manifest
+whose URLs point at that server, and every file identity must equal the recorded manifest. Installed
+`erebus-artifacts` signs the copy with an ephemeral publisher key. The installed prover then downloads,
+authenticates, and proves deposit, transfer, and withdrawal from empty caches. It re-proves transfer
+from the retained cache, and must refuse a served zkey with one flipped byte. Loopback distribution is a
+development exception, so only `test_only` bundles are accepted. This exercises download and
+authentication; it is not artifact hosting.
+
+Every report carries an `evidence` block with `evidence_scope: team-rehearsal` and
+`outside_acceptance: false`. `fixture_harness_from_checkout: true` marks runs whose Anvil chain fixture and
+test driver come from the repository, even though every participant command runs from the installed wheel.
+
+### Linux x86_64 from a macOS arm64 host
+
+Linux packages are built and checked in the pinned `packaging/metropolis/prover-qualification.Dockerfile`
+image as `linux/amd64`, on a Colima vz VM with Rosetta. This is **Rosetta-translated execution, not
+native Linux x86_64 hardware**: it qualifies the ELF wheel's installability and behaviour, not native-host
+performance, and its timings are not benchmarks. Native-host qualification is the registry workflow's
+`ubuntu-latest` leg on a clean revision.
+
+The shared tree changes while other agents work, so build from an isolated snapshot, never the live
+checkout. The snapshot is a local clone at `HEAD` plus the candidate's tracked, modified, and untracked
+files, with `MERGE_HEAD` copied in. It must recompute the same `source_tree_sha256` before use.
+Colima shares only the home directory, so place the snapshot and bundle there. The snapshot is mounted
+read-only and the target directories are Docker volumes.
+
+```sh
+SNAP="$HOME/.cache/erebus-linux-qual/src"
+git clone -q --local --no-checkout . "$SNAP" && git -C "$SNAP" checkout -q --detach "$(git rev-parse HEAD)"
+git ls-files -z --cached --others --exclude-standard | tar --null -T - -cf - | tar -xf - -C "$SNAP"
+git ls-files -z --deleted | (cd "$SNAP" && xargs -0 rm -f --)
+git rev-parse -q --verify MERGE_HEAD > "$SNAP/.git/MERGE_HEAD"   # only when a merge is open
+mkdir -p "$SNAP/circuits/m5/build" && cp circuits/m5/build/{deposit,transfer,withdraw}-input.json "$SNAP/circuits/m5/build/"   # fixture witnesses (ignored files)
+(cd "$SNAP" && python3 scripts/build-metropolis-registry.py --identify --version x --output x)
+
+colima start --vz-rosetta
+docker build --platform linux/amd64 -f packaging/metropolis/prover-qualification.Dockerfile \
+  -t erebus-metropolis-qualification:amd64 packaging/metropolis
+docker run --rm --platform linux/amd64 -v "$SNAP":/src:ro \
+  -v erebus-linux-target-rs:/src/sdk/rs/target -v erebus-linux-target-evm:/src/sdk/evm/target \
+  -v erebus-linux-target-transport:/src/sdk/transport/target -v erebus-linux-target-shielded:/src/sdk/shielded/target \
+  -v erebus-linux-cargo-registry:/usr/local/cargo/registry -v erebus-linux-out:/out \
+  -v "$HOME/.cache/erebus-linux-qual/bundle":/bundle:ro erebus-metropolis-qualification:amd64 \
+  sh -c 'git config --global --add safe.directory /src && cd /src && python3 scripts/build-metropolis-registry.py \
+    --version 0.3.0.dev2026101001 --profile release --build --output /out/registry \
+    --proving-manifest /bundle/manifest.json --proving-manifest-sha256 <pin>'
+```
+
+Run `check-metropolis-install.py` in the same image against `/out/registry` with the same proving flags.
+Keep the harness at `<dir>/scripts/` (for example the snapshot's `/src/scripts`). The prover runner treats
+any binary under its own parent directory as a source build and refuses it. Mounting the scripts at a
+top-level `/check` makes that parent `/`, so every installed binary is refused (fail closed, not a product
+failure).
+
+### Hosted cold-download check
+
+`--hosted-publisher ADDR --proving-witnesses DIR` plus, per pool domain, `--hosted-manifest FILE
+--hosted-manifest-sha256 PIN --hosted-signature FILE` qualifies real hosted artifacts. The release must
+have recorded each manifest digest, and every URL must be public HTTPS (placeholder, loopback and private
+hosts are refused). Each domain then runs these cases:
+
+- three empty-cache installs that must download every byte;
+- warm reuse (3 cache hits);
+- a cached zkey with one flipped byte, which must be re-downloaded or refused, never used;
+- refusals for a wrong publisher and for changed manifest bytes.
+
+The installed prover refuses public inputs whose chain, contract or verifier version differ from the
+manifest domain. The cases are proved only when the fixture witnesses in `DIR` are bound to that domain.
+Otherwise the installed `erebus-artifacts` performs every download and cache step and checks that the
+installed hashes match. A proof attempt with the foreign-domain witness must then be refused before
+anything installs, and the report says `proved: false` with the witness domain. The repository's
+`circuits/m5/build` witnesses are bound to the rehearsal pool `0x5fc8d32690cc91d4c39d9d3abcbd16989f875707`.
+
+`--hosted-fixture` runs the same sequence against a local release server. The server answers each
+`/releases/download/<tag>/<asset>` with a 302, as GitHub release assets do, and serves the flat names
+`stage_artifacts.py` produces. The manifest is signed with an ephemeral publisher. A second server serves
+a tampered zkey, which must be refused and not kept. The installed binaries trust only bundled web roots,
+so the fixture uses loopback HTTP and reports `https_exercised: false`. Only real hosting exercises HTTPS.
+`--hosted-fixture-bundle DIR` (repeatable) runs the fixture once per pool bundle instead of `--proving-bundle`.
+With `--hosted-fixture-unrecorded` it also accepts bundles whose manifests the packages did not record. That
+is a domain rehearsal before a rebuild: the report says `release_recorded: false`, and no CI gate accepts it.
+
+Per-domain witnesses: repeat `--hosted-witnesses DIR` in hosted-domain order (`--hosted-manifest` or
+`--hosted-fixture-bundle` order). Each directory must hold witnesses bound to that pool. Without it,
+`--proving-witnesses` is used for every domain. `--require-deployment FILE` refuses packages unless they
+recorded exactly one manifest for every pool in the deployment record, matching the chain, address, verifier
+version and verifier runtime pins, and nothing outside it. When a hosted check runs, every pool must also
+be proved. The report carries `deployment_coverage`.
+
+Packages record one manifest per pool domain. Repeat `--proving-manifest`, `--proving-manifest-sha256`
+and `--proving-signature` in the same order. `release.json` lists them under `proving_domains`; the
+domains must be distinct, and all must agree on `test_only`. `proving_artifacts` is kept only when exactly
+one manifest is recorded.
+
+### Hosted fetch (real HTTPS artifact verification)
+
+`stage_artifacts.py fetch --manifest FILE --manifest-sha256 PIN --output NEW_DIR` downloads every artifact
+in a hosted manifest, plus the three public verification keys from the same release base. Each file must
+match its size and SHA-256, and each key the circuit's `verification_key_sha256`. The output is bundle
+layout, which Codex's `circuits/m5/scripts/qualification-witnesses.mjs` accepts to generate synthetic
+offline witnesses for that pool. URLs must be public HTTPS. Only a run against the real release counts as
+hosting evidence. `stage` now also copies the verification keys into `files/` and `SHA256SUMS`; the hosting
+manifest bytes are unchanged.
+
+### Bundle check against a deployment record
+
+`stage_artifacts.py check-bundle --bundle DIR --manifest-sha256 PIN --deployment FILE --pool NAME
+[--source-manifest FILE --source-manifest-sha256 PIN]` runs offline. It compares a domain-bound bundle with
+one pool of a deployment record that lists several pools. It checks the pinned manifest and every file, the
+chain, the pool address and verifier version, each circuit's verifier runtime against the pool's
+`runtime_pins`, and the verification-key digests. With a source manifest, it also requires that only
+`settlement_contract` changed and that the source is the manifest the deployment recorded. The pool,
+Poseidon and asset runtimes are deployment facts the bundle does not carry. Confirm them from the chain
+(Codex's deployment verification).
+
+### Publication preflight
+
+`stage_artifacts.py preflight` runs offline before any upload. It refuses all of the following:
+
+- placeholder or non-HTTPS URLs, or URLs that don't share one release base;
+- a staged file or manifest that changed after staging;
+- a missing signature, or an invalid or zero publisher address;
+- a publisher signature that the installed `erebus-artifacts` rejects (it is checked against a
+  pre-filled cache, so nothing downloads);
+- a manifest domain that is neither the `--deployment` configuration nor the declared `--rehearsal-domain`;
+- verifier runtimes that differ from the deployment's `runtime_pins`;
+- a rehearsal domain on a non-test manifest;
+- package `release.json` files that recorded a different proving manifest or fixture boundary.
+
+The `--deployment` file supplies the wallet configuration's `namespace`, `pool`, `verifier_version` and
+`runtime_pins`. `stage_artifacts.py coverage --deployment FILE --release release.json` runs the same
+package coverage check on its own. A deployment record with a `pools` list needs `--pool NAME`, and a test-only record refuses
+a non-test manifest. The output always carries `test-only` when the manifest says so, plus `unaudited`.
+It carries `single-operator` unless the deployment record declares `"independent": true`, and
+`rehearsal-domain` for rehearsal publication. `packages_publishable` also requires every package to be
+`release_eligible`.
+
+### Native CI qualification
+
+On a clean revision, `.github/workflows/metropolis-registry.yml` runs these steps natively on `macos-14`
+(arm64) and `ubuntu-latest` (x86_64):
+
+1. Build the registry.
+2. Run the install check, with onboarding and the hosted-artifact sequence.
+3. Run `--rehearse-assets`, `--rehearse-metered` and `--rehearse-x402`.
+4. Write each report to `registry/qualification/`.
+
+The compare job fails unless all of these hold:
+
+- both legs verified every gate;
+- both recorded the same set of proving manifests;
+- both are `release_eligible`;
+- every recorded domain has a hosted report that the packages recorded, with all refusals passing.
+
+Without hosted inputs, each leg generates a known-entropy CI fixture bundle in the job and uses
+`--hosted-fixture`. Packages from that mode are refused by the publish job. With `hosted_publisher` and
+`hosted_domains`, the legs download each pool's manifest and signature over HTTPS only and check each pin.
+Each leg then runs `fetch` for every pool, generates that pool's witnesses from the fetched bytes, and
+builds packages with `--require-deployment <deployment_record>`. It runs the real HTTPS sequence per pool
+with that pool's witnesses. The deployment record and the witness generator must be committed in the
+dispatched revision. `hosted_domains`
+is a JSON list of `{"name", "manifest_url", "manifest_sha256", "signature_url"}`. The publish job also
+refuses unless all of these hold:
+
+- every hosted domain reports `proved: true` and `https_exercised: true`;
+- `deployment_coverage` is complete, with every pool proved;
+- every `fetch` report says `"hosted": true`;
+- each install report's `claims.native_platform_qualification` is true. Only a GitHub-hosted runner
+  with a clean tree sets it; local hosts and Rosetta containers never do.
+
+This workflow is native qualification; Rosetta results do not substitute for it. It has not run yet: there
+is no clean approved revision and no hosting. The dispatch inputs, with owner placeholders, are in
+`.local/metropolis/candidate-20261010/native-ci-dispatch-inputs.json`.
+
+### What a qualification report claims
+
+Every `check-metropolis-install.py` report identifies:
+
+- the candidate: `evidence.source_tree_sha256`, `source_commit` and `merge_head`;
+- `release_json_sha256`, and `evidence.binaries_sha256` and `launchers_sha256` (every installed file is
+  hash-matched against these before any gate runs);
+- the recorded pool manifests (`evidence.proving_domains`);
+- the deployment record (`deployment_sha256`, with `--require-deployment`);
+- the packaged deployment schemas (`evidence.deployment_schemas`).
+
+Its `claims` block separates these:
+
+- `offline_proving` and `proving_witnesses`: synthetic offline witnesses, with no wallet, chain history or transaction;
+- `funded_payments`: `local Anvil rehearsal with test keys`, or `none`. `live_payment` is always false here;
+- `artifact_transport`: `loopback-http`, `loopback-http-redirects` or `https`, with `https_exercised`;
+- `publisher`: `ephemeral` for fixtures, otherwise the pinned address;
+- `native_platform_qualification`.
+
+### Shielded disclosure deployment config
+
+`erebus-shielded-disclosure` parses a strict deployment config (`deny_unknown_fields`) with five runtime
+pins: `runtime_keccak256` (pool), `poseidon_keccak256`, `deposit_verifier_keccak256`,
+`transfer_verifier_keccak256` and `withdraw_verifier_keccak256`. Each must be a non-zero `0x`-prefixed
+lowercase digest. The config also carries `namespace`, `settlement_contract`, `verifier_version`, `rpc_url`,
+`peer_rpc_url` (distinct), `first_block`, `first_hash` (`0x`-prefixed) and `cache_root`. The registry
+build records this field list, read from the source it built, under `release.json`
+`deployment_schemas`.
+
+```sh
+python3 packaging/metropolis/disclosure_config.py render --deployment contracts/evm/deployments/monad-testnet-shielded-v2.json \
+  --pool wmon --rpc-url <primary RPC> --peer-rpc-url <second RPC> --cache-root <owner-only dir> > disclosure-wmon.json
+python3 packaging/metropolis/disclosure_config.py check --config disclosure-wmon.json --release <registry>/release.json \
+  --deployment contracts/evm/deployments/monad-testnet-shielded-v2.json --pool wmon
+```
+
+`render` copies the pool's identity and pins from the deployment record; the endpoints and cache root are
+operator inputs. `check` refuses a config whose fields differ from the packaged schema, a missing,
+zero or non-canonical pin, equal endpoints, or another pool's identity. It also refuses packages that
+did not record the schema, including r5 and everything earlier. Those binaries reject the current
+config's fields, which is why a later harness's metered run against r5 stopped with
+`invalid shielded deployment`. Test fixtures for both pools, with `.invalid` endpoints, are in
+`scripts/tests/fixtures/metropolis-disclosure-deployment-{wmon,usdc}.json`. The other binaries accept these
+pin fields with or without `0x`. `erebus-access-service` takes `first_hash` as a byte array; the disclosure
+config takes it as hex.
+
+### 2026-10-10 results, shared-snapshot candidate (superseded by r5)
+
+Codex's shared-snapshot candidate changes `sdk/shielded/src/rpc.rs`, `observation.rs` and `recovery.rs`.
+Identity: `HEAD` `94aa05902e7b70c2cd14bcc970790c7daba2c0c6`, open merge `a5dd7a25e2318229275dcf039374e067367cd894`,
+`source_tree_sha256` `0b93e2a04dbe1610ccf65712a54074fb929a5b47e9774a3a19ed3261b69dd72c` (190 inputs, 56 uncommitted).
+`release_eligible: false`; unaudited; test-only single-operator setup and rehearsal-domain pool. Proving manifest
+`268bf1abe34d738859a20d5db8cee96a30fd4dbb4b2e25b8b5b9da7084d59a4a`; the inventory matched the tree again.
+Version `0.3.0.dev2026101003`, release profile. All nine `sdk/shielded` binaries changed from r2.
+
+| macOS arm64 (native host) | SHA-256 |
+|---|---|
+| `release.json` | `052dbb7423101a58b9023d1bde677a2619c6074917d0233681ffa97569c6d454` |
+| `erebus_cli` wheel | `ffb405e284739a0f6a366fea3a5fdae41695be24d05151b40c91d5cfe4539fa7` |
+| `erebus_sdk` wheel | `2948a1cc734b1865d8442d11b65235ccab79567d9f06df9c3edaa380d80db6cc` |
+| `erebus_mcp_server` wheel | `ba19d284d00a10eefbc715f1501af6d3898d3ec563d4ebd6f4ac91350e664fd0` |
+
+| Installed gate (macOS arm64) | Result |
+|---|---|
+| Fresh install, 15 binaries plus launcher hash-matched, self-host relay, MCP tools, onboarding | passed |
+| Cold proving (deposit/transfer/withdrawal), warm reuse, tampered zkey refused | passed (cold transfer 3,157 ms elapsed, 2,889 ms proving) |
+| `--rehearse-assets`, run 1 | passed, 2 tests, 278.40 s |
+| `--rehearse-assets`, run 2 | passed, 2 tests, 265.87 s |
+| `--rehearse-metered` | passed, 1 test, 117.34 s |
+| `--rehearse-x402` | passed, 2 tests |
+| `--hosted-fixture` (loopback redirects, ephemeral publisher; HTTPS not exercised) | passed: 3 cold installs, 10 redirects, warm reuse, tampered cache re-downloaded, wrong-publisher and changed-bytes refusals, tampered served zkey refused |
+
+Two consecutive asset passes on this candidate are local team evidence. They are not proof that the
+intermittent failure cannot recur. Harness at run time: `random_asset.rs`
+`ce84c647299d1a8947dc7035120eed9a45ae73b49e68b305828f76fd7fc499d5`, `wallet_ops.rs`
+`59a5c159a823ca75aa51c7d609ca8a3475407d257c59de70a808f55589a61e4f`.
+
+Linux x86_64 (Rosetta) was **not** qualified for this candidate. A snapshot at the same identity was built,
+but the 5 GB host-disk guard stopped the container during compilation, at 4.7 GiB free. No Linux result
+exists for `0.3.0.dev2026101003`.
+
+### 2026-10-10 results, refreshed bundle (superseded binaries)
+
+Candidate unchanged from the first run below: `HEAD` `94aa05902e7b70c2cd14bcc970790c7daba2c0c6`, open merge
+`a5dd7a25e2318229275dcf039374e067367cd894`, `source_tree_sha256`
+`a49e327efd7b7b27e53b6dde88dafb772a4e952ac48d06373295bfa7b5b6c749` (190 input files, 54 uncommitted),
+`release_eligible: false`. Version `0.3.0.dev2026101002`, release profile.
+
+Proving bundle: `.local/metropolis/candidate-20261010/bundle-current-source/`, manifest SHA-256
+`268bf1abe34d738859a20d5db8cee96a30fd4dbb4b2e25b8b5b9da7084d59a4a` (matches the independently supplied pin).
+Before building, all 17 circuit files and all 5 witness sources in its `source-inventory.json` matched the
+working tree. Every manifest file, size, and verification-key hash matched, and each circuit binds the
+inventory's SHA-256. The zkeys are byte-identical to the previous bundle; only the provenance changed.
+The bundle is still test-only single-operator setup with a rehearsal pool address
+(`0x5fc8d32690cc91d4c39d9d3abcbd16989f875707`). It is not an authenticated Monad deployment or an audited release.
+
+| Platform | Execution | `release.json` SHA-256 | Native wheel SHA-256 |
+|---|---|---|---|
+| macOS arm64 | native host, live tree at the recorded identity | `367e9f404bed6d7ea90f7644fef7e1e715f19791fec2d15267cf8cbdf054ef69` | `1d4ae4679ffe5ba2fd2b55eef10cbab7514eac13a2b497c8c7fadde9dead3f1b` |
+| Linux x86_64 | **Rosetta-emulated** container, isolated snapshot at the same identity | `22efb4935a8dd0f63acb87690b2293bbfd812d19b02e36da23030b1ce097fd6f` | `696bd2a3261a6e49cacec7f1f6d3c79dff059dfe3c7ff791fd968457b5610959` |
+
+The pure-Python wheels are identical across platforms: `erebus_sdk` `e73a1b6946f1edfb50948111aeb6ca6a165a966c5cb7c34fe4533cf9c9601a68`,
+`erebus_mcp_server` `76407960d9c2e5203f5de917c487774f74a1a5952760a20051ca52e64059a80c`. On each platform, all 15 native
+binary hashes equal the first run's, so release rebuilds of the same tree were reproducible on that platform.
+
+| Check | macOS arm64 | Linux x86_64 (Rosetta, emulated) |
+|---|---|---|
+| Fresh install outside the checkout; imports; 15 binaries plus launcher hash-matched; self-host relay; MCP tools | passed | passed |
+| Installed onboarding (suite-2 buyer/seller, two bindings, auditor key, owner-only files) | passed | passed |
+| Cold proving of all three transitions, warm reuse (3 cache hits), tampered zkey refused | passed | passed |
+| `--rehearse-metered` (Anvil fixture) | passed, 1 test, 121.76 s | not run |
+| `--rehearse-x402` (Anvil fixture) | passed, 2 tests | not run |
+| `--rehearse-assets` (Anvil fixture) | diagnostic pass, 2 tests, 252.51 s (see below); the intermittent gate is still open | not run |
+
+| Transition (elapsed / proving ms, downloaded bytes) | macOS arm64 | Linux x86_64 (Rosetta, not a benchmark) |
+|---|---|---|
+| Deposit (cold) | 977 / 317, 4,470,892 | 1,104 / 981, 4,470,892 |
+| Transfer (cold) | 3,219 / 2,950, 38,434,425 | 5,443 / 4,999, 38,434,425 |
+| Transfer (warm) | 3,247 / 3,092, 0 | 5,509 / 5,154, 0 |
+| Withdrawal (cold) | 1,022 / 901, 12,248,359 | 2,091 / 1,896, 12,248,359 |
+
+The asset diagnostic ran later against the same r2 registry. By then the input tree was `ba0055ce2df59af01a6a4fdb59a5b950162484aaba12a601bfda8c89cc0e45a5`; the only change was `sdk/shielded/examples/support/funded_access.rs`, which no wheel ships. A release rebuild reproduced all 15 r2 binaries byte for byte. This one pass follows two failed runs on identical binaries, so the intermittent ERC-20/WMON failure stays open and the pass is not qualification. The handoff is `assets-handoff.md`.
+
+The first Linux check attempt failed before any proof. Its harness was mounted at `/check` (see above);
+the retry with the harness under `/harness/scripts` passed. Reports are in
+`.local/metropolis/candidate-20261010/` (`*-r2*`, `bundle-source-check.txt`, `candidate-identity-r2.json`).
+
+### 2026-10-12 results, r7 packages (current)
+
+Codex's withdrawal-receipt candidate `e4e4f8323ba40e34ac4701d04d52d55f1ca5182328d9b2bf81a75fcc8f495130` (HEAD `94aa059`,
+merge `a5dd7a2`, 191 inputs, 59 changed, `release_eligible: false`). The identity was the same before the build,
+after it and after all runs. Its only change from r6 is `sdk/shielded/src/operations.rs` (`a1f85682…caa9`). Version
+`0.3.0.dev2026101201`, release profile, macOS arm64, built with `--require-deployment` (`a53121e7…6c6a`) and
+the same WMON `46d8bda2…beb77` / USDC `d52aa67c…7347` manifests and keys.
+
+| Package identity | SHA-256 |
+|---|---|
+| `release.json` | `02b20b0a2b5d4d07853848b12e89648992752c684318087485d33d9089214b08` |
+| `erebus_cli` wheel | `c4a87488ab66bb130bb0e720e09d0f26eeb4ee60a2dce493730e49fc2aea08eb` |
+| `erebus_sdk` wheel | `e5930364a58d58434dee05b6926f2d83fbbcc838201d1e56cd4b90b8360f7d0a` |
+| `erebus_mcp_server` wheel | `fa079f8dbdd7f58066bbba90de478e26506d6419b023d76a218a33df8da72615` |
+| `erebus-shielded-disclosure` | `95f233b6201c5b8a063c485b6ad2ce7bfbf9454c04c8aade41f33fded35def01` |
+| `erebus-local-prove` | `9e21996aadc3e5005b17a5c64240e0ffc145cf291b2943487438b3db71613130` |
+| `erebus-artifacts` | `4493174715ca8b9cb7972448a78ca6dcdeb8a25e732e82ed6f34623c701bb38d` |
+| `erebus-wallet` | `91eac0cf76032daa46061c8d8150735b7dd41c4e3a9bcae01e93b6cb277bd924` |
+
+Nine shielded binaries changed from r6; all 15 binary hashes are in `release.json` and in each report.
+
+| Installed gate (macOS arm64) | Result | Report SHA-256 |
+|---|---|---|
+| Fresh install, hash checks, onboarding, deployment coverage (both pools recorded and proved) | passed | `macos-deployment-r7.json` `0ecfa14a…e15e` |
+| Disclosure config, both pools | accepted against r7; refused for the other pool, with a missing Poseidon pin, and against pre-schema r5 | `r7-disclosure-config.txt` |
+| Cold proving, WMON (elapsed/proving ms) | 960/309, 3,211/2,943, 1,059/943, all verified; warm 3 hits; tampered zkey rejected | in deployment report |
+| Cold proving, USDC | 678/350, 3,142/2,883, 998/884, all verified; warm 3 hits; tampered zkey rejected | `macos-cold-usdc-r7.json` `d03f8dca…447d` |
+| Pool fixtures, both pools | all transitions proved and verified; wrong publisher, changed bytes, foreign-domain inputs and tampered served zkey refused; tampered cache re-downloaded; 10 redirects | in deployment report |
+| `--rehearse-assets`, runs 1 and 2 | passed, 2 tests each, 266.36 s and 262.56 s | `macos-assets{1,2}-r7.json` `2dcd3b10…4656` (identical bytes) |
+| `--rehearse-metered` | passed, 1 test, 121.68 s | `macos-metered-r7.json` `b3c69158…91f8` |
+| `--rehearse-x402` | passed, 2 tests | `macos-x402-r7.json` `2596225a…bf03` |
+
+Every report: `live_payment: false`, `https_exercised: false`, `native_platform_qualification: false`. Proving used
+synthetic offline witnesses; funded payments ran only on local Anvil. No harness file these gates use changed
+between 12:30:41 and 12:43:53 IST (hashes and modification times in `r7-harness-hashes-after.txt`). OpenCode's
+`tests/wallet_faults.rs` changed in that window, but these gates don't compile it. A hashing step before the
+runs recorded nothing, because of a quoting error in the run script. Index: `r7-INDEX.json`.
+
+### 2026-10-12 results, r6 packages (superseded by r7; evidence retained)
+
+Candidate confirmed by Codex: `HEAD` `94aa059`, open merge `a5dd7a2`, `source_tree_sha256`
+`ee013bb6d5c4fb859a52a2db980aedc1a3e3e893affaee70c2ed7e6d1bde7c6d` (191 inputs, 59 changed), identical before
+the build and after all runs. `release_eligible: false`; test-only, unaudited, single-operator, team rehearsal.
+Version `0.3.0.dev2026101102`, release profile, macOS arm64. Built with `--require-deployment
+contracts/evm/deployments/monad-testnet-shielded-v2.json` (`a53121e7…6c6a`) and the WMON `46d8bda2…beb77` /
+USDC `d52aa67c…7347` manifests. Setup keys were not regenerated.
+
+| Package identity | SHA-256 |
+|---|---|
+| `release.json` | `cd34c26ff88e1556e35cf6ccadea546ac88b00a899bf0aaa20add647f07e9bca` |
+| `erebus_cli` wheel | `4ef1e6278f1ff24303593e54a0217ab50f5dec39c287d89020028e004255abcd` |
+| `erebus_sdk` wheel | `3915550cc9133c46d214c27bedc0567f5c67fbb5673f516fb0813c9304210963` |
+| `erebus_mcp_server` wheel | `16ba6d4b93afbcff6149ce6c7e8d703d9a7cb85b65b8ca615eddc9be776c7239` |
+| `erebus-shielded-disclosure` | `d1b1fe62788a58a8a8c68a345f2d5f4a6c70582baf6972dd583a3525e7944e0b` |
+| `erebus-local-prove` | `1b5c6396738de042508d5d3c40051657fcf37ea841d3b0808531d5b3811ccfec` |
+| `erebus-artifacts` | `9a5a60ea16bc2c4de0ecc8ffe4771de5ac26fcf2d3df7cd55f4cb98422828e77` |
+
+All 15 binary hashes are in `release.json` and in each report's `evidence.binaries_sha256`. Nine shielded binaries
+changed from r5. `release.json` records the 13-field disclosure schema.
+
+| Installed gate (macOS arm64) | Result | Report SHA-256 |
+|---|---|---|
+| Fresh install outside the checkout, binary/launcher hash checks, onboarding, deployment coverage (both pools recorded and proved) | passed | `macos-deployment-r6.json` `69785fa7…74ae` |
+| Disclosure config render and `check`, both pools | accepted against r6; refused against r5, for the other pool, and with a missing pin | `r6-disclosure-config.txt` |
+| Cold proving from empty caches, WMON (elapsed/proving ms) | 920/303, 3,031/2,789, 989/884, all verified; warm transfer 3 hits; tampered zkey rejected | in `macos-deployment-r6.json` |
+| Cold proving, USDC | 635/300, 3,259/3,015, 1,022/909, all verified; warm transfer 3 hits; tampered zkey rejected | `macos-cold-usdc-r6.json` `555f8e4c…df0c` |
+| Pool fixtures, both pools (loopback redirects, ephemeral publisher) | all transitions proved and verified; refusals held for wrong publisher, changed manifest bytes, foreign-domain public inputs and tampered served zkey; tampered cache re-downloaded; 10 redirects | in `macos-deployment-r6.json` |
+| `--rehearse-assets`, run 1 | passed, 2 tests, 261.47 s | `macos-assets1-r6.json` |
+| `--rehearse-assets`, run 2 | passed, 2 tests, 265.45 s | `macos-assets2-r6.json` |
+| `--rehearse-metered` | passed, 1 test, 120.11 s | `macos-metered-r6.json` `b40138e8…1437` |
+| `--rehearse-x402` | passed, 2 tests | `macos-x402-r6.json` `ad2caab5…7ae` |
+
+Both asset reports have the same bytes (`4fa81eb1…32c6`) because reports carry no timestamps. Separate runs show in the logs.
+Every report says `live_payment: false`, `https_exercised: false` and `native_platform_qualification: false`.
+Proving used synthetic offline witnesses. The funded payments ran only on local Anvil with test keys.
+The harness was unchanged during the runs (`r6-harness-hashes-*.txt`): `check-metropolis-install.py`
+`c921071f…a5`, `support/random_asset.rs` `ce84c647…99d5`, `controlled_paired.rs` `d9e49189…cb64`,
+`native_product.rs` `db88b7ea…0480`, `metered_driver.rs` `a5f298ee…6618`. Codex's separate broad funded run
+(26 passed, one timing fixture corrected and passed alone) is not a clean full-suite rerun and is not part
+of these results. Index: `r6-INDEX.json`.
+
+### 2026-10-11 results, r5 packages recording both pool domains (archived; source has moved)
+
+Codex's integrated candidate: `HEAD` `94aa05902e7b70c2cd14bcc970790c7daba2c0c6`, open merge
+`a5dd7a25e2318229275dcf039374e067367cd894`, `source_tree_sha256`
+`94d9eb6ef65909b2893184b56ff3fc5cfd11cb7dec4d32dd4797deaf473746b1` (191 inputs, 57 changed), identical before
+and after the build. `release_eligible: false`; test-only, unaudited, single-operator, team rehearsal.
+Version `0.3.0.dev2026101101`, release profile, macOS arm64 only (no Linux build).
+`release.json` `7a2562becf7107845da87c64bc052d199c4538733cd99bb70df1a9aa7de9297e` records
+`proving_domains` WMON `46d8bda2…beb77` and USDC `d52aa67c…7347` (unsigned bundle manifests, not hosting manifests).
+Wheels: `erebus_cli` `a40b48f9edfab9a603864f343f8cd485b635a72c9cd4242afe617c51e9b830c4`, `erebus_sdk`
+`936155a584678114cc764cb7b59647690435263890c012dcd3ec812c821859d2`, `erebus_mcp_server`
+`d5d76e722bc6fbd891cf385e1d3ad0d9a8d84499de67aea9ea8be48e60224e05`. Nine binaries changed from r3
+(the eight shielded tools and `erebus_pool_indexer`).
+
+| Installed gate (macOS arm64) | Result |
+|---|---|
+| Fresh install, binaries hash-matched, self-host relay, MCP tools, onboarding | passed (in every run below) |
+| WMON hosted fixture, `qualification-witnesses-wmon` | `proved: true`, `release_recorded: true`; cold deposit/transfer/withdrawal 939/317, 3,154/2,896, 1,003/891 ms (elapsed/proving), all verified; warm transfer 3 hits |
+| USDC hosted fixture, `qualification-witnesses-usdc` | `proved: true`, `release_recorded: true`; 686/352, 3,252/2,996, 1,009/892 ms, all verified; warm transfer 3 hits |
+| Fixture refusals, both pools | wrong publisher, changed manifest bytes, public inputs naming another pool, tampered served zkey; tampered cache re-downloaded; 10 redirects |
+| `--rehearse-assets` | passed, 2 tests, 263.38 s |
+| `--rehearse-metered` | passed, 1 test, 119.06 s |
+| `--rehearse-x402` | passed, 2 tests |
+
+Combined deployment run, same r5 packages and identity, harness `check-metropolis-install.py`
+`7893550d…c74d`, report `macos-deployment-r5.json` `1c1beca9…8648`:
+
+```sh
+python3 scripts/check-metropolis-install.py --registry /private/tmp/erebus-candidate-registry-20261011-r1 \
+  --require-deployment contracts/evm/deployments/monad-testnet-shielded-v2.json \
+  --proving-bundle <L>/live-bundle-wmon --proving-witnesses <L>/qualification-witnesses-wmon \
+  --hosted-fixture --hosted-fixture-bundle <L>/live-bundle-wmon --hosted-fixture-bundle <L>/live-bundle-usdc \
+  --hosted-witnesses <L>/qualification-witnesses-wmon --hosted-witnesses <L>/qualification-witnesses-usdc
+```
+
+Results:
+
+- `deployment_coverage` was complete, both pools recorded and proved.
+- Onboarding passed.
+- Cold proving from empty caches (WMON) verified 936/319, 3,123/2,872 and 1,057/936 ms. Warm transfer had 3 hits, and a tampered zkey was rejected.
+- Both pool fixtures proved and verified all transitions.
+- Refusals held for wrong publisher, changed bytes and foreign-domain public inputs. A tampered cache file was re-downloaded, and a tampered served zkey was refused.
+- `--rehearse-assets --require-deployment` passed again: 2 tests, 261.15 s (`macos-assets-r5b.json`).
+
+Later reruns against a moving test harness, with the same r5 packages:
+
+- Metered and x402 at 11:1x failed to compile: OpenCode was editing `tests/support/controlled_paired.rs`.
+- A metered retry settled on Anvil, then stopped at `tests/support/native_product.rs:230` with `invalid shielded
+  deployment`. That is harness and package drift, not a package result.
+- x402 passed again (`macos-x402-r5c.json`).
+
+By then the working tree had moved to `dc2bc7890856270a2c9cb018c56ddb666aa2fef2de1938a1bc40bf8dc3a65839`,
+from changes to `access/client.rs`, `access/tests.rs`, `erebus_shielded_disclosure.rs` and
+`examples/coordinated_transfer.rs`. r5 is archived at
+`.local/metropolis/candidate-20261010/archive-r5-20261011/INDEX.json`; the next rebuild waits for Codex's
+candidate hash.
+
+The fixtures use loopback HTTP and an ephemeral publisher (`https_exercised: false`). They are not public
+hosting or real publisher signatures. One asset pass does not close the intermittent asset gate. Harness:
+`check-metropolis-install.py` `cecbb987…bb18`, `support/random_asset.rs` `ce84c647…99d5`, `wallet_ops.rs`
+`59a5c159…1e4f`. Reports: `*-r5.json` in `.local/metropolis/candidate-20261010/`.
+
+### 2026-10-11: deployed pool domains (prepared, not hosted)
+
+Codex recorded the test-only Monad deployments in `contracts/evm/deployments/monad-testnet-shielded-v2.json`
+(SHA-256 `a53121e78207007c2d5095725eaa55c3abaf6132691299ccecc283f1d8696c6a`). That record has chain 10143,
+verifier version 2, `test_only: true` and `audited: false`, and declares no independent operators. Two pool
+bundles were rebound from source manifest `268bf1abe34d738859a20d5db8cee96a30fd4dbb4b2e25b8b5b9da7084d59a4a`.
+All artifact bytes are shared; only `settlement_contract` differs.
+
+| Pool | Address | Bundle manifest | Staged hosting manifest |
+|---|---|---|---|
+| wmon | `0x8868f35140f3602c80e2c76132740b6f0c0b409d` | `46d8bda2c69badff64046976a727c25a0fa05bd443484983108d3f1d9f5beb77` | `3c1285e7c655fb516031380820fe49841a2e60193ead0e14c9293b4b1b4d9112` |
+| usdc | `0x863f540471c0ad33c68d1218f31e8c9fe9cd50fb` | `d52aa67cc1c5904e3b5be3a6157af5f2af3ecedec27eec85414cb7edf7257347` | `b6e1fb62cee01d37adca8fb7e9f35dd463d2c7edd8344c508e28943cac29c5be` |
+
+Executed locally (team rehearsal evidence; packages are r3 `0.3.0.dev2026101003`, `release_eligible: false`):
+
+| Check | Result |
+|---|---|
+| `check-bundle`, each pool, with source manifest | passed: pin, nine files, chain, pool, verifier version 2, three verifier runtimes = deployment pins, VK digests, only `settlement_contract` changed. Verifier runtime keccaks also recomputed from `*-runtime.hex` with `cast keccak` |
+| `check-bundle`, WMON bundle against `--pool usdc` | refused (settlement contract) |
+| `stage --domain-name`, each pool | both manifests name the same nine files at one release base (`SHA256SUMS` identical to the rehearsal staging); assets `manifest-<pool>.json`, `manifest-<pool>.signature.json` |
+| `preflight --deployment … --pool`, each pool (throwaway key, deleted; not a publisher identity) | passed; labels `test-only`, `unaudited`, `single-operator` |
+| Preflight refusals | wrong pool, r3 packages (did not record these manifests), wrong publisher, WMON signature on the USDC manifest, rehearsal domain: all refused |
+| `--hosted-fixture --hosted-fixture-bundle` both pools `--hosted-fixture-unrecorded` | passed per pool: 3 cold installs downloading every byte, 10 redirects, warm reuse (3 hits), tampered cache re-downloaded, wrong-publisher, changed-bytes and foreign-domain-witness refusals, tampered served zkey refused. `proved: false`, `release_recorded: false`, `https_exercised: false` |
+| Rehearsal-domain hosted fixture, after the change | passed, `proved: true` (cold transfer proving 2,803 ms) |
+
+Domain-bound proving (Codex's synthetic offline witnesses, `circuits/m5/scripts/qualification-witnesses.mjs`;
+no RPC, keys, wallet state or transactions). Run once per pool:
+`--hosted-fixture --hosted-fixture-bundle live-bundle-<pool> --hosted-fixture-unrecorded --proving-witnesses qualification-witnesses-<pool>`.
+Installed `erebus-local-prove` `bdfc33c5b6afd6da59d4083dfb0b64792f037c33848b8e2f7e3a530d777ced77` and
+`erebus-artifacts` `600a2766616d7839fcb0f7beb30d0aff31f72c60f9e177028a7e9f62fb88e8ba`, both from r3.
+
+| Pool | Cold deposit / transfer / withdrawal (elapsed / proving ms) | Warm transfer | Refusals | Report SHA-256 |
+|---|---|---|---|---|
+| wmon | 913/310, 3,177/2,911, 1,030/916; all verified, every byte downloaded | 3,018/2,867 ms, 3 hits | wrong publisher, changed manifest bytes, public inputs naming another pool, tampered served zkey; tampered cache re-downloaded | `6fbcee56d4e3322d940aa797e1d1a5c3da15761d28d62d2592ae504cbec60696` |
+| usdc | 626/309, 3,125/2,869, 1,045/928; all verified, every byte downloaded | 3,065/2,912 ms, 3 hits | same, all refused | `3769cc19b18ead5f38185a3c1c12c6a614287142be86d0600e4b70c80b7d50d6` |
+
+Both report `proved: true`, `https_exercised: false` (loopback redirect server, not public hosting),
+`release_recorded: false` (r3 packages recorded `268bf1ab…`), `test_only: true`, publisher `ephemeral`,
+evidence scope team rehearsal. The r3 packages lack Codex's later `sdk/shielded/src/rpc.rs` read retries,
+so these runs qualify proving against the deployed domains, not the updated product candidate.
+
+The first live-domain attempt stopped at the first cold proof: the installed prover rejected the
+rehearsal-pool witness for the live domain (`artifacts.rs` public-input check). That refusal is correct.
+Proving with these domains needs fixture witnesses bound to each live pool. Upload destinations, exact
+hashes and per-pool commands are in `.local/metropolis/candidate-20261010/publication-checklist-live.md`.
+
+### Proving-artifact hosting (prepared, not hosted)
+
+`packaging/metropolis/stage_artifacts.py stage` checks a bundle against its pinned manifest and copies the
+nine proving files under flat release-asset names. It writes a hosting manifest whose URLs are
+`<base-url>/<circuit>.<wasm|r1cs|zkey>`, plus `SHA256SUMS` and `hosting.json`. Only the URLs change.
+It refuses non-HTTPS, credentialed, loopback, private, and placeholder hosts (`.invalid`, `example.*`, `.test`).
+The installer follows at most five HTTPS redirects, which GitHub release-asset downloads need. Confirm
+with a real download once the files are hosted.
+
+Staged locally (nothing uploaded):
+
+```sh
+python3 packaging/metropolis/stage_artifacts.py stage \
+  --bundle .local/metropolis/candidate-20261010/bundle-current-source \
+  --manifest-sha256 268bf1abe34d738859a20d5db8cee96a30fd4dbb4b2e25b8b5b9da7084d59a4a \
+  --base-url https://github.com/PoulavBhowmick03/erebus-metropolis/releases/download/artifacts-268bf1abe34d \
+  --output .local/metropolis/candidate-20261010/hosting-staged-268bf1abe34d
+```
+
+Result: hosting manifest SHA-256 `5302b81e1346927cb971ae534b48927e9b16d42a9c76c76619775c5306aafb94`, `test_only: true`,
+`signed: false`, `hosted: false`. The base URL is a proposal; no such release exists. After owner approval:
+
+0. Run `stage_artifacts.py preflight` (above) after signing and before upload; it must print `"status": "ok"`.
+1. Review `hosting-staged-…/manifest.json`. Sign its exact bytes offline:
+   `printf '{"manifest_file":"<abs>/manifest.json","publisher_key_file":"<abs>/publisher.key"}' | erebus-artifacts --sign-manifest`.
+   Use a dedicated release-publisher key, never a participant or gas key.
+2. Create the release named in the base URL and upload `files/*`, `manifest.json`, `SHA256SUMS`, and the signature envelope.
+3. Run `python3 packaging/metropolis/stage_artifacts.py verify --staged <dir>`. Only `"hosted": true` from that
+   command is hosting evidence.
+4. Publish the hosting-manifest digest and publisher address through a channel independent of the download.
+   Rebuild the packages with `--proving-manifest` naming the hosting manifest.
+
+Hosting authenticates the publisher and file bytes only. It does not make test-only keys a trusted
+ceremony, and it does not authenticate a Monad deployment.
+
+### 2026-10-10 results, first run (superseded bundle)
+
+Candidate: `HEAD` `94aa05902e7b70c2cd14bcc970790c7daba2c0c6` with open merge `a5dd7a25e2318229275dcf039374e067367cd894`,
+`source_tree_sha256` `a49e327efd7b7b27e53b6dde88dafb772a4e952ac48d06373295bfa7b5b6c749` (190 input files, 54 uncommitted).
+`release_eligible: false`; this is team rehearsal evidence, not a release, external acceptance or Monad evidence.
+Version `0.3.0.dev2026101001`, release profile. Proving manifest: the single-operator test-only bundle
+`37fed4d21ea6d68f783a4ccb65879764a9d0487f51397c9aca4484791a926680`. Its circuit sources match the
+candidate, but its recorded witness-source hashes for `sdk/core/src/shielded.rs`, `circuits/m5/scripts/pool.mjs`, and
+`native-fixture.mjs` predate the current files.
+
+| Platform | Execution | `release.json` SHA-256 | Native wheel SHA-256 |
+|---|---|---|---|
+| macOS arm64 (`macosx_11_0_arm64`) | native host, live tree at the recorded identity | `44d508c7b3f4389b9d27b3f48382316ebaf828e00360a76daa64c400b6c19709` | `d411f6742215381a851f76500493c7a10162f0e1674c5c58ec731c18c6fbb356` |
+| Linux x86_64 (`linux_x86_64`) | **Rosetta-translated** container, isolated snapshot at the same identity | `23148b81e0c2de28880a0395f518e9f832f4a7619e457e0b2a1119b746c71b15` | `e7ff2a669ef81d6dabfaaee5bc787f32a2fcbe44d12e6ae7070466251b9d818b` |
+
+The pure-Python wheels are byte-identical across both builds: `erebus_sdk` `9d9ca6da47eb8b35f140dbd27491149529b4165b42405165280c238d66a1273b`,
+`erebus_mcp_server` `1ca7bdf477de542468f1bc2db0b3882db362cf83a3036b281d57dfa6e335a797`.
+
+| Check | macOS arm64 | Linux x86_64 (Rosetta) |
+|---|---|---|
+| Fresh install, imports, 15 binaries plus launcher hash-matched, self-host relay, MCP tool surfaces | passed | passed |
+| Cold proving: deposit/transfer/withdrawal from empty caches, warm reuse, tampered zkey refused | passed | passed |
+| Prepaid metered access (`--rehearse-metered`, Anvil fixture) | passed, 1 test, 124.25 s | not run |
+| x402 settle/restart/audit and two MCP agents (`--rehearse-x402`, Anvil fixture) | passed, 2 tests | not run |
+| Random-key ERC-20 and wrapped-native workflows (`--rehearse-assets`, Anvil fixture) | **failed twice** (see below) | not run |
+| Suite-2 `prepare_operator`, `prepare_binding`, auditor `keygen` from installed binaries with an empty environment | passed (manual) | not run |
+
+Cold-proving measurements (installed release binaries; elapsed / proving ms, downloaded bytes):
+
+| Transition | macOS arm64 | Linux x86_64 (Rosetta, not a benchmark) |
+|---|---|---|
+| Deposit (cold) | 923 / 310, 4,470,892 | 1,125 / 992, 4,470,892 |
+| Transfer (cold) | 3,197 / 2,918, 38,434,425 | 5,396 / 4,948, 38,434,425 |
+| Transfer (warm, 3 cache hits) | 3,560 / 3,406, 0 | 5,595 / 5,306, 0 |
+| Withdrawal (cold) | 1,069 / 932, 12,248,359 | 2,042 / 1,847, 12,248,359 |
+
+The asset rehearsal failed in both runs, once per run, in a different workflow each time: first ERC-20, then
+wrapped-native. Each time `erebus-payment settle` returned `paired pool evidence unavailable; retain reservations`
+with exit 1 and `retry_without_new_payment: true`. The harness expects success or `pending`. The response
+fails closed, but the asset gate is not passing for this candidate. The earlier 2026-10-09 pass used a
+different candidate. The funded Linux rehearsals need the repository's debug test build inside the VM,
+which the host disk could not hold safely. Reports are retained under `.local/metropolis/candidate-20261010/`.
+
+## 12. Not yet available
+
+Remaining dependencies for a user who has only the installed shielded candidate (updated 2026-10-11):
+
+- Proving artifacts have no hosted distribution. The pool bundles' URLs are `https://example.invalid/…`,
+  so installation works only from a pre-filled cache or a loopback rehearsal. Hosting manifests for the
+  deployed WMON and USDC pools are staged (see "2026-10-11: deployed pool domains" above). Still needed, each with
+  approval: owner publisher signatures, upload, `verify`, and an independent digest/publisher pin. The
+  keys are test-only, single-operator and unaudited.
+- Test-only Monad deployments are recorded (2026-10-11, single operator, unaudited). Installed proving
+  against both domains passed with synthetic witnesses over a loopback fixture, on r7 packages (`0.3.0.dev2026101201`)
+  that record both pool manifests and the disclosure schema. Still missing:
+  - public HTTPS hosting;
+  - native macOS and Linux CI on a clean revision.
+- The funded rehearsals' Anvil chain, contract deployment, and test drivers come from the repository
+  (`cargo test`, Node, `circuits/m5`). Only the participant commands are installed. The base install check,
+  cold proving, and manual onboarding needed no checkout code.
+- The installed binaries embed no checkout paths, and the installed SDK/MCP imports resolve only inside the
+  fresh environment.
 
 - No independent third-party run of the published packages yet.
 - No hosted testnet deployment of the shared services. Render deployment files are prepared and

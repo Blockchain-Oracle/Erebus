@@ -177,7 +177,7 @@ pub fn check_requirements(
 /// `backend_evidence` is opaque to the core: it holds whatever the backend must carry from
 /// preparation to submission (a proof and public inputs, or a signed envelope). No spending
 /// secret or witness belongs in it once it leaves the local environment.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct PreparedSettlement {
     /// Caller-supplied operation reference, bound to the durable journal before preparation.
     pub operation_ref: [u8; 32],
@@ -193,6 +193,12 @@ pub struct PreparedSettlement {
     pub required_guarantees: GuaranteeSet,
     /// Backend-internal evidence.
     pub backend_evidence: Vec<u8>,
+}
+
+impl core::fmt::Debug for PreparedSettlement {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str("PreparedSettlement { <redacted> }")
+    }
 }
 
 /// How far a submitted transition has progressed on chain.
@@ -336,6 +342,26 @@ pub fn recovery_action(finality: Finality) -> RecoveryAction {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opaque_backend_evidence_never_prints_in_prepared_debug() {
+        let context = context();
+        let prepared = PreparedSettlement {
+            operation_ref: [1; 32],
+            deal_commitment: DealCommitment::from_bytes([2; 32]),
+            deal_nullifier: DealNullifier::from_bytes([3; 32]),
+            domain: context.domain,
+            mode: context.mode,
+            required_guarantees: context.required_guarantees,
+            backend_evidence: b"PRIVATE_AGREEMENT_OPENING".to_vec(),
+        };
+        assert_eq!(format!("{prepared:?}"), "PreparedSettlement { <redacted> }");
+        assert_eq!(
+            format!("{prepared:#?}"),
+            "PreparedSettlement { <redacted> }"
+        );
+        assert_eq!(prepared.backend_evidence, b"PRIVATE_AGREEMENT_OPENING");
+    }
 
     #[test]
     fn selection_checks_suites_modes_local_proving_and_asset_domain() {

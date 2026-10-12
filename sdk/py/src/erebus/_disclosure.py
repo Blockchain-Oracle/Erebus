@@ -51,7 +51,7 @@ class DisclosureSeam:
                 [self._binary], input=json.dumps(request), capture_output=True,
                 text=True, timeout=self._timeout, check=False,
             )
-        except (OSError, subprocess.TimeoutExpired):
+        except (OSError, subprocess.TimeoutExpired, UnicodeError):
             raise DisclosureError("disclosure process unavailable; retain evidence and retry") from None
         try:
             response = json.loads(completed.stdout)

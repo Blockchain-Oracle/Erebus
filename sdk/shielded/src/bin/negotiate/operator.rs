@@ -1,4 +1,4 @@
-//! Operator setup for a suite-1 participant: fresh keys, a signed descriptor, and the canonical
+//! Operator setup for either agreement suite: fresh keys, a signed descriptor, and the canonical
 //! service template both participants negotiate against. Nothing here touches a chain.
 
 use super::*;
@@ -9,10 +9,22 @@ use erebus_core::{
     service::ServiceRecord,
     terms::{FeePolicy, Guarantee, GuaranteeSet, SettlementMode, CURRENT_PROTOCOL_VERSION},
 };
-use erebus_transport::descriptor::MODE_PUBLIC_BOUND;
+use erebus_transport::descriptor::{MODE_PUBLIC_BOUND, MODE_SHIELDED};
 
 /// Longest descriptor validity this setup will sign.
 const MAX_DESCRIPTOR_LIFETIME: u64 = 30 * 24 * 3600;
+
+pub(super) fn default_suite() -> u16 {
+    1
+}
+
+fn guarantees(suite: u16) -> GuaranteeSet {
+    if suite == 2 {
+        GuaranteeSet::from_bits(7).expect("defined shielded guarantees")
+    } else {
+        GuaranteeSet::from_guarantee(Guarantee::AgreementBoundSettlement)
+    }
+}
 
 fn write_new(path: &Path, bytes: &[u8], private: bool) -> Result<(), &'static str> {
     let mut options = fs::OpenOptions::new();
@@ -38,7 +50,8 @@ fn address(value: &str) -> Result<[u8; 20], &'static str> {
 }
 
 /// Creates `directory` (which must not exist) with a transport key, a suite-1 agreement key that
-/// also signs discovery, and a signed public descriptor. Returns public values only.
+/// also signs discovery, or separate suite-2/discovery keys. Returns no key values.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn prepare_operator(
     directory: &Path,
     role: &str,
@@ -46,9 +59,13 @@ pub(super) fn prepare_operator(
     namespace: &str,
     assets: &[String],
     lifetime: u64,
+    suite: u16,
 ) -> Result<Value, &'static str> {
     if !directory.is_absolute() || !matches!(role, "buyer" | "seller") {
         return Err("use an absolute new directory and a buyer or seller role");
+    }
+    if !matches!(suite, 1 | 2) {
+        return Err("unsupported agreement suite");
     }
     if !(3600..=MAX_DESCRIPTOR_LIFETIME).contains(&lifetime)
         || assets.is_empty()
@@ -81,7 +98,26 @@ pub(super) fn prepare_operator(
             break identity;
         }
     };
-    write_new(&directory.join("agreement.key"), seed.as_ref(), true)?;
+    if suite == 1 {
+        write_new(&directory.join("agreement.key"), seed.as_ref(), true)?;
+    } else {
+        write_new(&directory.join("discovery.key"), seed.as_ref(), true)?;
+        OsRng.fill_bytes(seed.as_mut());
+        let public = derive_key(&seed).map_err(|_| "shielded key generation failed")?;
+        write_new(&directory.join("agreement.key"), seed.as_ref(), true)?;
+        write_new(&directory.join("agreement.public"), &public, true)?;
+        OsRng.fill_bytes(seed.as_mut());
+        write_new(&directory.join("wallet.key"), seed.as_ref(), true)?;
+        if role == "seller" {
+            loop {
+                OsRng.fill_bytes(seed.as_mut());
+                if note_spend_tag(&seed).is_ok() {
+                    break;
+                }
+            }
+            write_new(&directory.join("spend.key"), seed.as_ref(), true)?;
+        }
+    }
     let issued = now()?.saturating_sub(60);
     let mut descriptor = ServiceDescriptor::new(
         identity.address(),
@@ -89,9 +125,13 @@ pub(super) fn prepare_operator(
         vec![format!("tcp://{endpoint}")],
         namespace,
         assets,
-        vec![1],
-        MODE_PUBLIC_BOUND,
-        GuaranteeSet::from_guarantee(Guarantee::AgreementBoundSettlement),
+        vec![suite],
+        if suite == 2 {
+            MODE_SHIELDED
+        } else {
+            MODE_PUBLIC_BOUND
+        },
+        guarantees(suite),
         issued,
         issued + lifetime,
     )
@@ -108,17 +148,113 @@ pub(super) fn prepare_operator(
             .as_bytes(),
         false,
     )?;
-    Ok(json!({"protocol_version":1,"status":"ok","role":role,
-        "agreement_address":format!("0x{}", hex::encode(identity.address())),
+    fs::File::open(directory)
+        .and_then(|file| file.sync_all())
+        .map_err(|_| "operator directory sync failed")?;
+    let mut response = json!({"protocol_version":1,"status":"ok","role":role,"suite_id":suite,
+        "discovery_address":format!("0x{}", hex::encode(identity.address())),
         "transport_public_key":hex::encode(transport.public_key()),
         "agreement_key_file":directory.join("agreement.key"),"transport_key_file":directory.join("transport.key"),
-        "descriptor_file":descriptor_file,"descriptor_expires_at":issued + lifetime}))
+        "descriptor_file":descriptor_file,"descriptor_expires_at":issued + lifetime});
+    if suite == 1 {
+        response["agreement_address"] = json!(format!("0x{}", hex::encode(identity.address())));
+    } else {
+        response["discovery_key_file"] = json!(directory.join("discovery.key"));
+        response["wallet_key_file"] = json!(directory.join("wallet.key"));
+        response["wallet_agreement_key_file"] = json!(directory.join("agreement.public"));
+        if role == "seller" {
+            response["seller_spend_secret_file"] = json!(directory.join("spend.key"));
+        }
+    }
+    Ok(response)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct BindingRequest {
+    output: PathBuf,
+    descriptor_file: PathBuf,
+    discovery_key_file: PathBuf,
+    agreement_key_file: PathBuf,
+    settlement_contract: String,
+    verifier_version: u32,
+    expires_at: u64,
+}
+
+fn shielded_domain(
+    namespace: ChainNamespace,
+    contract: &str,
+    verifier_version: u32,
+) -> Result<DeploymentDomain, &'static str> {
+    let contract =
+        AddressBytes::new(address(contract)?.to_vec()).map_err(|_| "invalid pool address")?;
+    Ok(DeploymentDomain {
+        namespace,
+        settlement_contract: Some(contract.clone()),
+        pool: Some(contract),
+        verifier_version,
+    })
+}
+
+/// Writes an owner-only attestation. Exchange it privately; never publish it with discovery.
+pub(super) fn prepare_binding(request: BindingRequest) -> Result<Value, &'static str> {
+    if !request.output.is_absolute() {
+        return Err("use an absolute new binding path");
+    }
+    let descriptor = descriptor(&request.descriptor_file)?;
+    let current = now()?;
+    let domain = shielded_domain(
+        descriptor.chain_namespace.clone(),
+        &request.settlement_contract,
+        request.verifier_version,
+    )?;
+    let discovery = AuthorizationIdentity::from_bytes(key(&request.discovery_key_file)?.as_ref())
+        .map_err(|_| "invalid discovery key")?;
+    let seed = key(&request.agreement_key_file)?;
+    let agreement = KeyBytes::new(
+        derive_key(&seed)
+            .map_err(|_| "invalid shielded key")?
+            .to_vec(),
+    )
+    .map_err(|_| "invalid shielded key")?;
+    let binding = AgreementKeyBinding::sign(
+        &descriptor,
+        domain,
+        agreement,
+        &discovery,
+        current,
+        request.expires_at,
+    )
+    .map_err(|_| "identity binding context or validity failed")?;
+    write_new(
+        &request.output,
+        &binding.encode().map_err(|_| "binding encoding failed")?,
+        true,
+    )?;
+    fs::File::open(
+        request
+            .output
+            .parent()
+            .ok_or("binding parent unavailable")?,
+    )
+    .and_then(|file| file.sync_all())
+    .map_err(|_| "binding directory sync failed")?;
+    Ok(
+        json!({"protocol_version":1,"status":"ok","binding_file":request.output,
+        "expires_at":request.expires_at,"private_counterparty_exchange":true}),
+    )
 }
 
 /// The service promise both participants must configure identically, apart from price.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct TermsRequest {
+    #[serde(default = "default_suite")]
+    pub(super) suite_id: u16,
+    #[serde(default)]
+    pub(super) local_binding_file: Option<PathBuf>,
+    #[serde(default)]
+    pub(super) peer_binding_file: Option<PathBuf>,
     pub(super) output: PathBuf,
     pub(super) role: String,
     pub(super) local_descriptor_file: PathBuf,
@@ -139,7 +275,7 @@ pub(super) struct TermsRequest {
     pub(super) delivery_deadline: u64,
 }
 
-/// Writes the canonical suite-1 template. Deal identity, nonce, expiry, and transcript are
+/// Writes the canonical template. Deal identity, nonce, expiry, and transcript are
 /// replaced per deal by negotiation; every other field is the promise the peer must match.
 pub(super) fn prepare_terms(request: TermsRequest) -> Result<Value, &'static str> {
     if !request.output.is_absolute() || !matches!(request.role.as_str(), "buyer" | "seller") {
@@ -162,9 +298,75 @@ pub(super) fn prepare_terms(request: TermsRequest) -> Result<Value, &'static str
         (peer.seller_address, local.seller_address)
     };
     let asset = AssetId::parse(&request.asset).map_err(|_| "invalid asset")?;
-    if !local.assets.contains(&asset) || !peer.assets.contains(&asset) {
-        return Err("both descriptors must offer the agreement asset");
+    let mode = match request.suite_id {
+        1 => MODE_PUBLIC_BOUND,
+        2 => MODE_SHIELDED,
+        _ => return Err("unsupported agreement suite"),
+    };
+    if [&local, &peer].iter().any(|descriptor| {
+        !descriptor.assets.contains(&asset)
+            || descriptor.chain_namespace != *asset.namespace()
+            || !descriptor.suites.contains(&request.suite_id)
+            || descriptor.settlement_modes & mode == 0
+            || descriptor.guarantees.bits() & guarantees(request.suite_id).bits()
+                != guarantees(request.suite_id).bits()
+    }) {
+        return Err("both descriptors must support the agreement asset, chain, suite and mode");
     }
+    let domain = if request.suite_id == 2 {
+        shielded_domain(
+            asset.namespace().clone(),
+            &request.settlement_contract,
+            request.verifier_version,
+        )?
+    } else {
+        DeploymentDomain {
+            namespace: asset.namespace().clone(),
+            settlement_contract: Some(
+                AddressBytes::new(address(&request.settlement_contract)?.to_vec())
+                    .map_err(|_| "invalid settlement contract")?,
+            ),
+            pool: None,
+            verifier_version: request.verifier_version,
+        }
+    };
+    let (buyer_key, seller_key) = if request.suite_id == 2 {
+        let binding_key = |path: &Option<PathBuf>, descriptor: &ServiceDescriptor| {
+            let path = path
+                .as_ref()
+                .ok_or("suite-2 requires private identity bindings")?;
+            let bytes = read(path, erebus_transport::binding::MAX_BINDING_BYTES, true)?;
+            AgreementKeyBinding::decode(&bytes)
+                .and_then(|binding| binding.attested_key(descriptor, &domain, current))
+                .map_err(|_| "identity binding signature, domain or validity failed")
+        };
+        let local_key = binding_key(&request.local_binding_file, &local)?;
+        let peer_key = binding_key(&request.peer_binding_file, &peer)?;
+        if local_key == peer_key {
+            return Err("buyer and seller must use different agreement keys");
+        }
+        if request.role == "buyer" {
+            (local_key, peer_key)
+        } else {
+            (peer_key, local_key)
+        }
+    } else {
+        if request.local_binding_file.is_some() || request.peer_binding_file.is_some() {
+            return Err("public-bound templates must not carry shielded bindings");
+        }
+        (
+            KeyBytes::new(buyer.to_vec()).map_err(|_| "invalid key")?,
+            KeyBytes::new(seller.to_vec()).map_err(|_| "invalid key")?,
+        )
+    };
+    // The encrypted bootstrap replaces this template-only spend tag with the seller's tag.
+    let recipient = if request.suite_id == 2 {
+        let mut placeholder = [0u8; 32];
+        placeholder[31] = 1;
+        KeyBytes::new(placeholder.to_vec()).map_err(|_| "invalid template tag")?
+    } else {
+        seller_key.clone()
+    };
     let digest: [u8; 32] = hex::decode(&request.fulfillment_digest)
         .ok()
         .and_then(|bytes| bytes.try_into().ok())
@@ -175,37 +377,32 @@ pub(super) fn prepare_terms(request: TermsRequest) -> Result<Value, &'static str
             .flatten()
             .ok_or("amounts must be decimal base units")
     };
-    let key = |bytes: [u8; 20]| KeyBytes::new(bytes.to_vec()).map_err(|_| "invalid key");
     let terms = AgreementTerms {
         protocol_version: CURRENT_PROTOCOL_VERSION,
-        suite_id: 1,
-        domain: DeploymentDomain {
-            namespace: asset.namespace().clone(),
-            settlement_contract: Some(
-                AddressBytes::new(address(&request.settlement_contract)?.to_vec())
-                    .map_err(|_| "invalid settlement contract")?,
-            ),
-            pool: None,
-            verifier_version: request.verifier_version,
-        },
+        suite_id: request.suite_id,
+        domain,
         deal_id: [0; 16],
         revision: 1,
         transcript_root: [0; 32],
-        buyer_authorization_key: key(buyer)?,
-        seller_authorization_key: key(seller)?,
-        payment_recipient: key(seller)?,
+        buyer_authorization_key: buyer_key.clone(),
+        seller_authorization_key: seller_key,
+        payment_recipient: recipient,
         asset,
         amount: BaseUnits::new(decimal(&request.amount)?),
         expiry: request.delivery_deadline,
         fee_policy: FeePolicy::none(),
-        settlement_mode: SettlementMode::PublicBound,
-        required_guarantees: GuaranteeSet::from_guarantee(Guarantee::AgreementBoundSettlement),
+        settlement_mode: if request.suite_id == 2 {
+            SettlementMode::Shielded
+        } else {
+            SettlementMode::PublicBound
+        },
+        required_guarantees: guarantees(request.suite_id),
         settlement_nonce: [0; 32],
         service: ServiceRecord {
             resource: request.resource,
             quantity: BaseUnits::new(decimal(&request.quantity)?),
             unit: request.unit,
-            access_recipient: key(buyer)?,
+            access_recipient: buyer_key,
             delivery_deadline: request.delivery_deadline,
             fulfillment_method: request.fulfillment_method,
             fulfillment_digest: digest,
@@ -218,6 +415,13 @@ pub(super) fn prepare_terms(request: TermsRequest) -> Result<Value, &'static str
         .encode()
         .map_err(|_| "terms do not encode canonically")?;
     write_new(&request.output, &encoded, true)?;
+    fs::File::open(request.output.parent().ok_or("terms parent unavailable")?)
+        .and_then(|file| file.sync_all())
+        .map_err(|_| "terms directory sync failed")?;
+    if request.suite_id == 2 {
+        return Ok(json!({"protocol_version":1,"status":"ok","suite_id":2,
+            "terms_template_file":request.output,"payment_recipient_finalized":false}));
+    }
     Ok(
         json!({"protocol_version":1,"status":"ok","terms_template_file":request.output,
         "buyer":format!("0x{}", hex::encode(buyer)),"seller":format!("0x{}", hex::encode(seller)),

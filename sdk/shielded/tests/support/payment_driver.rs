@@ -25,6 +25,10 @@ use std::sync::{
 struct ServiceProcess(Child);
 #[path = "agent_driver.rs"]
 mod agent_driver;
+#[path = "metered_driver.rs"]
+mod metered_driver;
+#[path = "controlled_paired.rs"]
+mod controlled_paired;
 #[path = "native_product.rs"]
 mod native_product;
 #[path = "shielded_driver.rs"]
@@ -168,11 +172,21 @@ async fn deploy(
 }
 
 async fn run_payment(binary: &Path, cwd: &Path, config: &Path, method: &str) -> (bool, Value) {
+    run_payment_for(binary, cwd, config, method, OPERATION).await
+}
+
+async fn run_payment_for(
+    binary: &Path,
+    cwd: &Path,
+    config: &Path,
+    method: &str,
+    operation: [u8; 32],
+) -> (bool, Value) {
     finish_with_timeout(
         spawn(
             binary,
             cwd,
-            json!({"method":method,"config_file":config,"operation_ref":hex::encode(OPERATION)}),
+            json!({"method":method,"config_file":config,"operation_ref":hex::encode(operation)}),
         ),
         Duration::from_secs(180),
     )

@@ -28,10 +28,12 @@ use zeroize::{Zeroize, Zeroizing};
 
 use super::{
     issuance_id, request_digest, AccessRequest, Issuance, IssuanceId, X402Payment,
-    MAX_RESOURCE_BYTES,
+    MAX_REQUEST_LIFETIME, MAX_RESOURCE_BYTES,
 };
 
 const MAX_RESPONSE_BYTES: usize = MAX_RESOURCE_BYTES * 2 + 4096;
+// Allow bounded history verification while leaving time for issuance authentication.
+pub(super) const RETRIEVAL_TIMEOUT_SECONDS: u64 = MAX_REQUEST_LIFETIME - 60;
 
 /// Retrieval failures never authorize another payment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -243,7 +245,7 @@ impl AccessClient {
             .map_err(|_| RetrievalError::Storage)?;
         let client = Client::builder()
             .redirect(Policy::none())
-            .timeout(Duration::from_secs(30))
+            .timeout(Duration::from_secs(RETRIEVAL_TIMEOUT_SECONDS))
             .build()
             .map_err(|_| RetrievalError::Configuration)?;
         Ok(Self {
@@ -455,7 +457,9 @@ impl AccessClient {
             OsRng
                 .try_fill_bytes(&mut nonce)
                 .map_err(|_| RetrievalError::Authentication)?;
-            let expires_at = now.checked_add(120).ok_or(RetrievalError::Authentication)?;
+            let expires_at = now
+                .checked_add(MAX_REQUEST_LIFETIME)
+                .ok_or(RetrievalError::Authentication)?;
             let digest = request_digest(&selected, service_id, nonce, expires_at, payment.as_ref())
                 .map_err(|_| RetrievalError::Agreement)?;
             let (buyer, signature) = if selected.terms.suite_id == SHIELDED_POSEIDON_EDDSA_SUITE_ID

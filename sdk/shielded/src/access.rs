@@ -26,15 +26,26 @@ use erebus_transport::disclosure::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::{disclosure::verify_shielded_payment, index_store::IndexStore, rpc::PoolRpc};
+use crate::{
+    disclosure::verify_shielded_payment_certified,
+    index_store::IndexStore,
+    rpc::{PoolRpc, PoolRuntimePins},
+};
 
 pub mod client;
+pub mod metered;
 pub mod x402;
 
 /// Longest resource response supported by this snapshot profile.
 pub const MAX_RESOURCE_BYTES: usize = 1024 * 1024;
 /// Longest lifetime of one signed retrieval request.
 pub const MAX_REQUEST_LIFETIME: u64 = 300;
+/// Keccak-256 domain tag of a snapshot retrieval request.
+pub const ACCESS_REQUEST_TAG: &[u8] = b"EREBUS_HTTP_ACCESS_REQUEST_V1";
+/// Keccak-256 domain tag of a snapshot retrieval request carrying an x402 authorization.
+pub const ACCESS_REQUEST_X402_TAG: &[u8] = b"EREBUS_HTTP_ACCESS_REQUEST_X402_V1";
+/// Keccak-256 domain tag of a snapshot issuance identity.
+pub const ACCESS_ISSUANCE_TAG: &[u8] = b"EREBUS_ACCESS_ISSUANCE_V1";
 
 /// A short-lived proof of possession of the buyer's agreement key.
 #[derive(Clone, Deserialize, Serialize)]
@@ -168,7 +179,37 @@ pub enum AccessBackend {
         peer_rpc: Box<PoolRpc>,
         /// Distinct second public history cache.
         peer_index: IndexStore,
+        /// Reviewed pool and dependency runtime pins both observers must run. Boxed to keep
+        /// this startup-configured enum from carrying the largest inline variant.
+        runtime: Box<PoolRuntimePins>,
     },
+}
+
+/// An agreement already checked against one access profile's terms.
+///
+/// Only a profile check in this module constructs it, so a backend that accepts one never
+/// re-derives which profile it was checked for. It says nothing about payment.
+pub struct CheckedAgreement {
+    evidence: SelectedAgreement,
+    agreement: VerifiedAgreement,
+}
+
+impl CheckedAgreement {
+    /// The selected agreement evidence that passed the profile check.
+    pub fn evidence(&self) -> &SelectedAgreement {
+        &self.evidence
+    }
+
+    /// Facts established by transcript replay and both participant authorizations.
+    pub fn agreement(&self) -> &VerifiedAgreement {
+        &self.agreement
+    }
+}
+
+impl fmt::Debug for CheckedAgreement {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CheckedAgreement { <redacted> }")
+    }
 }
 
 /// Agreement checked against matching finalized payment. Only the observers can construct it.
@@ -316,6 +357,34 @@ impl AccessPolicy {
         }
         verify_selected_agreement(evidence).map_err(|_| AccessError::Agreement)
     }
+
+    /// Checks the agreement against this snapshot profile and keeps it for payment checks.
+    pub fn check_agreement(
+        &self,
+        evidence: SelectedAgreement,
+    ) -> Result<CheckedAgreement, AccessError> {
+        let agreement = self.check(&evidence)?;
+        Ok(CheckedAgreement {
+            evidence,
+            agreement,
+        })
+    }
+}
+
+/// Maps a shielded verification failure to an access answer. Never an unpaid verdict.
+fn shielded_access_error(error: crate::disclosure::ShieldedDisclosureError) -> AccessError {
+    match error {
+        crate::disclosure::ShieldedDisclosureError::Payment => AccessError::Pending,
+        crate::disclosure::ShieldedDisclosureError::Observation(
+            crate::observation::ObservationError::Recovery(
+                crate::recovery::RecoveryError::HistoryPending { .. },
+            ),
+        )
+        | crate::disclosure::ShieldedDisclosureError::Observation(
+            crate::observation::ObservationError::FinalityPending,
+        ) => AccessError::Pending,
+        _ => AccessError::Observation,
+    }
 }
 
 /// Computes a domain-separated retrieval digest, not a payment authorization.
@@ -336,7 +405,7 @@ pub fn request_digest(
     let expiry = expires_at.to_be_bytes();
     let encoded = payment.map(X402Payment::encode);
     let mut preimage: Vec<&[u8]> = vec![
-        b"EREBUS_HTTP_ACCESS_REQUEST_V1",
+        ACCESS_REQUEST_TAG,
         &domain,
         &service_id,
         agreement.commitment.as_bytes(),
@@ -346,7 +415,7 @@ pub fn request_digest(
         &expiry,
     ];
     if let Some(encoded) = &encoded {
-        preimage[0] = b"EREBUS_HTTP_ACCESS_REQUEST_X402_V1";
+        preimage[0] = ACCESS_REQUEST_X402_TAG;
         preimage.push(encoded);
     }
     let digest = suite::keccak256(&preimage);
@@ -360,7 +429,7 @@ pub fn request_digest(
 /// Stable identity for one agreement's issuance at an independently configured service.
 pub fn issuance_id(service_id: &[u8; 32], commitment: &[u8; 32]) -> String {
     hex::encode(suite::keccak256(&[
-        b"EREBUS_ACCESS_ISSUANCE_V1",
+        ACCESS_ISSUANCE_TAG,
         service_id,
         commitment,
     ]))
@@ -374,7 +443,20 @@ impl AccessBackend {
         policy: &AccessPolicy,
         evidence: SelectedAgreement,
     ) -> Result<PaidAccess, AccessError> {
-        let agreement = policy.check(&evidence)?;
+        self.verify_checked(policy.check_agreement(evidence)?).await
+    }
+
+    /// Checks an agreement that already passed a profile check against configured, independent
+    /// final chain evidence. It does not re-check profile terms; the profile's issuer must.
+    /// Pending and unavailable observations never produce a PaidAccess value.
+    pub async fn verify_checked(
+        &self,
+        checked: CheckedAgreement,
+    ) -> Result<PaidAccess, AccessError> {
+        let CheckedAgreement {
+            evidence,
+            agreement,
+        } = checked;
         let reads = match self {
             Self::PublicBound {
                 chain,
@@ -413,22 +495,30 @@ impl AccessBackend {
                 index,
                 peer_rpc,
                 peer_index,
+                runtime,
             } => {
-                let payment =
-                    verify_shielded_payment(evidence.clone(), rpc, index, peer_rpc, peer_index)
-                        .await
-                        .map_err(|error| match error {
-                            crate::disclosure::ShieldedDisclosureError::Payment => {
-                                AccessError::Pending
-                            }
-                            crate::disclosure::ShieldedDisclosureError::Observation(
-                                crate::observation::ObservationError::Recovery(
-                                    crate::recovery::RecoveryError::HistoryPending { .. },
-                                ),
-                            ) => AccessError::Pending,
-                            _ => AccessError::Observation,
-                        })?;
-                payment.settlement
+                // Pool code is immutable, so checking the deployment origin is as strong as
+                // checking any later anchor, and it costs no observation scan.
+                let origin = index.domain().first_hash;
+                rpc.authenticate_runtime_at(origin, **runtime)
+                    .await
+                    .map_err(|_| AccessError::Observation)?;
+                peer_rpc
+                    .authenticate_runtime_at(origin, **runtime)
+                    .await
+                    .map_err(|_| AccessError::Observation)?;
+                verify_shielded_payment_certified(
+                    evidence.clone(),
+                    rpc,
+                    index,
+                    peer_rpc,
+                    peer_index,
+                    **runtime,
+                )
+                .await
+                .map_err(shielded_access_error)?
+                .payment
+                .settlement
             }
         };
         let Some(winner) = &reads.winner else {

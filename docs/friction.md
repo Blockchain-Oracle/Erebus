@@ -2137,3 +2137,146 @@ invalidated by the next refresh, nor that the catch-up cost is proportional to t
 the snapshot. An operator sees only `history_pending`. A documented "the scan is a lease on a
 snapshot; settlement refreshes it" rule, or a scan design that keeps a rolling verified prefix
 closer to the tip, would have made this obvious before a live run.
+
+## F58: The Metropolis rail leaves no room for agent-side price policy (2026-10-06)
+
+**What we were trying to do.** Run a procurement scenario where the buyer agent enforces a
+maximum unit price and the supplier agent a floor, over the Metropolis MCP servers.
+
+**What the stack did instead.** `negotiate_deal` takes only an operation ID. The role, price
+policy, and keys come from each operator's owner-only configuration file, and negotiation runs
+in Rust. The agent layer can sequence calls but cannot propose, counter, or reject a price.
+
+**Whether we worked around it.** Partly. The scenario's price logic runs on the mock client
+through the existing offer policies, and the auditor's compliance check (settled, consistent,
+under the buyer's ceiling) is a pure function over a disclosed record. On the Metropolis rail the
+ceiling lives in the operator's file, so the agent has nothing to enforce.
+
+**What would have made it easier.** A way for the agent to pass bounded parameters, such as a
+maximum total, into `negotiate_deal` that Rust checks against the operator policy, or a
+documented statement that price policy is operator-only on this rail.
+
+## F59: A pre-handshake clock rejected an honestly issued peer binding (2026-10-09)
+
+**What we were trying to do.** Restart a shielded negotiation with fresh signed identity
+bindings and continue through separate operator processes.
+
+**What the stack did instead.** The negotiation command captured time before the Noise
+handshake. A peer could issue its binding in the next second, but bootstrap validated it
+against the earlier timestamp and rejected it as future-dated. Scheduling determined whether
+the existing freeze/resume regression passed.
+
+**Whether we worked around it.** Fixed in bootstrap, not by allowing clock skew. The command
+supplies a clock that bootstrap samples after receiving the peer binding and at completion.
+Both bindings and descriptors must still be valid at completion. Future issuance, expiry,
+clock failure, and backwards clock movement fail closed. Deterministic tests reproduce the
+old refusal and exercise each boundary; the transport suite and freeze/resume regression pass.
+
+**What would have made it easier.** A bootstrap API that distinguished fixed logical time in
+tests from fresh validation time after blocking network operations.
+
+## F60: Native wrapping was tested separately from the pool asset (2026-10-09)
+
+**What we were trying to do.** Wrap native value, deposit WMON into a shielded pool,
+recover its note, withdraw it, and unwrap it through installed wallet commands.
+
+**What the stack did instead.** The local wrapper lacked `transferFrom`, so pool
+deposits reverted. After that fixture fix, the wallet rejected `wrapper == asset`.
+That equality is required when the pool's asset is the wrapped token. Previous
+tests used an unrelated ERC-20 pool and did not exercise this configuration.
+
+**Whether we worked around it.** Added allowance-based transfers to the local fixture.
+Three contract tests cover finite allowance, unlimited allowance, and rollback on
+insufficient funds. The wallet now accepts a nonzero wrapper equal to its asset.
+A regression test still rejects zero and malformed wrapper addresses. The circuits,
+signed formats, and pool contract are unchanged.
+
+**What would have made it easier.** An asset-specific wrapper pool in the original
+wallet test, rather than unrelated wrapper and ERC-20 operations in one test.
+
+## F61: A metered cursor hint ignored a missing stored response (2026-10-09)
+
+**What we were trying to do.** Recover prepaid access after a lost response, service
+restart, or damaged seller storage, without consuming a call twice.
+
+**What the stack did instead.** The issuer's next-index/status path checked call records
+but not their response blobs. A missing or altered response could therefore remain
+undetected while a later call consumed another unit. An older regression allowed this.
+
+**Whether we worked around it.** Fixed the record-read boundary: hint probes, status,
+and replay require the original blob, exact length, and hash. They establish directory
+durability before returning stored responses. Missing or altered blobs fail closed
+before another call consumes. The revised corruption tests and 42-boundary storage
+fault sweep pass. The installed five-call rehearsal also recovers without another payment.
+
+**What would have made it easier.** One complete definition of a committed call:
+both its record and its original durable response, not a cursor hint alone.
+
+## F62: Artifact redirects forwarded a source download token (2026-10-10)
+
+**What we tried.** Audited artifact HTTP requests during local proving and followed
+a redirect from a URL containing a synthetic download token to a second server.
+
+**What happened.** Reqwest's default automatic Referer header sent the original URL,
+including its query token, to the destination. No proof witness was involved. The
+redirect regression reproduced the token exposure before the fix.
+
+**Whether we worked around it.** The artifact client disables automatic referrers.
+The regression passes with unchanged redirect bounds, URL checks and artifact hashes.
+The source server still sees its own URL; this does not hide network metadata.
+
+**What would have made it easier.** Explicit request-field tests for every download
+hop, rather than testing file integrity and download counts alone.
+
+## F63: Relay authentication and HTTP errors had misleading boundaries (2026-10-10)
+
+**What we tried.** Reviewed startup token handling and actual HTTP responses to bad
+cursors, unauthorized writes and a corrupt mailbox index.
+
+**What happened.** An empty token counted as authenticated; insecure development mode
+still listened on all interfaces. Storage errors returned raw parser/I/O diagnostics.
+The opaque-byte API also cannot establish that arbitrary callers encrypted their blobs.
+
+**Whether we worked around it.** Empty/blank tokens are refused and insecure mode
+binds loopback. Read queries reject unknown fields; public errors are fixed messages.
+HTTP regressions and a real file-backed Noise exchange pass. The threat model now
+states that bearer access is not per-recipient authorization and encryption is client-side.
+
+**What would have made it easier.** Tests of the full HTTP/configuration boundary,
+in addition to the mailbox storage contract.
+
+## F66: Independently sampled fixture deadlines could disagree (2026-10-10)
+
+The fresh shielded-operator test computed the buyer and seller service deadlines with
+separate clock reads. Crossing a second made the two configured service promises differ.
+The seller correctly rejected the offer, and the buyer reported reconciliation failure.
+The fixture now samples one deadline for both templates, matching the public-bound test.
+No service-policy comparison, deadline bound or protocol rule was relaxed.
+
+## F65: Shared journal reads and locks followed existing symlinks (2026-10-10)
+
+Records, transaction blobs and lock opens followed links to files outside the journal.
+Opening a linked root or lock could also change the target's permissions.
+The storage engine now rejects existing symlinks and non-regular entries before reading
+or locking. New files request owner-only creation modes. Regression tests preserve the
+outside target's bytes and permissions and reject directory entries.
+Trusted parents and local ownership remain requirements: this does not prevent concurrent
+path replacement by a compromised owner, and it does not encrypt journal contents.
+
+## F64: Well-shaped native replies could carry private free-form details (2026-10-10)
+
+**What we tried.** Reviewed the SDK/MCP boundary with failure envelopes containing a
+synthetic private message, undecodable subprocess output and redirected resource paths.
+
+**What happened.** The access seam checked the error envelope but forwarded its message.
+Resource paths were arbitrary bounded strings. Subprocess decode errors were not covered
+by the access, proving, payment or disclosure wrappers' fixed-error handling.
+
+**Whether we worked around it.** Recognized error codes map to fixed public messages;
+unknown codes fail closed. MCP also uses this fixed public surface. Decode failures
+return recovery guidance, and the payment test makes one call with no automatic retry.
+Resource paths are confined to the configured journal layout. Installed seams pass.
+
+**What would have made it easier.** Adversarial tests inside valid envelopes, not only
+unknown JSON fields and explicit process failure codes. These guards do not protect a
+compromised host or make a malicious replacement binary trustworthy.

@@ -27,14 +27,163 @@ BINARY_GROUPS = {
     "sdk/evm": ["erebus-settle", "erebus-tx-relayer", "erebus-disclosure", "erebus-network-check"],
     "sdk/transport": ["erebus-relay"],
     "sdk/shielded": [
-        "erebus-negotiate", "erebus-payment", "erebus-local-prove", "erebus-artifacts",
-        "erebus-access", "erebus-access-service", "erebus-shielded-disclosure",
+        "erebus-negotiate", "erebus-payment", "erebus-wallet", "erebus-local-prove",
+        "erebus-artifacts", "erebus-access", "erebus-access-service", "erebus-shielded-disclosure",
         "erebus_pool_indexer",
     ],
 }
 PACKAGE_PATHS = ["packaging/erebus-cli", "sdk/py", "mcp-server"]
 PROJECT_NAMES = {"erebus-cli", "erebus-sdk", "erebus-mcp-server"}
 DEV_VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+\.dev[0-9]+", re.ASCII)
+
+
+# Inputs that reach a shipped wheel: the Rust crates the binaries link, the Python packages, the
+# packaging hook, and the launcher. Test trees and docs are excluded so concurrent test or doc
+# edits elsewhere in the shared tree do not invalidate a build.
+CANDIDATE_INPUTS = [
+    "sdk/rs", "sdk/evm", "sdk/transport", "sdk/shielded", "sdk/core", "sdk/journal", "sdk/coordinator",
+    "sdk/py/src", "sdk/py/pyproject.toml", "mcp-server/src", "mcp-server/pyproject.toml",
+    "packaging/erebus-cli", "packaging/metropolis/hatch_build.py", "scripts/metropolis-selfhost.sh", "LICENSE",
+]
+HEX64 = re.compile(r"[0-9a-f]{64}", re.ASCII)
+
+
+def git(*arguments: str) -> bytes:
+    return subprocess.check_output(["git", *arguments], cwd=ROOT)
+
+
+def candidate_identity() -> dict:
+    """Identify the exact working-tree candidate, including uncommitted and untracked inputs.
+
+    `source_tree_sha256` is SHA-256 over the sorted lines `<path>\0<file sha256>\n` for every
+    tracked or untracked, non-ignored file under CANDIDATE_INPUTS, excluding `tests` directories.
+    Anyone holding the same files recomputes it with `candidate_identity()`; a commit hash alone
+    cannot name a dirty candidate.
+    """
+    listed = git("ls-files", "-z", "--cached", "--others", "--exclude-standard", "--", *CANDIDATE_INPUTS)
+    files: dict[str, str] = {}
+    for raw in sorted(set(listed.split(b"\0")) - {b""}):
+        relative = raw.decode("utf-8")
+        if "tests" in Path(relative).parts:
+            continue
+        path = ROOT / relative
+        if path.is_symlink() or not path.exists():
+            continue  # tracked but deleted in the working tree; the status list records it
+        if not path.is_file():
+            raise ValueError("candidate inputs must be regular files")
+        files[relative] = sha256(path)
+    tree = hashlib.sha256("".join(f"{name}\0{digest}\n" for name, digest in sorted(files.items())).encode())
+    status = git("status", "--porcelain=v1", "-z", "--untracked-files=all", "--", *CANDIDATE_INPUTS)
+    entries = status.split(b"\0")
+    changed = []
+    index = 0
+    while index < len(entries):
+        entry = entries[index].decode("utf-8")
+        index += 1
+        if not entry:
+            continue
+        code, relative = entry[:2], entry[3:]
+        if code[0] in "RC":
+            index += 1  # the original path of a rename or copy follows as its own field
+        if "tests" in Path(relative).parts:
+            continue
+        changed.append({"path": relative, "status": code.strip(), "sha256": files.get(relative)})
+    merge = subprocess.run(["git", "rev-parse", "-q", "--verify", "MERGE_HEAD"], cwd=ROOT,
+                           capture_output=True, text=True, check=False).stdout.strip() or None
+    any_dirty = bool(git("status", "--porcelain"))
+    return {
+        "source_commit": git("rev-parse", "HEAD").decode().strip(),
+        "merge_head": merge,
+        "dirty_source": any_dirty,
+        "source_tree_sha256": tree.hexdigest(),
+        "source_tree_files": len(files),
+        "changed_inputs": changed,
+        # Publication needs a clean committed tree; a dirty build is rehearsal evidence only.
+        "release_eligible": not any_dirty and merge is None,
+        "evidence_scope": "team-rehearsal" if any_dirty or merge else "release-candidate",
+    }
+
+
+def require_same_candidate(before: dict, after: dict) -> None:
+    keys = ("source_commit", "merge_head", "source_tree_sha256")
+    if any(before[key] != after[key] for key in keys):
+        raise ValueError("candidate source changed during the build; rebuild from a stable tree")
+
+
+def proving_artifacts(manifest_file: Path, expected_sha256: str, signature_file: Path | None) -> dict:
+    """Record the proving manifest the release was qualified against; files are not bundled.
+
+    The digest must be pinned independently. Installed `erebus-artifacts` verifies every file
+    and the publisher signature at installation; this record lets the install check refuse a
+    prover request that names a different manifest.
+    """
+    if not HEX64.fullmatch(expected_sha256):
+        raise ValueError("proving manifest digest must be 64 lowercase hex characters")
+    data = manifest_file.read_bytes()
+    if hashlib.sha256(data).hexdigest() != expected_sha256:
+        raise ValueError("proving manifest identity mismatch")
+    manifest = json.loads(data)
+    if type(manifest.get("test_only")) is not bool or manifest.get("version") not in (1, 2):
+        raise ValueError("proving manifest must declare its version and fixture boundary")
+    circuits = {}
+    for circuit in manifest["circuits"]:
+        circuits[circuit["kind"]] = {kind: {"sha256": circuit[kind]["sha256"], "bytes": circuit[kind]["bytes"]}
+                                     for kind in ("wasm", "r1cs", "zkey")}
+        if "identity" in circuit:
+            circuits[circuit["kind"]]["identity"] = circuit["identity"]
+    record = {"manifest_sha256": expected_sha256, "version": manifest["version"],
+              "test_only": manifest["test_only"], "chain_id": manifest.get("chain_id"),
+              "settlement_contract": manifest.get("settlement_contract"),
+              "verifier_version": manifest.get("verifier_version"), "circuits": circuits,
+              "signature_sha256": None, "bundled_in_wheels": False}
+    if signature_file is not None:
+        record["signature_sha256"] = sha256(signature_file)
+    if not manifest["test_only"] and signature_file is None:
+        raise ValueError("non-test proving manifests require a detached publisher signature")
+    return record
+
+
+def proving_domains(records: list[dict]) -> list[dict]:
+    """One recorded manifest per pool domain; artifact bytes may be shared, domains may not."""
+    digests = [record["manifest_sha256"] for record in records]
+    domains = [(record["chain_id"], str(record["settlement_contract"]).lower()) for record in records]
+    if len(set(digests)) != len(digests) or len(set(domains)) != len(domains):
+        raise ValueError("each proving manifest must name a distinct pool domain")
+    if len({record["test_only"] for record in records}) > 1:
+        raise ValueError("proving manifests disagree about the fixture boundary")
+    return records
+
+
+DEPLOYMENT_SCHEMAS = {"erebus-shielded-disclosure": "sdk/shielded/src/bin/erebus_shielded_disclosure.rs"}
+
+
+def deployment_schemas(root: Path = ROOT) -> dict:
+    """Field lists of the strict (`deny_unknown_fields`) deployment configs the packaged binaries parse,
+    read from the source they were built from, so configs can be checked against these exact packages."""
+    schemas = {}
+    for binary, relative in DEPLOYMENT_SCHEMAS.items():
+        source = (root / relative).read_text()
+        match = re.search(r"#\[serde\(deny_unknown_fields\)\]\s*struct Deployment \{(.*?)\n\}", source, re.S)
+        if match is None:
+            raise ValueError(f"deployment schema not found for {binary}")
+        fields = re.findall(r"^\s+(?:pub\s+)?([a-z_][a-z0-9_]*)\s*:", match.group(1), re.M)
+        if not fields:
+            raise ValueError(f"deployment schema for {binary} is empty")
+        schemas[binary] = {"fields": fields, "strict": True, "source": relative,
+                           "source_sha256": hashlib.sha256(source.encode()).hexdigest()}
+    return schemas
+
+
+def require_deployment(deployment: Path, proving: list[dict] | None) -> dict:
+    """Refuse packages that do not record exactly one proving manifest per deployed pool."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("metropolis_stage_artifacts", ROOT / "packaging/metropolis/stage_artifacts.py")
+    staging = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(staging)
+    coverage = staging.deployment_coverage(deployment, {"proving_domains": proving or []})
+    if not coverage["complete"]:
+        raise ValueError("proving manifests do not cover the deployment: " + "; ".join(coverage["problems"]))
+    return coverage
 
 
 def sha256(path: Path) -> str:
@@ -263,7 +412,8 @@ def build_index(wheels: Path, destination: Path, base_url: str | None = None) ->
     return projects
 
 
-def build(version: str, output: Path, profile: str, build_native: bool, base_url: str | None = None) -> dict:
+def build(version: str, output: Path, profile: str, build_native: bool, base_url: str | None = None,
+          proving: list[dict] | None = None, deployment: dict | None = None) -> dict:
     if not DEV_VERSION.fullmatch(version):
         raise ValueError("use a dev prerelease version, for example 0.3.0.dev20261003")
     if output.exists() or profile not in {"debug", "release"}:
@@ -271,6 +421,7 @@ def build(version: str, output: Path, profile: str, build_native: bool, base_url
     uv = shutil.which("uv")
     if not uv:
         raise ValueError("uv is required")
+    candidate = candidate_identity()
     binaries: dict[str, Path] = {}
     for crate, names in BINARY_GROUPS.items():
         if build_native:
@@ -289,8 +440,6 @@ def build(version: str, output: Path, profile: str, build_native: bool, base_url
             validate_binary(binary)
             binaries[name] = binary
     notices, notice_summary = third_party_notices()
-    source_commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
-    dirty = bool(subprocess.check_output(["git", "status", "--porcelain"], cwd=ROOT))
     output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="metropolis-package-") as staging:
         stage = Path(staging)
@@ -320,9 +469,12 @@ def build(version: str, output: Path, profile: str, build_native: bool, base_url
                            cwd=stage, env=environment, check=True)
         require_licenses(wheels)
         build_index(wheels, registry / "simple", base_url)
+        # The shared tree can change while cargo runs; refuse a build that mixes two candidates.
+        require_same_candidate(candidate, candidate_identity())
         manifest = {
             "version": version, "channel": "metropolis-testnet", "published": False,
-            "build_profile": profile, "source_commit": source_commit, "dirty_source": dirty,
+            "build_profile": profile, "source_commit": candidate["source_commit"],
+            "dirty_source": candidate["dirty_source"], "candidate": candidate,
             "platform": sysconfig.get_platform(), "portability_audit": False,
             "platform_qualification": {
                 "host": sysconfig.get_platform(),
@@ -334,6 +486,10 @@ def build(version: str, output: Path, profile: str, build_native: bool, base_url
             "launchers": {"erebus-selfhost": {"sha256": sha256(ROOT / "scripts/metropolis-selfhost.sh")}},
             "wheels": {path.name: {"sha256": sha256(path), "bytes": path.stat().st_size} for path in sorted(wheels.glob("*.whl"))},
             "test_only_artifacts_included": False,
+            "proving_artifacts": proving[0] if proving and len(proving) == 1 else None,
+            "proving_domains": proving or [],
+            "deployment_coverage": deployment,
+            "deployment_schemas": deployment_schemas(),
             "licenses": {"project": "Apache-2.0", "third_party": notice_summary},
         }
         (registry / "release.json").write_text(json.dumps(manifest, indent=2) + "\n")
@@ -350,7 +506,15 @@ def main() -> None:
     parser.add_argument("--base-url", help="absolute base URL for wheel links, e.g. a release download URL")
     parser.add_argument("--index-only", action="store_true", help="rebuild the index from an existing wheel directory")
     parser.add_argument("--wheels", type=Path, help="wheel directory for --index-only")
+    parser.add_argument("--proving-manifest", type=Path, action="append", default=[], help="repeatable, one per pool domain: proving artifact manifest to record (files are not bundled)")
+    parser.add_argument("--proving-manifest-sha256", action="append", default=[], help="repeatable, in --proving-manifest order: independently pinned SHA-256")
+    parser.add_argument("--require-deployment", type=Path, help="deployment record whose every pool must have exactly one recorded proving manifest")
+    parser.add_argument("--proving-signature", type=Path, action="append", default=[], help="repeatable, in --proving-manifest order: detached publisher signature envelope")
+    parser.add_argument("--identify", action="store_true", help="print the working-tree candidate identity and exit")
     args = parser.parse_args()
+    if args.identify:
+        print(json.dumps(candidate_identity(), indent=2))
+        return
     try:
         if args.index_only:
             if args.wheels is None:
@@ -358,11 +522,24 @@ def main() -> None:
             build_index(args.wheels, args.output.resolve(), args.base_url)
             print(json.dumps({"status": "indexed", "output": str(args.output.resolve())}))
             return
-        manifest = build(args.version, args.output.resolve(), args.profile, args.build, args.base_url)
-    except (ValueError, OSError, subprocess.CalledProcessError):
-        raise SystemExit("Metropolis registry build failed; no publication was attempted") from None
+        proving = None
+        if args.proving_manifest or args.proving_manifest_sha256 or args.proving_signature:
+            if len(args.proving_manifest) != len(args.proving_manifest_sha256):
+                raise ValueError("each --proving-manifest requires its --proving-manifest-sha256")
+            if args.proving_signature and len(args.proving_signature) != len(args.proving_manifest):
+                raise ValueError("give a --proving-signature for every --proving-manifest, or none")
+            signatures = [path.resolve() for path in args.proving_signature] or [None] * len(args.proving_manifest)
+            proving = proving_domains([proving_artifacts(path.resolve(), pin, signature) for path, pin, signature
+                                       in zip(args.proving_manifest, args.proving_manifest_sha256, signatures)])
+        coverage = require_deployment(args.require_deployment.resolve(), proving) if args.require_deployment else None
+        manifest = build(args.version, args.output.resolve(), args.profile, args.build, args.base_url, proving, coverage)
+    except (ValueError, OSError, KeyError, TypeError, subprocess.CalledProcessError) as error:
+        detail = str(error) if isinstance(error, ValueError) else type(error).__name__
+        raise SystemExit(f"Metropolis registry build failed ({detail}); no publication was attempted") from None
     print(json.dumps({"status": "built", "channel": manifest["channel"], "version": args.version,
-                      "output": str(args.output.resolve()), "published": False}))
+                      "output": str(args.output.resolve()), "published": False,
+                      "source_tree_sha256": manifest["candidate"]["source_tree_sha256"],
+                      "release_eligible": manifest["candidate"]["release_eligible"]}))
 
 
 if __name__ == "__main__":

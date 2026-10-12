@@ -32,6 +32,7 @@ sha2 = "0.10"
 thiserror = "2"
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time", "fs", "io-util"] }
+futures-util = "0.3"
 
 [lints.rust]
 missing_docs = "warn"
@@ -69,3 +70,7 @@ path = "src/bin/erebus_negotiate.rs"
 [[bin]]
 name = "erebus-payment"
 path = "src/bin/erebus_payment.rs"
+
+[[bin]]
+name = "erebus-wallet"
+path = "src/bin/erebus_wallet.rs"

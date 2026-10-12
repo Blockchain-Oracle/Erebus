@@ -3,7 +3,8 @@
 use std::{io::Read, path::PathBuf, time::Duration};
 
 use erebus_shielded_prover::artifacts::{
-    ArtifactRelease, CircuitKind, InstallOptions, MAX_MANIFEST_BYTES,
+    ArtifactRelease, CircuitKind, InstallOptions, ManifestAuthorization, ManifestSignature,
+    MAX_MANIFEST_BYTES,
 };
 use serde::Deserialize;
 
@@ -12,6 +13,8 @@ use serde::Deserialize;
 struct Request {
     manifest_file: PathBuf,
     manifest_sha256: String,
+    #[serde(default)]
+    manifest_authorization: Option<ManifestAuthorization>,
     circuit: CircuitKind,
     cache_root: PathBuf,
     #[serde(default)]
@@ -20,14 +23,66 @@ struct Request {
     allow_loopback_http: bool,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SignRequest {
+    manifest_file: PathBuf,
+    publisher_key_file: PathBuf,
+}
+
+fn sign_manifest(request: SignRequest) -> Result<serde_json::Value, &'static str> {
+    let metadata = std::fs::symlink_metadata(&request.publisher_key_file)
+        .map_err(|_| "publisher key unavailable")?;
+    if !metadata.is_file() || metadata.len() != 32 {
+        return Err("publisher key must be a regular 32-byte file");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err("publisher key must be owner-only");
+        }
+    }
+    #[cfg(not(unix))]
+    return Err("publisher key permissions unsupported");
+    let mut secret = zeroize::Zeroizing::new(Vec::new());
+    std::fs::File::open(&request.publisher_key_file)
+        .map_err(|_| "publisher key unavailable")?
+        .take(33)
+        .read_to_end(&mut secret)
+        .map_err(|_| "publisher key unavailable")?;
+    if secret.len() != 32 {
+        return Err("publisher key must contain exactly 32 bytes");
+    }
+    let publisher = erebus_transport::identity::AuthorizationIdentity::from_bytes(&secret)
+        .map_err(|_| "invalid publisher key")?;
+    let metadata =
+        std::fs::symlink_metadata(&request.manifest_file).map_err(|_| "manifest unavailable")?;
+    if !metadata.is_file() || metadata.len() > MAX_MANIFEST_BYTES as u64 {
+        return Err("manifest unavailable");
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::open(&request.manifest_file)
+        .map_err(|_| "manifest unavailable")?
+        .take((MAX_MANIFEST_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "manifest unavailable")?;
+    let signature =
+        ManifestSignature::sign(&bytes, &publisher).map_err(|_| "manifest signing failed")?;
+    Ok(
+        serde_json::json!({"status":"ok", "publisher":format!("0x{}", hex::encode(publisher.address())), "signature":signature}),
+    )
+}
+
 #[tokio::main]
 async fn main() {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     if args.len() == 1 && args[0] == "--help" {
-        println!("erebus-artifacts: install public artifacts from an independently hash-pinned manifest.\nOne JSON request on stdin: manifest_file, manifest_sha256, circuit, cache_root.\nPrototype keys and loopback HTTP require explicit development opt-in. No witnesses or wallet keys are read.");
+        println!("erebus-artifacts: install public artifacts from an independently pinned manifest.\nOne JSON request on stdin: manifest_file, manifest_sha256, circuit, cache_root, optional manifest_authorization.\nNon-test releases require a pinned publisher and detached signature.\n--sign-manifest: publisher-only request with manifest_file and owner-only publisher_key_file.\nPrototype keys and loopback HTTP require explicit development opt-in.");
         return;
     }
-    if !args.is_empty() {
+    let signing = args.len() == 1 && args[0] == "--sign-manifest";
+    if !args.is_empty() && !signing {
         finish(Err("unexpected arguments"));
     }
     let mut bytes = Vec::new();
@@ -38,6 +93,10 @@ async fn main() {
         || bytes.len() > 16_384
     {
         finish(Err("invalid request size"));
+    }
+    if signing {
+        let request = serde_json::from_slice(&bytes).map_err(|_| "invalid signing request");
+        finish(request.and_then(sign_manifest));
     }
     let request: Request = match serde_json::from_slice(&bytes) {
         Ok(request) => request,
@@ -61,8 +120,12 @@ async fn install(request: Request) -> Result<serde_json::Value, &'static str> {
     file.take((MAX_MANIFEST_BYTES + 1) as u64)
         .read_to_end(&mut bytes)
         .map_err(|_| "manifest unavailable")?;
-    let release = ArtifactRelease::authenticate(&bytes, expected)
-        .map_err(|_| "manifest not authenticated")?;
+    let release = ArtifactRelease::authenticate_authorized(
+        &bytes,
+        expected,
+        request.manifest_authorization.as_ref(),
+    )
+    .map_err(|_| "manifest not authenticated")?;
     let installed = release
         .install(
             request.circuit,

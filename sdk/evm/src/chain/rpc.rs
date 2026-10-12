@@ -144,6 +144,47 @@ impl EvmChain {
         Ok(result)
     }
 
+    /// Executes one read-only `eth_call` at the latest block.
+    /// No transaction is created, signed, persisted, or sent.
+    pub async fn call(&self, to: [u8; 20], data: &[u8]) -> Result<Vec<u8>, EvmError> {
+        use alloy::rpc::types::TransactionRequest;
+        self.check_chain().await?;
+        let request = TransactionRequest::default()
+            .to(Address::from(to))
+            .input(Bytes::copy_from_slice(data).into());
+        let result = tokio::time::timeout(self.timeout, self.provider.call(request))
+            .await
+            .map_err(|_| EvmError::Rpc("read call timed out".into()))?
+            .map_err(|_| EvmError::Rpc("read call failed".into()))?;
+        Ok(result.to_vec())
+    }
+
+    /// Executes one read-only `eth_call` pinned to a block number.
+    /// No transaction is created, signed, persisted, or sent.
+    pub async fn call_at(
+        &self,
+        to: [u8; 20],
+        data: &[u8],
+        block_number: u64,
+    ) -> Result<Vec<u8>, EvmError> {
+        self.check_chain().await?;
+        let request = self.provider.client().request::<_, Bytes>(
+            "eth_call",
+            (
+                serde_json::json!({
+                    "to": Address::from(to),
+                    "input": Bytes::copy_from_slice(data),
+                }),
+                format!("0x{block_number:x}"),
+            ),
+        );
+        let result = tokio::time::timeout(self.timeout, request)
+            .await
+            .map_err(|_| EvmError::Rpc("pinned read call timed out".into()))?
+            .map_err(|_| EvmError::Rpc("pinned read call failed".into()))?;
+        Ok(result.to_vec())
+    }
+
     /// Reads the gas payer's balance after checking the configured chain.
     /// No allowance, payment authorization, or transaction is created.
     pub async fn gas_payer_balance(&self, sender: [u8; 20]) -> Result<u128, EvmError> {
@@ -274,12 +315,33 @@ impl EvmChain {
         fees: Eip1559Fees,
         gas_limit: u64,
     ) -> Result<SigningPlan, NonceError> {
+        self.reserve_nonce_for_call_with_value(
+            journal, prepared, target, calldata, 0, fees, gas_limit,
+        )
+        .await
+    }
+
+    /// Reserves the same durable nonce lane for a call with an explicit native value.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn reserve_nonce_for_call_with_value(
+        &self,
+        journal: &SignerJournal,
+        prepared: &PreparedSettlement,
+        target: [u8; 20],
+        calldata: &[u8],
+        value: u128,
+        fees: Eip1559Fees,
+        gas_limit: u64,
+    ) -> Result<SigningPlan, NonceError> {
         let (chain_id, sender) = journal.account();
         if chain_id != self.deployment.chain_id {
             return Err(NonceError::Conflict);
         }
         if let Some(plan) = journal.resume_call(&self.deployment, prepared, target, calldata)? {
-            if plan.params().fees != fees || plan.params().gas_limit != gas_limit {
+            if plan.params().fees != fees
+                || plan.params().gas_limit != gas_limit
+                || plan.params().value != value
+            {
                 return Err(NonceError::Conflict);
             }
             return Ok(plan);
@@ -291,11 +353,12 @@ impl EvmChain {
         if latest != pending {
             return Err(NonceError::Busy);
         }
-        journal.reserve_call(
+        journal.reserve_call_with_value(
             &self.deployment,
             prepared,
             target,
             calldata,
+            value,
             latest,
             fees,
             gas_limit,
@@ -329,6 +392,10 @@ impl EvmChain {
     }
 
     /// Validates the exact stored bytes against a backend-validated call before sending.
+    ///
+    /// The plan and claim bind the full call (target, calldata, sender, nonce, fees), so the
+    /// caller validates the target when it builds the call. Settlement callers pass the
+    /// deployment's settlement contract; explicit wallet operations may pass a token.
     pub async fn broadcast_call(
         &self,
         plan: &SigningPlan,
@@ -336,7 +403,7 @@ impl EvmChain {
         target: [u8; 20],
         calldata: &[u8],
     ) -> Result<Broadcast, EvmError> {
-        if target != self.deployment.settlement_contract {
+        if target == [0; 20] {
             return Err(EvmError::SignedIntentMismatch);
         }
         plan.validate_call(self.deployment.chain_id, target, calldata, raw)?;

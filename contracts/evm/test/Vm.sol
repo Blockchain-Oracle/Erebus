@@ -15,6 +15,8 @@ interface Vm {
 
     function prank(address sender) external;
 
+    function deal(address account, uint256 balance) external;
+
     function warp(uint256 timestamp) external;
 
     function chainId(uint256 newChainId) external;

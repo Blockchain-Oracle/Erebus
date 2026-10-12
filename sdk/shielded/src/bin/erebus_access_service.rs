@@ -1,4 +1,5 @@
-//! Immutable snapshot access, authenticated by the buyer and gated by finalized payment.
+//! Immutable snapshot access, or prepaid metered access, authenticated by the buyer and gated
+//! by finalized payment.
 
 use std::{
     io::Read,
@@ -21,12 +22,16 @@ use erebus_evm::{
     x402::EXACT_PERMIT2_PROXY,
 };
 use erebus_shielded_prover::{
+    access::metered::{
+        http::{FeedFile, MeteredService},
+        DeploymentBinding, MeteredIssuer, MeteredPolicy, MeteredProfile,
+    },
     access::x402::{payment_required_header, verify_payment_header, Facilitator},
     access::{
         AccessBackend, AccessError, AccessIssuer, AccessPolicy, AccessRequest, MAX_RESOURCE_BYTES,
     },
     index_store::{IndexDomain, IndexStore},
-    rpc::PoolRpc,
+    rpc::{PoolRpc, PoolRuntimePins},
 };
 use erebus_transport::disclosure::{SelectedAgreement, MAX_DISCLOSURE_BYTES};
 use serde::Deserialize;
@@ -41,11 +46,58 @@ struct Config {
     seller_key: Vec<u8>,
     suite_id: u16,
     resource: String,
-    payload_file: PathBuf,
+    #[serde(default)]
+    profile: Profile,
+    /// Snapshot profile only: the immutable payload.
+    #[serde(default)]
+    payload_file: Option<PathBuf>,
+    /// Metered profile only: the signed response cap of the v1 profile.
+    #[serde(default)]
+    max_response_bytes: Option<u32>,
+    /// Metered profile only: the seller-owned feed, read when a call consumes a new index.
+    #[serde(default)]
+    feed_file: Option<PathBuf>,
     evidence_root: PathBuf,
     state_root: PathBuf,
     port: u16,
     backend: Backend,
+}
+
+#[derive(Deserialize, Default, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum Profile {
+    #[default]
+    Snapshot,
+    Metered,
+}
+
+/// Rejects mixed profile fields and metered rails before any chain connection.
+fn check_profile(config: &Config) -> Result<(), &'static str> {
+    match config.profile {
+        Profile::Snapshot => {
+            if config.payload_file.is_none() {
+                return Err("snapshot profile requires payload_file");
+            }
+            if config.max_response_bytes.is_some() || config.feed_file.is_some() {
+                return Err("metered fields require the metered profile");
+            }
+        }
+        Profile::Metered => {
+            if matches!(config.backend, Backend::X402Exact { .. }) {
+                return Err("metered access cannot use the x402_exact rail");
+            }
+            if !matches!(config.backend, Backend::Shielded { .. }) {
+                return Err("metered access requires the shielded backend");
+            }
+            if config.payload_file.is_some()
+                || config.max_response_bytes.is_none()
+                || config.feed_file.is_none()
+            {
+                return Err("metered profile requires max_response_bytes and feed_file only");
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -82,7 +134,34 @@ enum Backend {
         peer_rpc_url: String,
         first_block: u64,
         first_hash: [u8; 32],
+        runtime_keccak256: String,
+        poseidon_keccak256: String,
+        deposit_verifier_keccak256: String,
+        transfer_verifier_keccak256: String,
+        withdraw_verifier_keccak256: String,
+        #[serde(default = "default_log_concurrency")]
+        max_concurrent_queries: u64,
     },
+}
+
+/// Parses one lowercase-hex 32-byte deployment pin. A zero pin is never valid.
+fn digest(value: &str) -> Result<[u8; 32], &'static str> {
+    let value = value.strip_prefix("0x").unwrap_or(value);
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err("invalid deployment pin");
+    }
+    let bytes: [u8; 32] = hex::decode(value)
+        .map_err(|_| "invalid deployment pin")?
+        .try_into()
+        .map_err(|_| "invalid deployment pin")?;
+    if bytes == [0; 32] {
+        return Err("zero deployment pin");
+    }
+    Ok(bytes)
 }
 
 fn default_log_concurrency() -> u64 {
@@ -129,7 +208,7 @@ fn bounded_file(
 #[tokio::main]
 async fn main() {
     if std::env::args().nth(1).as_deref() == Some("--help") {
-        println!("erebus_access_service: owner-only JSON configuration in EREBUS_ACCESS_CONFIG.\nGET /healthz; POST /v1/access with a short-lived signature from the buyer agreement key.\nListen is loopback-only; place an authenticated TLS gateway in front for remote clients.\nObservation backends cannot submit payments. Explicit x402_exact mode signs and fences one seller-funded transaction for a buyer-authorized permit. Retries observe the persisted transaction without resubmitting.\nStore state persistently for payment and delivery recovery.");
+        println!("erebus_access_service: owner-only JSON configuration in EREBUS_ACCESS_CONFIG.\nGET /healthz; POST /v1/access (profile snapshot, the default) or POST /v1/metered (profile metered, shielded backend only) with a short-lived signature from the buyer agreement key.\nListen is loopback-only; place an authenticated TLS gateway in front for remote clients.\nObservation backends cannot submit payments. Explicit x402_exact mode signs and fences one seller-funded transaction for a buyer-authorized permit. Retries observe the persisted transaction without resubmitting.\nStore state persistently for payment and delivery recovery.");
         return;
     }
     if let Err(error) = run().await {
@@ -155,19 +234,26 @@ async fn run() -> Result<(), &'static str> {
             return Err("evidence directory must be owner-only");
         }
     }
-    let payload = bounded_file(&config.payload_file, MAX_RESOURCE_BYTES, false)?.to_vec();
-    let issuer = AccessIssuer::open(
-        config.state_root.join("issuance"),
-        AccessPolicy {
-            service_id: config.service_id,
-            seller: KeyBytes::new(config.seller_key).map_err(|_| "invalid seller identity")?,
-            suite_id: config.suite_id,
-            resource: config.resource,
-            payload,
-        },
-    )
-    .map_err(|_| "access policy or storage unavailable")?;
+    check_profile(&config)?;
+    let seller = KeyBytes::new(config.seller_key).map_err(|_| "invalid seller identity")?;
+    let issuer = match &config.payload_file {
+        Some(payload_file) => Some(
+            AccessIssuer::open(
+                config.state_root.join("issuance"),
+                AccessPolicy {
+                    service_id: config.service_id,
+                    seller: seller.clone(),
+                    suite_id: config.suite_id,
+                    resource: config.resource.clone(),
+                    payload: bounded_file(payload_file, MAX_RESOURCE_BYTES, false)?.to_vec(),
+                },
+            )
+            .map_err(|_| "access policy or storage unavailable")?,
+        ),
+        None => None,
+    };
     let mut facilitator = None;
+    let mut deployment = None;
     let backend = match config.backend {
         Backend::X402Exact {
             namespace,
@@ -286,17 +372,40 @@ async fn run() -> Result<(), &'static str> {
             peer_rpc_url,
             first_block,
             first_hash,
+            runtime_keccak256,
+            poseidon_keccak256,
+            deposit_verifier_keccak256,
+            transfer_verifier_keccak256,
+            withdraw_verifier_keccak256,
+            max_concurrent_queries,
         } => {
             let pool = parse_lowercase_address(&pool).ok_or("invalid pool")?;
+            let runtime = PoolRuntimePins {
+                pool: digest(&runtime_keccak256)?,
+                poseidon: digest(&poseidon_keccak256)?,
+                deposit: digest(&deposit_verifier_keccak256)?,
+                transfer: digest(&transfer_verifier_keccak256)?,
+                withdraw: digest(&withdraw_verifier_keccak256)?,
+            };
+            deployment = Some(DeploymentBinding {
+                chain_id,
+                pool,
+                first_block,
+                first_hash,
+                runtime,
+            });
             let domain = IndexDomain {
                 chain_id,
                 pool,
                 first_block,
                 first_hash,
             };
-            let rpc = PoolRpc::new(&rpc_url, chain_id, pool).map_err(|_| "invalid pool RPC")?;
-            let peer_rpc =
-                PoolRpc::new(&peer_rpc_url, chain_id, pool).map_err(|_| "invalid peer pool RPC")?;
+            let rpc = PoolRpc::new(&rpc_url, chain_id, pool)
+                .and_then(|rpc| rpc.with_max_concurrent_reads(max_concurrent_queries))
+                .map_err(|_| "invalid pool RPC")?;
+            let peer_rpc = PoolRpc::new(&peer_rpc_url, chain_id, pool)
+                .and_then(|rpc| rpc.with_max_concurrent_reads(max_concurrent_queries))
+                .map_err(|_| "invalid peer pool RPC")?;
             if rpc.shares_endpoint(&peer_rpc) {
                 return Err("configure distinct pool observers");
             }
@@ -310,27 +419,65 @@ async fn run() -> Result<(), &'static str> {
                     domain,
                 )
                 .map_err(|_| "invalid peer pool history")?,
+                runtime: Box::new(runtime),
             })
         }
     };
-    let app = App {
-        issuer: Arc::new(issuer),
-        backend: backend.map(Arc::new),
-        facilitator,
-        evidence_root: config.evidence_root,
-        slots: Arc::new(Semaphore::new(16)),
+    let submits = facilitator.is_some();
+    let routes = match (config.profile, issuer) {
+        (Profile::Snapshot, Some(issuer)) => Router::new()
+            .route("/v1/access", post(access))
+            .with_state(App {
+                issuer: Arc::new(issuer),
+                backend: backend.map(Arc::new),
+                facilitator,
+                evidence_root: config.evidence_root,
+                slots: Arc::new(Semaphore::new(16)),
+            }),
+        (Profile::Metered, None) => {
+            let backend = backend.ok_or("metered access requires the shielded backend")?;
+            let observers = backend
+                .shielded_observers()
+                .ok_or("metered access requires the shielded backend")?;
+            let profile = MeteredProfile::new(config.max_response_bytes.unwrap_or(0))
+                .map_err(|_| "invalid metered response cap")?;
+            let feed = FeedFile::new(
+                config
+                    .feed_file
+                    .ok_or("metered profile requires feed_file")?,
+                &profile,
+            );
+            let deployment = deployment.ok_or("metered access requires the shielded backend")?;
+            let issuer = MeteredIssuer::open(
+                config.state_root.join("metered"),
+                MeteredPolicy {
+                    service_id: config.service_id,
+                    seller,
+                    suite_id: config.suite_id,
+                    resource: config.resource,
+                    profile,
+                },
+                observers,
+                deployment,
+            )
+            .map_err(|_| "metered policy or storage unavailable")?;
+            MeteredService::new(issuer, Arc::new(backend), feed, config.evidence_root, 16).router()
+        }
+        _ => return Err("invalid access profile"),
+    };
+    let profile = match config.profile {
+        Profile::Snapshot => "snapshot",
+        Profile::Metered => "metered",
     };
     let router = Router::new()
         .route(
             "/healthz",
-            get({
-                let submits = app.facilitator.is_some();
-                move || async move { Json(json!({"status":"ok","payment_submission":submits})) }
+            get(move || async move {
+                Json(json!({"status":"ok","profile":profile,"payment_submission":submits}))
             }),
         )
-        .route("/v1/access", post(access))
-        .layer(DefaultBodyLimit::max(8192))
-        .with_state(app);
+        .merge(routes)
+        .layer(DefaultBodyLimit::max(8192));
     let listener = tokio::net::TcpListener::bind((IpAddr::V4(Ipv4Addr::LOCALHOST), config.port))
         .await
         .map_err(|_| "cannot bind access service")?;

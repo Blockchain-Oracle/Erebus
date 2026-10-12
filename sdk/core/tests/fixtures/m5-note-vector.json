@@ -1,4 +1,8 @@
 {
+  "chainId": "10143",
+  "poolHex": "5fc8d32690cc91d4c39d9d3abcbd16989f875707",
+  "verifierVersion": "2",
+  "noteDomainHex": "13d7f9b2f5fca8f6bd4e2bc0f75afb5cee15f133a070d4e9702b18b9d05b7dbf",
   "assetHex": "5fbdb2315678afecb367f032d93f642f64180aa3",
   "input": {
     "amount": "150",
@@ -6,10 +10,10 @@
     "spendSecretHex": "0182c996f69200665dc3f75a04f6f370c62e184e7b106fb66350c993b4edca01",
     "spendTagHex": "1e2ba2b26fdc8e9820a4088a6218ff7e3ba0fe16f14d3bad88b0727ee3f24497",
     "saltHex": "0ca06b7848111af41bea1972745aa9d58cfb89a3d88f16aae61283a7773f4ed8",
-    "commitmentHex": "0f581b2837ba22f4e6fc9f017ab44a8b628141f747569e57869cf48a25b98ff0",
-    "nullifierHex": "2a6aa3a83091d8a6128dcf1d2627eb17e790abca1fe61099092f422f83cde44f",
+    "commitmentHex": "0d96e4aa62480ff2e038867845455599b66d7316f77d5996b8375a1668c5ecdc",
+    "nullifierHex": "15d815e052a9ee96e3b8249c3e1464c60c6c5b8b3e9df9b4cfc285665deb6e97",
     "index": 0,
-    "rootHex": "25b31a46f54fc20668951e5c2673a980b3f5811c46e615ea051e6f80aea82135"
+    "rootHex": "0dfc614bf970d199ca11ac378ad2bbb8a6c47e1011efe508be2ba45c0315a611"
   },
   "payment": {
     "amount": "70",
@@ -17,10 +21,19 @@
     "spendSecretHex": "14f496f58584c63e2ff60b82e9c51c1fbf04840113d69ed406e4f734b6c4c6d3",
     "spendTagHex": "107161b57dc94ecaca856628e108d02914d98d5efad07e21fa86daad46545498",
     "saltHex": "114f072a6e257377b0b772a522ef3c8a3d0179ea18b65df9c481c0626044be9e",
-    "commitmentHex": "11d1d71ca4b2a537e2bc223eee1870f3e1553216d9d59fb66126d09241ed0197",
-    "nullifierHex": "22cd267912e8943000612b277dd9dbddc2af178ae797fa290342f8c51a6f8d8f",
+    "commitmentHex": "125e47729caf7275a7303eeb28b255741756d7749148f9455e81259e6de88d87",
+    "nullifierHex": "2571ec72812a06df248655f08ec2680fd9ea497f7ad52cdad07a3d0aa3c08fa5",
     "index": 1,
-    "rootHex": "1893661446b3b8f161d1faa0928fc7f126452148b6d1ab3363f94a87eec226f9"
+    "rootHex": "14792b9acfed212655c7238c3a97f295301481212a41892e61b62fa03d5d351e"
   },
-  "changeCommitmentHex": "14468e1f974b7869f2fd11e0220b5a4d7f6a6a324b52f33b8e8a91f4bb10569e"
+  "change": {
+    "amount": "80",
+    "ownerHex": "207da3420047cd4a38bc1f0dd092ea03cbdbd5f01fa45d877bf4b8a532e4c91a1497069db1d64ed9ed6670a822111b4c8bd0c3cd00dccb6af96d890bd61cbfd7",
+    "spendSecretHex": "2c7d0505f1a684b88f6e1ee803ec1c9f7bd8f138fe7d80ee9faab9db42d7b11c",
+    "spendTagHex": "10e57ed2489b82d025e085522b9a1cfce721cdc7c38bd3f5c7559a51b9202e11",
+    "saltHex": "216200263d70a6ca7f024f7e3a46bc599c755c596f7a41ae76ad84b37908ba4e",
+    "commitmentHex": "1388c08f4d6d77eaec4fe718a66bc940518889d93031e494e893cf8e8c80aabc",
+    "nullifierHex": "087cd63daffca491a1642e63fd285266d8ed63f2741a206714a9b4d9024ad94c"
+  },
+  "changeCommitmentHex": "1388c08f4d6d77eaec4fe718a66bc940518889d93031e494e893cf8e8c80aabc"
 }

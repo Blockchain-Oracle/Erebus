@@ -414,9 +414,62 @@ jobs:
         working-directory: sdk/shielded
         run: cargo test --locked --test local_proof -- --ignored
 
+      - name: Reject mutated candidate witnesses without emitting private inputs
+        working-directory: circuits/m5
+        run: npm run test:negative-witness
+
+      - name: Check seeded private conservation sequences with real verifiers
+        working-directory: circuits/m5
+        env:
+          NODE_OPTIONS: --max-old-space-size=4096
+        run: npm run test:stateful-proof
+
+      - name: Recover positive change from encrypted backup and prove a new withdrawal
+        working-directory: sdk/shielded
+        run: cargo test --locked --test wallet positive_change -- --include-ignored
+
+      - name: Check setup consistency and reject tampered verification keys
+        working-directory: circuits/m5
+        run: |
+          node scripts/verify-setup.mjs
+          node scripts/verify-setup.test.mjs
+          node scripts/build-artifact-bundle.test.mjs
+          node scripts/bundle-testnet-setup.test.mjs
+          node scripts/stage-test-bundle.test.mjs
+          node scripts/verify-phase1.test.mjs
+          node scripts/verify-phase2-step.test.mjs
+          node scripts/verify-phase2-chain.test.mjs
+
+      - name: Measure source and offline-installed fixture proving without witness output
+        env:
+          EREBUS_M5_QUALIFY_FIXTURE: "1"
+          EREBUS_M5_QUALIFY_WHEEL: "1"
+        run: |
+          cargo build --locked --manifest-path sdk/shielded/Cargo.toml --bins
+          cargo build --locked --manifest-path sdk/rs/Cargo.toml --bin erebus-cli
+          cargo build --locked --manifest-path sdk/evm/Cargo.toml --bins
+          cargo build --locked --manifest-path sdk/transport/Cargo.toml --bins
+          uv run --locked --with hatchling==1.32.4 pytest scripts/tests/test_metropolis_prover_qualification.py -q -s
+
       - name: Install hash-pinned public artifacts and prove in fresh processes
         working-directory: sdk/shielded
-        run: cargo test --locked --test artifacts -- --include-ignored
+        run: cargo test --locked --test artifacts -- --include-ignored --skip actual_tmpfs_exhaustion_cleans_partial_download_and_can_retry
+
+      - name: Recover artifact installation after real bounded ENOSPC
+        working-directory: sdk/shielded
+        run: |
+          sudo mkdir /erebus-pressure
+          sudo mount -t tmpfs -o size=16m,mode=1777 tmpfs /erebus-pressure
+          trap 'sudo umount /erebus-pressure; sudo rmdir /erebus-pressure' EXIT
+          cargo test --locked --test artifacts actual_tmpfs_exhaustion_cleans_partial_download_and_can_retry -- --ignored --exact
+
+      - name: Deposit and withdraw with the installed wallet over fresh random notes
+        working-directory: sdk/shielded
+        run: cargo test --locked --test wallet_ops -- --ignored
+
+      - name: Recover an actually rolled-back withdrawal with one same-intent replacement
+        working-directory: sdk/shielded
+        run: cargo test --locked --test wallet_faults rolled_back_withdrawal -- --ignored
 
       - name: Exercise local proof generation over installed Python and MCP boundaries
         env:
@@ -462,6 +515,9 @@ jobs:
       - name: Negotiate in separate processes, recover a lost payment response, and audit x402
         working-directory: sdk/shielded
         run: cargo test --locked --test negotiation_cli payment_driver -- --include-ignored
+
+      - name: Check prepaid request and profile vectors independently
+        run: python3 scripts/check_agreement_vectors.py
 
       - name: Check path-only buyer access SDK and MCP boundaries
         env:

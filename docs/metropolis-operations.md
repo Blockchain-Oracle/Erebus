@@ -80,6 +80,8 @@ owns the protocol and key handling. Key values never cross the Python boundary.
 - Configurations, key files, evidence files, and witnesses are **regular, owner-only files**.
   Directories that hold them (`evidence_root`, witness directories, artifact caches, state
   roots) are owner-only; the access evidence directory must be a real directory with mode `0700`.
+- Note snapshots are encrypted, but participant transcripts and explicit witness inputs are
+  plaintext protected by file permissions. Keep them out of web roots, public backups and logs.
 - Use absolute paths. The owner must control the paths and their parent directories.
 - Private keys contain exactly **32 raw bytes** unless a command's schema says otherwise. Some
   key files also accept a 64-digit hexadecimal encoding (`erebus-access` buyer key); the shielded
@@ -371,6 +373,622 @@ Use `mode: "shielded"`, not the public-bound configuration above. Set these fiel
   response text. Funding shortfalls and estimated gas are operator diagnostics; they reveal
   financial requirements to that operator.
 
+### Shielded wallet operations
+
+`erebus-wallet` performs explicit deposit and withdrawal onboarding against one shielded pool.
+It shares the payment driver's wallet file, deployment identity, artifact manifest, and gas
+signer. Build and run:
+
+```sh
+cargo build --locked --manifest-path sdk/shielded/Cargo.toml --bin erebus-wallet
+printf '%s' '{"method":"version"}' | sdk/shielded/target/debug/erebus-wallet
+```
+
+Configuration is strict (`deny_unknown_fields`): `version`, `state_root`, `namespace`, `pool`,
+`verifier_version`, `asset`, `wrapper` (optional native wrapper; required for wrap/unwrap),
+`rpc_url`, `peer_rpc_url`, `first_block`, `first_hash`,
+`wallet_file`, `wallet_key_file`, `agreement_key_file` (raw 64-byte suite-2 owner key),
+`signer_address`, `signer_journal_root`, `transaction_key_file` (required for deposit, withdraw,
+and resume), `artifact_manifest_file`, `artifact_manifest_sha256`, `artifact_cache_root`,
+`allow_test_artifacts`, `allow_loopback_artifact_http`, `gas_limit`, `max_fee_per_gas`,
+`max_priority_fee_per_gas`, `timeout_seconds`, `max_scan_blocks`, `artifact_timeout_seconds`.
+
+Unreleased wallet hardening adds `artifact_manifest_authorization` and `runtime_pins`.
+Outside explicit `allow_test_artifacts` mode, `runtime_pins` is required and contains five
+non-zero lowercase 32-byte runtime hashes: `pool`, `poseidon`, `deposit`, `transfer`, and
+`withdraw`. Obtain them from reviewed deployment evidence, not from the RPC response being
+checked. `first_block` and `first_hash` identify the pool deployment block, not an arbitrary
+later checkpoint. The wallet authenticates the pool at deployment and finalized anchors,
+authenticates all four immutable dependencies, and rechecks the anchor before applying
+history or receipts. Recovery does not require the artifact files or publisher key.
+Non-test proof preparation additionally compares the signed manifest's verifier identities
+with these pins. This does not yet qualify a wrapper or ERC-20 implementation.
+
+| Method | Fields | Behavior |
+|---|---|---|
+| `notes` | `config_file` | Lists note commitments, amounts, inclusion/consumption/reservation flags, and durable operation states. Reads no network. |
+| `sync` | `config_file` | Replays verified finalized history through two RPCs. Withdrawal completion requires consumption matching its own successful finalized receipt. Releases a signer claim only when the finalized nonce proves consumption. Never signs or submits. |
+| `approve` | `config_file`, `amount` | Grants the pool an ERC-20 allowance through the shared fenced signer lane and the same durable operation journal. |
+| `wrap` | `config_file`, `amount`, `operation_ref` | Sends exactly `amount` native wei to the configured wrapper with `deposit()`; the receipt, target, value, and finalized WMON mint to the signer are all verified before completion. |
+| `unwrap` | `config_file`, `amount`, `operation_ref` | Sends `withdraw(amount)` to the configured wrapper with zero transaction value; completion requires the exact finalized WMON burn from the signer. |
+| `deposit` | `config_file`, `amount` | Checks the onchain allowance, then creates a fresh random note, persists it in the encrypted wallet before proving, installs hash-pinned artifacts, proves locally, and sends at most one deposit transaction. |
+| `withdraw` | `config_file`, `commitment`, `recipient` | Syncs first, reserves the note, proves locally, and sends at most one withdrawal transaction. |
+| `resume` | `config_file`, `identity` | Explicitly resends the exact retained bytes of an open operation. Never re-signs, re-proves, or re-plans. |
+| `replace` | `config_file`, `identity`, optional `max_fee_per_gas` and `max_priority_fee_per_gas` | Explicit same-intent fee replacement: sender, nonce, chain, target, value, calldata, and gas limit are preserved; only fee caps may increase. Both fee fields must be supplied together or omitted for the automatic bump. |
+
+- Deposit notes use operating-system randomness; no note secret is derived from a fixture or
+  configuration string.
+- The deposit opening is durable before proving. A failed proof leaves the note with no inclusion;
+  retries reuse the same opening, and a duplicate onchain deposit is rejected by the pool.
+- A withdrawal reserves the note before proving. Completion requires its own successful finalized receipt.
+  Verified consumption must match that attempt's transaction hash, block number and block hash.
+  Consumption by another operation does not complete this operation. An unknown outcome keeps the reservation.
+  Only `resume` may resend the retained bytes.
+- Receipt reconciliation records the actual winning attempt, including an older replacement attempt.
+  A rejected replacement cannot receive credit for an older attempt's payout.
+  After interrupted reservation cleanup, the same verified receipt permits restart recovery without another payment.
+- A finalized canonical receipt whose transaction reverted clears the retained bytes and returns
+  the operation to a retryable plan; a reverted withdrawal also releases its local reservation.
+  The reverted transaction hash, block, target, and value stay in the bounded attempt history, so
+  a later retry is distinguishable from the reverted attempt. Pending or missing receipts are
+  never treated as failure, and a completed operation is never rebroadcast.
+- `wrap` and `unwrap` require an explicit nonzero `operation_ref` (64 lowercase hex digits) that
+  is bound into the operation identity; retries with the same reference are idempotent, and a
+  repeat with a new reference is a distinct operation.
+- Wrapper completion authenticates the exact signed transaction (sender, target, value, calldata
+  hash), its successful canonical finalized receipt, and exactly one wrapper `Deposit` (wrap) or
+  `Withdrawal` (unwrap) event for the participant with the exact amount. Parent/including block
+  balance deltas are supplementary only: they include unrelated same-block transfers and never
+  complete an operation by themselves. The configured wrapper must emit the WETH9 event topics;
+  this is part of asset qualification.
+- Reorg behavior: an included-but-not-final transaction is never completed and its reservation
+  and signer claim stay held. A reorged transaction whose replacement is refused because a node
+  already knows the identical bytes is recovered by an explicit `replace`: the same nonce and
+  intent are re-signed with higher fee caps and persisted before broadcast. Every older attempt
+  hash stays in the bounded history and is reconciled, because an older attempt may be the one
+  that reached the chain. Replacement is never automatic, there is no cancellation, and no new
+  nonce is allocated. Reservations are never released because a transaction disappeared.
+  The local `rolled_back_withdrawal_recovers_by_same_intent_replacement_after_restart`
+  test uses actual Anvil state rollback, reopens the stores, and completes one withdrawal
+  by explicit replacement. This supplements the receipt-visibility tests; it does not
+  qualify live Monad reorg behavior or permit replacing a different intent.
+- Legacy records written before expectations were stored are reconstructed from durable intent:
+  the pool/asset target, the call selector, and the public input carrying the note commitment or
+  nullifier (or the approval spender). A retained transaction that does not match the intent, or
+  a record that cannot be reconstructed, fails closed and is reported as `migration_required`
+  with exit code 2; it is never completed or rewritten silently.
+- Value policy: only `wrap` may carry a nonzero native value, and it must equal the amount.
+  Settlement, approval, deposit, withdrawal, and unwrap calls require zero value; the signed
+  plan and claim bind the value.
+- Durable call plans encode version 2 with the native value. Version 1 plans remain readable and
+  mean zero value unambiguously; they are never re-encoded as version 1.
+- ERC-20 allowance is granted with `approve`; `deposit` refuses before proving when it is short.
+- Exit codes: 0 success, 2 pending or retained (incomplete history or unknown broadcast), 1 error.
+- Output contains no spend secret, salt, witness, key, or raw transaction.
+- Never treat the local `MockWMON` test fixture as Monad's deployed wrapper; a real wrapper must
+  be independently authenticated and recorded before use.
+
+### Native value through a wrapped-asset pool
+
+Native value enters the pool through an ERC-20 wrapper. A pool accepts one configured
+asset. For a WMON-backed pool, `asset` and `wrapper` identify the same wrapper contract.
+An unrelated ERC-20 pool cannot hold that wrapped asset.
+
+1. Authenticate the wrapper and its asset-specific pool before use.
+2. Set `asset` and `wrapper` to the wrapper address in the wallet configuration.
+3. Run `wrap` with an explicit operation reference and the native amount in base units.
+4. Run `sync` until the exact finalized wrapper event completes the operation.
+5. Run `approve` for the pool's allowance.
+6. Run `sync` before `deposit`.
+7. Deposit the wrapped asset and recover its note through finalized history.
+8. After withdrawal finalizes, run `unwrap` with a new operation reference.
+9. Run `sync` until the exact finalized withdrawal event completes the operation.
+
+Wrapping, approvals, deposits, withdrawals, and unwrapping expose public transactions.
+Only internal shielded transfers have the pool's private-payment guarantees.
+The local `MockWMON` fixture does not qualify Monad's deployed wrapper.
+
+### Restore a wallet snapshot and switch RPC endpoints
+
+This procedure restores note state, not missing spending keys or operation journals.
+A stale backup can show a spent note as unspent before finalized history recovery.
+
+1. Stop all commands that use the wallet.
+2. Preserve the current wallet, operation journal, and signer journal in owner-only storage.
+3. Restore the encrypted snapshot with its original wallet key in an owner-only directory.
+4. Keep the chain, pool, asset, verifier version, deployment block, deployment hash, and reviewed runtime pins unchanged.
+5. Set `rpc_url` and `peer_rpc_url` to the new endpoints in the owner-only configuration.
+6. Run `erebus-wallet` with `method: "sync"` and the configuration file.
+7. If history remains pending, repeat `sync` without a payment command.
+8. Check inclusion, consumption, and reservations before a spending command.
+
+`sync` needs neither a transaction key nor proving artifacts. It authenticates the
+deployment and applies finalized history and receipts. It does not sign or submit transactions.
+An empty history cache requires a scan from the configured deployment block.
+
+Do not delete journals to remove a pending operation. A snapshot alone does not retain
+every signed transaction, broadcast attempt, or nonce claim. Missing journals require a
+separate recovery review before any new transaction.
+
+### M5B setup ceremony and artifact distribution preparation
+
+This is independent-release preparation only. No independent release ceremony was run,
+no non-fixture release keys were generated, and no
+artifacts were published. Known-entropy fixtures remain isolated under the ignored
+`circuits/m5/build/` directory and are never release material.
+
+Candidate v2 working-tree hashes (not a freeze): circuits `deposit.circom` `bfd098a9…`,
+`transfer.circom` `b6f3d0c5…`, `withdraw.circom` `1eea28d2…`, `lib/eddsa_strict.circom`
+`b12d56cd…`; Rust mapping `sdk/core/src/shielded.rs` `c81e0509…`; witness construction
+`sdk/shielded/src/lib.rs` `cf2772f0…`; wallet `sdk/shielded/src/wallet.rs` `905c962b…`;
+operations `sdk/shielded/src/operations.rs` `4fd420f4…`. The tree
+is an uncommitted no-commit merge with `origin/metropolis` `a5dd7a2`, so this is a pinned
+working-tree identity, not a freeze; a freeze requires a clean committed revision whose recorded
+hashes match it. Candidate v2 implements the M5A-2..M5A-5 remediations (C1-C4); the results remain
+unaudited and use known-entropy test artifacts, so the audit scope items are addressed but not
+closed.
+
+Tooling prepared:
+
+- `node circuits/m5/scripts/verify-setup.mjs [buildDir] [ptau]` verifies each zkey against its
+  r1cs and the powers-of-tau and prints file identities. It is a consistency check only; it was
+  exercised against the local fixtures and does not authenticate a ceremony.
+- `node circuits/m5/scripts/verify-phase1.mjs <plan.json>` verifies the powers-of-tau
+  transcript against an independently supplied SHA-256 pin. The version-1 plan contains
+  `test_only` plus `ptau` and `provenance` file records, each with `path` and `sha256`.
+  The provenance record is a bounded local document, not a trust assertion inferred from
+  the transcript. Review its origin and assumptions separately. The receipt always states
+  `provenance_reviewed: false` and `trust_verified: false`; passing does not select phase-1.
+  Optional `published_pin` contains `algorithm` (`sha256` or `blake2b512`) and the exact
+  lowercase `digest` from the independently reviewed source. The checker compares it
+  before cryptographic verification. The internal SHA-256 file pin remains required;
+  a published BLAKE2b-512 hash is not a SHA-512 or SHA-256 hash.
+- `node circuits/m5/scripts/verify-phase2-step.mjs <plan.json>` verifies a contributor
+  handoff without generating entropy or changing keys. Its version-1 plan contains
+  `test_only`, the exact public `contributor` label, and four file records (`r1cs`, `ptau`,
+  `before`, `after`), each with `path` and independently obtained `sha256`. Both keys must
+  verify against the same R1CS/ptau. The contribution history must preserve its entire
+  prefix and append exactly one named entropy contribution, not a beacon. The tool reads
+  structured Groth16 metadata with the pinned snarkjs 0.7.6 reader and refuses another
+  version. It rehashes inputs before returning. Preserve the JSON receipt with the handoff.
+  It does not prove participant identity, independence, or entropy destruction.
+  `test_only` is the plan's declaration, not automatic recognition of unsafe keys.
+- `node circuits/m5/scripts/verify-phase2-chain.mjs <chain-plan.json>` verifies the
+  complete deposit, transfer, and withdrawal chains. Its version-1 plan contains
+  `test_only`, ordered `contributors` (two to eight distinct labels), `ptau_sha256`,
+  and three `circuits`. Each circuit has `kind`, the reviewed `r1cs_sha256`, and
+  ordered `steps` records containing the step-plan `path` and `sha256`. Every step
+  must match the contributor order, ptau, R1CS, and fixture declaration. Each chain
+  begins at a zero-contribution key and must be contiguous. It verifies every step
+  cryptographically and rechecks all input pins before returning. Its receipt still
+  says `trust_verified: false`: labels do not prove independence or destruction.
+
+Phase-1 candidate for owner review, not selected (source checked 2026-10-07):
+the [official snarkjs prepared-transcript table](https://github.com/iden3/snarkjs#7-prepare-phase-2)
+lists `powersOfTau28_hez_final_16.ptau` with capacity 64k and this BLAKE2b-512 digest:
+
+```json
+{
+  "algorithm": "blake2b512",
+  "digest": "6a6277a2f74e1073601b4f9fed6e1e55226917efb0f0db8a07d98ab01df1ccf43eb0e8c3159432acd4960e2f29fe84a4198501fa54c8dad9e43297453efec125"
+}
+```
+
+The candidate was downloaded for read-only review on 2026-10-07 to
+`/private/tmp/erebus-phase1-public-16.ptau`. Its SHA-256 is
+`1c401abb57c9ce531370f3015c3e75c0892e0f32b8b1e94ace0f6682d9695922`.
+The published BLAKE2b-512 pin matched before cryptographic verification began.
+The header reports power 16 and original ceremony power 28. The owner approved this
+phase-1 candidate subject to successful full verification on 2026-10-07. That condition
+is not satisfied by the digest/header checks alone and does not authorize deployment
+or publication. A subsequent complete read-only run returned exit 0 and
+`consistent: true`. The receipt is `/private/tmp/erebus-phase1-public-receipt.json`,
+SHA-256 `a54c8ad0e9272723e1324f1cbe5e976c1c8420be84f1e79b37b38c0747ea2132`.
+It still declares `trust_verified: false` and `provenance_reviewed: false`; those
+human judgments are not inferred by the checker. Snarkjs recomputes the initial
+challenge at the original ceremony power, even for a truncated file. Allow for that
+work; never skip it to produce a successful receipt. Do not substitute the local
+known-entropy `pot16_final.ptau` for it. The
+[Perpetual Powers of Tau procedure](https://github.com/privacy-ethereum/perpetualpowersoftau#the-transcript)
+describes contributor attestations and signatures. Review that provenance separately,
+then verify the downloaded file and its capacity against the frozen circuit builds.
+The source listing alone does not establish the owner's trust decision.
+- Phase-1: accept only a widely reviewed powers-of-tau transcript with its own verification
+  procedure (`snarkjs powersoftau verify`) and published transcript hashes. Do not run a fresh
+  one-person phase-1 and call it trusted randomness.
+- Phase-2: at least two independent human contributors, on separate machines and keys, must
+  contribute circuit-specific randomness to the same zkey chain per circuit. Each step records
+  the contribution hash; `snarkjs zkey verify` must pass after every contribution and after
+  finalization; each contributor must destroy their toxic waste and attest to it.
+  Obtain the previous key hash out of band before accepting it. Run the read-only handoff
+  check after each contribution. Keep every intermediate key and receipt so an independent
+  verifier can repeat the chain checks. Contributor identity and destruction attestations
+  need separate human review; changing a fixture label cannot establish independence.
+- Manifests: the release manifest must bind chain, pool, verifier version, circuit source hash,
+  witness schema version, r1cs/wasm/zkey hashes, verification key, and verifier runtime hash, and
+  must carry a detached signature in addition to the SHA-256 digest. Timestamped transparency or
+  an offline-signed manifest digest is the authentication mechanism. The installed artifact
+  installer now requires a detached publisher signature for non-test manifests. The publisher
+  address must be pinned independently. This authenticates the publisher, not the ceremony or
+  circuit safety. Release format version 2 binds source/schema/verifier identities as described
+  below. Reviewed inventories, authentic ceremony keys, deployed runtimes, and package
+  qualification remain release work; metadata alone does not verify those claims.
+
+#### Fixture bundle qualification
+
+`node circuits/m5/scripts/build-artifact-bundle.mjs <plan.json>` prepares a version-2
+test-only manifest and verifier bundle. It does not generate keys or publish artifacts.
+Use an unused output directory. The base URL names the existing build artifact directory;
+the builder does not copy or upload the large proving files.
+
+```json
+{
+  "test_only": true,
+  "build_dir": "/absolute/path/to/circuits/m5/build",
+  "output_dir": "/absolute/path/to/new-bundle-directory",
+  "base_url": "https://example.invalid/fixtures/",
+  "chain_id": 10143,
+  "settlement_contract": "0x1212121212121212121212121212121212121212",
+  "verifier_version": 2
+}
+```
+
+The example domain is illustrative, not a deployed pool. Supply the intended test domain.
+The builder recompiles all three circuits with Circom 2.2.3 and compares R1CS and WASM
+hashes with the retained setup. It checks zkeys against R1CS and powers-of-tau, compares
+exported verification keys, and exports Solidity verifiers from those same keys. Solc
+0.8.24 compiles their complete runtime with explicit Paris EVM and optimizer-off settings.
+The manifest binds runtime Keccak hashes, file sizes and SHA-256 hashes, domain, and schema.
+
+`source-inventory.json` includes the three circuits and transitive circuit includes,
+including circomlib. Includes outside the circuit root are refused. `toolchain.json`
+records the lockfile, compiler versions/settings, powers-of-tau hash, and rebuild result.
+The inventory also binds that toolchain record and Rust/JavaScript witness-source hashes.
+These files are review evidence, not contributor attestations. The builder refuses
+`test_only: false`; release generation must wait for independently reviewed setup material.
+Sign exact manifest bytes with the publisher command below only after reviewing them.
+Signing fixtures does not make them safe release keys.
+
+Run `node circuits/m5/scripts/build-artifact-bundle.test.mjs` to exercise the fixture
+rebuild, setup consistency, verifier export, inventory, and refusal checks. No deployment
+or setup contribution occurs. Disk-full download recovery and dual-platform installed
+qualification remain separate gates.
+
+The bundle now contains the actual WASM/R1CS/zkey files at the paths named by its
+manifest, as well as verification keys and the ptau. Every copy is checked against
+its pre-build identity. Changed inputs or source files fail before `manifest.json`
+is written. Existing output files are never replaced; a failed directory without a
+manifest is not a qualified bundle. This remains a fixture-only builder, not authority
+to promote test keys into release artifacts.
+The toolchain record also includes SHA-256 identities for the Circom binary, Node
+executable, and Solc engine. They are rechecked before the manifest is written.
+Executable hashes can differ across host platforms; artifact-byte reproduction is
+checked separately from producer-tool identity.
+
+#### Prover qualification measurements
+
+`scripts/qualify-metropolis-prover.py` runs one hash-pinned `erebus-local-prove` binary
+with an owner-only JSON request file. The request has the same fields as the proving CLI.
+The runner checks the binary and manifest hashes before starting. It reports platform,
+elapsed time, child CPU time, child peak RSS, installation/proving time,
+downloaded bytes, and cache hits. It never prints the request, witness, child stderr,
+or returned proof calldata. A timeout or malformed/error response fails qualification.
+
+```sh
+python3 scripts/qualify-metropolis-prover.py \
+  --binary /absolute/installed/erebus-local-prove \
+  --binary-sha256 <independently-pinned-binary-sha256> \
+  --request /absolute/owner-only/prove-request.json
+```
+
+Run once with an empty cache to measure installation, then with retained verified files
+to measure reuse. Use a fresh runner process per measurement: peak RSS is the cumulative
+child high-water for that process, not a stage allocation or aggregate parallel RSS.
+The CLI reports `rss_scope: prover_child_high_water`; the install checker starts a
+fresh runner for each proof so prior wheel/Node builds cannot inflate that measurement.
+Direct in-process calls retain `cumulative_child_high_water` and must not be interpreted
+as an isolated prover memory measurement.
+Supported measurement hosts are macOS arm64 and Linux x86_64. Use the installed package
+outside the source checkout; source builds require `--allow-source-build` and are labelled
+as such. Neither a signature nor a measurement certifies setup entropy or circuit safety.
+
+The explicit fixture regression is:
+
+```sh
+cargo build --locked --manifest-path sdk/shielded/Cargo.toml --bin erebus-local-prove
+EREBUS_M5_QUALIFY_FIXTURE=1 uv run --locked pytest \
+  scripts/tests/test_metropolis_prover_qualification.py -q -s
+```
+
+This regression uses cached known-entropy artifacts and the debug source build. It is
+not downloaded release-artifact or installed-package qualification. CI also schedules it
+on Linux, but an unexecuted workflow edit is not Linux evidence.
+
+To qualify only the native wheel without registry HTTP or SDK/MCP dependencies, use:
+
+```sh
+python3 scripts/check-metropolis-install.py --registry /absolute/local-registry \
+  --offline-native-prover --prover-request /absolute/owner-only/prove-request.json
+```
+
+This creates a fresh virtual environment and installs the hash-checked native wheel
+offline with no dependency resolution. It verifies the package location/version, every
+native binary and launcher hash, then runs the installed prover with the package's hash
+pin and an isolated environment. The result explicitly says `scope: native-prover-only`
+and `services_verified: false`. It does not replace the full SDK/MCP/self-hosting check.
+Build profile and dirty-source metadata stay visible. Fixture artifacts remain test-only.
+The qualification-only `--prover-timeout-seconds` option accepts 1 to 3,600 seconds
+(default 600). Slow emulated debug runs can use 3,600; this does not extend product
+proving deadlines or agreement expiry. QEMU timings are not native-hardware benchmarks.
+
+The opt-in installed-wheel regression is
+`EREBUS_M5_QUALIFY_WHEEL=1 uv run --locked --with hatchling==1.32.4 pytest scripts/tests/test_metropolis_prover_qualification.py -q -s`.
+Build all native binary groups first, as the CI step does. The test uses the existing
+packaging metadata, native wheel hook, license checks, and notice inventory; it does not
+handcraft or extract a wheel in place of installation. It exercises all three transitions
+from separate fresh environments using cached fixture files. No index or package is published.
+The installed cases use signed version-2 fixture manifests from a rebuilt full bundle;
+they also reject wrong publishers, tampered signatures, and changed manifest bytes
+even when the caller updates the manifest's SHA-256 pin.
+For emulated debug packaging, the test-only
+`EREBUS_M5_QUALIFY_WHEEL_BUILD_TIMEOUT_SECONDS` override accepts 1 to 3,600
+seconds (default 180). It bounds wheel creation separately from prover execution.
+Neither override changes the required binary inventory, signature checks, or product
+timeouts. Keep failed qualification outputs separate when retrying.
+
+The 2026-10-08 local prototype qualification passed all three installed transitions
+on macOS arm64 and Linux x86_64. Linux used a complete debug wheel under QEMU;
+these timings are not native-hardware benchmarks. The recovered Linux run passed
+six installed proof/authorization cases after rechecking the retained wheel,
+binary inventory, launcher and licenses. Earlier timeout and host-disk failures
+remain recorded in [status](metropolis-status.md); they are not passing test runs.
+Reserve space for both unpacked debug binaries and fresh installed copies before
+starting an emulated run. Never bypass VM write errors or discard source, keys,
+journals or retained evidence to reclaim space.
+Installed macOS SDK/MCP funded tests also passed against the new bundle on Anvil.
+All results remain single-operator, test-only and unaudited; the original M5B
+non-fixture release acceptance gate stays open.
+
+#### Manifest authorization
+
+Manifest version 1 is accepted only with `test_only: true`. Non-test manifests require version
+2 and a signature. Each circuit retains its `wasm`, `r1cs`, and `zkey` file records and adds:
+
+```json
+"identity": {
+  "source_inventory_sha256": "<SHA-256 of the reviewed source inventory, including includes>",
+  "witness_schema_version": 2,
+  "verification_key_sha256": "<SHA-256 of the exported verification-key JSON file>",
+  "verifier_runtime_keccak256": "<Keccak-256 of the complete deployed verifier runtime>"
+}
+```
+
+Hashes are exactly 64 lowercase hex characters without `0x`, and cannot be all zero.
+Unknown or missing fields and unsupported witness versions fail closed. The publisher signs
+these identities with the artifact file hashes and deployment domain. Source inventories
+must include transitive circuit dependencies and reproducible toolchain versions; review
+their completeness separately. The payment command compares all three verifier runtime
+identities with its independent deployment pins before installing or proving.
+
+`erebus-artifacts --sign-manifest` accepts one JSON request on stdin with `manifest_file` and
+`publisher_key_file`. The latter must be an owner-only, regular 32-byte secp256k1 key file.
+The command returns `publisher` and a `signature` envelope, never the private key. Use a
+separate release-publisher key, not a participant spending key.
+
+Installation and local proving accept `manifest_authorization` with the independently pinned
+`publisher` and the returned `signature` object. The payment driver uses the same field;
+the wallet calls it `artifact_manifest_authorization`. Signatures bind exact manifest bytes
+under `EREBUS_ARTIFACT_MANIFEST_SIGNATURE_V1`; even JSON whitespace changes require signing
+again. Non-test installation fails without valid authorization, regardless of test opt-in.
+
+For the local-prover MCP server, set `EREBUS_ARTIFACT_PUBLISHER` to the trusted address and
+`EREBUS_ARTIFACT_SIGNATURE` to a regular JSON file containing only the signature envelope.
+The model cannot supply or replace these settings. Keep the independently trusted SHA-256
+pin as well. Never obtain the trusted publisher from the artifact download itself.
+
+`verify-setup.mjs` also compares each verification-key JSON against the key exported from its
+zkey. Run `node circuits/m5/scripts/verify-setup.test.mjs` against generated local artifacts
+to check that a changed verification key fails while unchanged keys pass. This is consistency
+evidence only; it does not establish entropy provenance.
+
+For the independent release ceremony, human roles and approvals required before execution:
+two or more named independent phase-2
+contributors (not the release author), one ceremony coordinator, one independent verifier who
+did not contribute, and an owner decision on phase-1 transcript provenance, budgets, and
+publication. None of these is authorized by this document.
+
+Participant handoff state (2026-10-07): the owner designated Sagar and Sudipta as
+phase-2 contributors and Ishita as the independent verifier. No contribution,
+verification, machine independence, or destruction attestation has been received.
+These are designated roles, not completed ceremony evidence. Do not fill these
+roles with multiple AI sessions or a single operator's machines.
+
+The owner separately authorized a single-operator testnet prototype setup on
+2026-10-08. Automated worker processes may add fresh operating-system randomness
+without recording the entropy. Their output remains test-only; worker labels are
+not Sagar, Sudipta, or Ishita and do not establish independence or secret destruction.
+This authorization does not permit publication, deployment, or use with real funds.
+
+For this prototype only, run from the repository root:
+
+```sh
+node --test circuits/m5/scripts/testnet-setup.test.mjs
+node circuits/m5/scripts/testnet-setup.mjs
+```
+
+The runner requires the pinned candidate R1CS files in `circuits/m5/build/` and
+the previously verified public phase-1 transcript and receipt in `/private/tmp`.
+It creates a new private `/private/tmp/erebus-testnet-setup-*` directory. Initial
+keys, two contribution steps per circuit, verification keys, file hashes, and
+public receipts remain there; it never overwrites the existing fixtures.
+Each contribution runs in a separate child process. Entropy comes from the
+operating system inside that child, not from agent text, arguments, or files.
+JavaScript and dependency memory copies prevent a provable zeroization claim.
+Only a successful verification of all three chains produces `receipt.json`.
+An interrupted directory without that receipt is not a completed setup.
+These commands do not start a server, send transactions, or mark M5B complete.
+
+`scripts/bundle-testnet-setup.mjs` accepts a JSON plan with exactly `test_only`,
+`receipt` (`path` and `sha256`), `base_url`, `chain_id`, `settlement_contract`,
+and `verifier_version`. It requires a single-operator test-only completion receipt,
+re-verifies the complete chains, and copies the final keys and candidate WASM/R1CS
+into a separate private staging directory. The existing bundle builder then
+rebuilds the circuits and emits matching verification keys, Solidity verifiers,
+runtime hashes, and a version-2 test-only manifest. No existing output is replaced.
+The plan domain must match the witness domain for proving qualification; a test
+address and an `example.invalid` URL are not evidence of a deployment or hosting.
+
+```sh
+node circuits/m5/scripts/bundle-testnet-setup.test.mjs
+node circuits/m5/scripts/bundle-testnet-setup.mjs /private/tmp/erebus-testnet-bundle-plan.json
+```
+
+Installed-prover qualification may use an already checked test-only bundle via
+`EREBUS_M5_QUALIFY_BUNDLE=/absolute/path/to/bundle` alongside
+`EREBUS_M5_QUALIFY_WHEEL=1`. The tests check its file hashes and lengths and sign
+the exact manifest bytes with a temporary test publisher. This exercises signatures,
+not the identity of a release publisher; offline native-wheel tests do not qualify
+the full SDK/MCP release, cold HTTP downloads, or a second platform.
+
+`scripts/verify-testnet-verifiers.mjs <bundle-directory> <manifest-sha256>`
+checks each artifact hash, compiles the verifier source to compare the pinned
+runtime, and generates fresh local proofs from candidate test witnesses. Foundry
+runs the generated verifier contracts in-process, checking valid proofs and mutated
+public inputs. It does not start Anvil, contact RPCs, deploy to Monad, or transfer
+tokens. The test harness and public receipt stay under `/private/tmp`.
+
+The funded local harness accepts `EREBUS_M5_TEST_BUNDLE` and
+`EREBUS_M5_TEST_BUNDLE_SHA256` together. It refuses non-test manifests, checks
+artifact and identity files, recompiles each verifier to match its runtime pin,
+and stages a separate working directory. It does not regenerate keys or write
+into the input bundle. Generated witnesses, journals and reports use that working
+directory; the default fixture path is unchanged when the variables are absent.
+The Rust coordinator example receives `EREBUS_M5_TEST_BUILD` from the harness.
+Native proving with external artifacts requires the coordinated path, not retained
+calldata from an earlier fixture run.
+
+```sh
+EREBUS_M5_TEST_BUNDLE=/private/tmp/erebus-testnet-bundle-wWk6Q8/bundle \
+EREBUS_M5_TEST_BUNDLE_SHA256=37fed4d21ea6d68f783a4ccb65879764a9d0487f51397c9aca4484791a926680 \
+EREBUS_M5_NATIVE_PROOF=1 EREBUS_M6_COORDINATED=1 \
+node circuits/m5/scripts/pool.mjs
+```
+
+This is a local test command and requires permission to bind loopback listeners.
+The initial restricted-workspace attempt stopped before Anvil started. Approved
+local execution subsequently passed the funded external-bundle workflow with
+native coordinated proving and separate-process auditing. No Monad funds were used.
+With the same two bundle environment variables, these product-path tests also pass:
+
+```sh
+cargo test --manifest-path sdk/shielded/Cargo.toml --locked --test negotiation_cli negotiated_shielded_payment_proves_locally_and_recovers_without_a_second_send -- --ignored
+cargo test --manifest-path sdk/shielded/Cargo.toml --locked --test negotiation_cli two_mcp_agents_negotiate_and_settle_once_through_a_lost_broadcast -- --ignored
+cargo test --manifest-path sdk/shielded/Cargo.toml --locked --test wallet_ops -- --ignored
+```
+
+The native fixture returns its selected artifact directory; the tests must use
+that directory rather than pairing a staged verifier with an older fixture key.
+These are current-source binaries copied into temporary participant directories,
+not published packages, independent acceptance or an independent setup ceremony.
+To test a local wheel install instead, install all three packages from the local
+registry into an environment outside the checkout. Retain the two bundle variables
+above and set the following explicit test overrides:
+
+```sh
+export EREBUS_TEST_INSTALLED_BIN_DIR=/private/tmp/erebus-m5b-installed-20261008/bin
+export EREBUS_TEST_MCP_PYTHON="$EREBUS_TEST_INSTALLED_BIN_DIR/python"
+export EREBUS_TEST_MCP_SERVER="$EREBUS_TEST_INSTALLED_BIN_DIR/erebus-mcp-server"
+cargo test --manifest-path sdk/shielded/Cargo.toml --locked --test negotiation_cli two_mcp_agents_negotiate_and_settle_once_through_a_lost_broadcast -- --ignored
+```
+
+Use the path of your actual fresh environment, not an unrelated existing install.
+Verify installed binary hashes against its local registry manifest first. Both
+MCP paths must be set together; a partial override fails instead of falling back
+to checkout modules. The driver runs with Python isolation in a temporary participant
+directory. Its installed servers and commands come from the environment; the driver
+and funded Anvil fixture remain repository test code. This installed macOS run passed
+with the new single-operator bundle; it remains unpublished, test-only and unaudited.
+The real Linux disk-full test requires a dedicated 16 MiB tmpfs at
+`/erebus-pressure`; never run it against a host filesystem. Ordinary Linux
+`artifacts --include-ignored` runs must skip
+`actual_tmpfs_exhaustion_cleans_partial_download_and_can_retry` unless that mount
+exists. CI uses a separate bounded mount and removes it after the dedicated test.
+
+Before sending a contribution packet, freeze the reviewed circuit revision and
+obtain approval of the phase-1 provenance. Each packet must include the circuit
+R1CS, the selected ptau, the preceding zkey, their independently communicated hashes,
+and the pinned toolchain. Never send the fixture keys as a release packet.
+Each contributor verifies the incoming packet on their own machine, contributes to
+all three circuit chains, and returns only public keys, hashes, verification logs,
+and their identity/destruction attestation. Keep entropy out of shell arguments,
+chat, recordings, logs, and shared files. The snarkjs interactive entropy prompt
+does not hide terminal input; use a private unrecorded terminal. Destruction
+attestations are human claims, not something the checker can prove.
+
+The independent verifier checks the complete contribution chain and final setup
+against the frozen R1CS and selected ptau. Only after these checks may the owner
+approve final verifiers and publisher-signed manifests. Installed proof qualification
+must then use those artifacts, not the earlier fixture bundle.
+
+#### Phase-2 participant sequence
+
+Prerequisites: a frozen reviewed source revision, rebuilt and hash-pinned R1CS/WASM,
+the approved public ptau, and the successful phase-1 verification record. The public
+ptau was verified locally on 2026-10-07; its receipt and SHA-256 are recorded above.
+The current dirty merge is not a frozen revision. None of the following commands has
+run for release keys.
+
+Use the frozen checkout's `circuits/m5` directory and its locked snarkjs 0.7.6
+installation. Keep ceremony output outside `build/`, which contains fixture artifacts.
+`PACKET` below is an absolute path to a new ceremony directory containing the reviewed
+`deposit.r1cs`, `transfer.r1cs`, `withdraw.r1cs`, and `phase1.ptau`.
+Reject existing output keys before every command; never overwrite a handoff.
+
+The coordinator creates the initial keys after the prerequisites are satisfied:
+
+```sh
+for kind in deposit transfer withdraw; do
+  test ! -e "$PACKET/$kind-0000.zkey" || exit 1
+  node node_modules/snarkjs/cli.js groth16 setup \
+    "$PACKET/$kind.r1cs" "$PACKET/phase1.ptau" "$PACKET/$kind-0000.zkey" || exit 1
+  node node_modules/snarkjs/cli.js zkey verify \
+    "$PACKET/$kind.r1cs" "$PACKET/phase1.ptau" "$PACKET/$kind-0000.zkey" || exit 1
+done
+```
+
+These initial keys have zero circuit-specific contributions and are not release-safe.
+The coordinator sends their hashes through a separate authenticated channel. Sagar
+checks those hashes, verifies all three incoming setups, and runs on his own machine:
+
+```sh
+for kind in deposit transfer withdraw; do
+  test ! -e "$PACKET/$kind-0001.zkey" || exit 1
+  node node_modules/snarkjs/cli.js zkey contribute \
+    "$PACKET/$kind-0000.zkey" "$PACKET/$kind-0001.zkey" --name=Sagar || exit 1
+done
+```
+
+Sudipta receives the verified `0001` keys and their independently communicated hashes.
+On his own machine he repeats the incoming checks, contributes with `--name=Sudipta`,
+and writes `0002` keys. Neither participant uses `--entropy` shell arguments or sends
+private randomness to the coordinator. Each supplies the public outputs, hashes, logs,
+and an honest destruction attestation for all three contributions.
+
+For each circuit, run `verify-phase2-step.mjs` twice: `0000` to `0001` with contributor
+`Sagar`, then `0001` to `0002` with contributor `Sudipta`. Each plan uses the same
+frozen R1CS and approved ptau, with SHA-256 records for every input. Retain all six
+receipts and all intermediate keys. Contribution labels alone do not authenticate people.
+The whole-chain checker consumes those same step plans and pins the contributor order,
+one common ptau, and each reviewed R1CS. Its fixture regression is
+`node circuits/m5/scripts/verify-phase2-chain.test.mjs`: it creates two local test
+contributions per circuit in a temporary directory, checks the complete chains and
+mutation refusals, then removes the test keys. This is not Sagar or Sudipta's participation.
+
+Ishita independently verifies phase-1 provenance, all six transitions, the frozen
+source/build identities, and every final `0002` setup. She records exactly what she
+checked and any limitations. No finalization, release-key export, manifest signing,
+publication, or deployment is implied by preparing this sequence.
+
 ### Local evidence
 
 From the repository root:
@@ -469,11 +1087,18 @@ For shielded settlement, replace `backend` with:
   "rpc_url": "<first provider URL>",
   "peer_rpc_url": "<second provider URL>",
   "first_block": 0,
+  "runtime_keccak256": "<64 lowercase hex digits: pool runtime>",
+  "poseidon_keccak256": "<64 lowercase hex digits: Poseidon runtime>",
+  "deposit_verifier_keccak256": "<64 lowercase hex digits: deposit verifier runtime>",
+  "transfer_verifier_keccak256": "<64 lowercase hex digits: transfer verifier runtime>",
+  "withdraw_verifier_keccak256": "<64 lowercase hex digits: withdrawal verifier runtime>",
   "first_hash": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
 }
 ```
 
-Use the authenticated deployment block and hash, not the placeholders. No secure Monad shielded
+Use the authenticated deployment block, hash, and independently pinned runtimes, not the
+placeholders. The candidate requires these pins for snapshot and metered profiles.
+No secure Monad shielded
 deployment is claimed by this document.
 
 ### Prepare a resource
@@ -573,6 +1198,12 @@ Send one JSON request on standard input:
 - `resource_verified: true` means the bytes match the signed digest.
   `seller_reported_payment_finalized: true` is the seller's claim. The receipt does not
   independently verify chain payment or audit delivery.
+- SDK/MCP errors use fixed public messages and recognized codes. Unknown native codes fail
+  closed; they do not authorize another payment. Undecodable native output also requires
+  retained-state recovery. Update the SDK alongside a native protocol extension.
+- Returned snapshot paths must match the configured cache and issuance ID. Metered paths
+  must remain in its `metered/calls` directory. Python does not open resource or witness
+  contents to check this metadata; Rust still verifies and publishes the files.
 
 ### Buyer MCP configuration
 
@@ -778,6 +1409,16 @@ Example operator configuration, with paths replaced by that operator's existing 
 - A shielded seller must also configure its spending secret, encrypted wallet, and wallet
   encryption key. Before sending seller consent, the command persists the expected payment note
   in that wallet. An expected note is not an included or spendable payment.
+- Keep encrypted backups in an owner-only directory. The local negotiated shielded
+  regression restores a pre-payment backup with the original wallet, standalone
+  spending-secret file and sender storage unavailable. Finalized pool replay then
+  makes the retained recipient note spendable. Retain the wallet encryption key:
+  public history alone cannot reconstruct private spending material.
+- A received note can fund a later private agreement after finalized recovery.
+  The local two-deal regression covers 70 received units, a subsequent 65-unit
+  payment, 5 units of retained change, and retries without another broadcast.
+  Each deal uses its own operation reference. Reuse the same gas-payer nonce
+  journal when the gas account is shared; do not share participant spending keys.
 - For a paid snapshot, set `access_evidence_root` to the access service's `evidence_root`; see
   §4 for the handoff rules.
 
@@ -965,14 +1606,26 @@ For a suite-2 grant, `expected_issuer` is `0x` followed by the 128 lowercase hex
  "expected_issuer":"<0x suite-2 participant key>","deployment":{
    "namespace":"<eip155 chain namespace>","settlement_contract":"<0x pool address>",
    "verifier_version":2,"rpc_url":"<primary RPC>","peer_rpc_url":"<independent peer RPC>",
-   "first_block":123,"first_hash":"<0x deployment block hash>","cache_root":"<public cache directory>"}}
+   "first_block":123,"first_hash":"<0x deployment block hash>","cache_root":"<public cache directory>",
+   "runtime_keccak256":"<0x pool runtime hash>","poseidon_keccak256":"<0x Poseidon runtime hash>",
+   "deposit_verifier_keccak256":"<0x deposit verifier runtime hash>",
+   "transfer_verifier_keccak256":"<0x transfer verifier runtime hash>",
+   "withdraw_verifier_keccak256":"<0x withdraw verifier runtime hash>"}}
 ```
 
-The deployment anchor and verifier version must come from a trusted deployment manifest. The
-tool creates separate `primary` and `peer` public caches. It never needs a note wallet or proving
+The deployment anchor, verifier version and all five runtime pins must come from trusted public configuration.
+Each runtime pin requires `0x` followed by 64 lowercase hex digits and cannot be zero.
+These fields are required by the current source candidate, not older published packages.
+The tool creates separate `primary` and `peer` public caches. It never needs a note wallet or proving
 artifacts. If observation is pending or unavailable, retain those caches and retry the same
 request. Never interpret an unavailable result as non-payment. Never submit another payment from
 the auditor command.
+
+For incomplete history, the source candidate returns exit code `2` with `next_log_block` progress.
+An indexed authorized payment can be certified from a complete canonical prefix below both providers' finalized tips.
+The tool still verifies its event, consumed state, pool state and runtime pins.
+This positive certificate does not establish that a note remains unspent after that prefix.
+Missing payments and wallet/coordinator recovery still require full history catch-up.
 
 The grant contains the selected deal transcript, accepted terms, blinding, and authorizations. It
 contains no parent Eleusis session key or spending key. Its public header reveals the issuer
@@ -1089,11 +1742,89 @@ key and ciphertext can bypass that policy. Expiry cannot erase plaintext already
 
 ---
 
+### Candidate prepaid data-feed access
+
+This source-only profile uses one finalized shielded payment for several HTTP calls.
+It preserves candidate-v2 note domains, strict authorization, and wallet recovery.
+It is not in the published dev5 packages and is not a standard x402 payment scheme.
+
+Before negotiation, configure the signed service with `unit: call`, quantity 1..=4096,
+and `fulfillment_method: http-metered-v1`. Compute `fulfillment_digest` with
+`MeteredProfile::profile_digest`; its exact encoding is in the agreement specification.
+Use the buyer's suite-2 agreement key as `access_recipient`.
+
+Configure the seller negotiation command's `access_evidence_root` before it accepts the
+agreement. The command publishes selected evidence there. Do not use a watcher to copy
+buyer evidence into the service.
+
+For `erebus-access-service`, select `profile: metered` with `max_response_bytes` and
+`feed_file`. Omit `payload_file` and select the `shielded` observation backend.
+Configure both RPC endpoints, the deployment start block/hash, and all five runtime pins:
+pool, Poseidon, deposit verifier, transfer verifier, and withdrawal verifier.
+Unknown or mixed profile fields fail configuration. The listener stays loopback-only;
+remote access requires a TLS gateway. Protect the feed, evidence, and state directories.
+
+After finalized payment, run this path-only request through source-built `erebus-access`:
+
+```json
+{
+  "method": "metered_call",
+  "evidence_file": "/absolute/buyer/deal.evidence",
+  "buyer_key_file": "/absolute/buyer/agreement.key",
+  "service_url": "https://seller.example/v1/metered",
+  "service_id": "<64 lowercase hex characters>",
+  "cache_root": "/absolute/buyer/metered-cache"
+}
+```
+
+`metered_status` uses the same fields and consumes no call. `metered_call` resumes an
+in-flight call before consuming another index. An explicit earlier `call_index` retrieves
+the original stored response. SDK/MCP adapters expose `call_metered_service` and
+`metered_service_status`; they return local response paths, not payloads or spending keys.
+
+Keep the service state and buyer cache on persistent storage. The seller commits each
+response before acknowledging it. The client retains its in-flight index before sending.
+After a lost reply or service restart, retry access, not payment. A deleted buyer cursor
+can reconcile from seller status. Missing or corrupt seller call records or response files
+fail closed; do not delete them to reset an allowance. Changed runtime pins or observers
+require payment recertification, not a new allowance.
+
+HTTP 202 means payment/history pending; 503 means unavailable; 409 means out of order;
+403 means allowance exhausted or authentication denied. None instructs a recharge.
+Activated allowances can serve during an RPC outage, using the saved payment certificate.
+This trusts the recorded provider-finalized anchor and durable seller state. It does not
+protect against a compromised seller host, dishonest paired providers, or finality reversal.
+
+The response hash checks stored bytes, not the truth of a data feed. Access results do not
+independently verify payment or delivery. The seller sees agreement keys and call timing;
+RPCs see pool queries, and gateways see network metadata. Owner-only service records contain
+private agreement amounts and response bytes; filesystem permissions are not encryption.
+
 ## 7. Local proving
 
 The implementation downloads public artifacts and generates proofs locally. It does not require
 a hosted prover or an operator setup ceremony. The current tests use insecure prototype keys. No
 secure artifact release is published here.
+
+### Local stateful proof regression
+
+With Node, pinned Circom and Foundry available, run from the checkout:
+
+```sh
+cd circuits/m5
+npm ci
+npm run prototype
+npm run test:stateful-proof
+```
+
+`prototype` prepares known-entropy test artifacts. It is not a secure setup ceremony.
+The sequence test reuses those artifacts without changing existing witness fixtures.
+It starts its own loopback Anvil, verifies artifact hashes, and runs three seeded sequences
+through the real test verifiers. Each final report has eleven proofs and equal deposit and
+withdrawal totals. All pools must end empty. Failure returns a nonzero exit status.
+The script writes no private witness files; its keys and openings are reproducible test material.
+Do not use them on a public network. This is contract/circuit regression evidence, not audit
+or installed-agent acceptance.
 
 ### Trust boundary
 
@@ -1352,9 +2083,15 @@ These reads do not submit transactions. Library callers can configure the deadli
 
 ### Message relay (`erebus-relay`)
 
-The relay exposes ciphertext mailboxes and a bearer-token health surface. The relay sees mailbox
-ids, sizes, and timing, never plaintext. Do not add payload logging to diagnose it. Clients
+The relay exposes opaque mailboxes and a bearer-token health surface. For messages encrypted
+by Erebus, it sees mailbox IDs, sizes and timing, not plaintext. Do not add payload logging. Clients
 retain their own transcripts and re-handshake after a relay outage.
+That confidentiality claim requires Erebus clients to encrypt before uploading; the relay
+stores opaque bytes and cannot reject a plaintext blob by inspecting it. Its bearer token
+does not provide per-recipient mailbox access control. Empty or whitespace-only tokens are
+refused, and `EREBUS_RELAY_INSECURE=1` without a token binds only `127.0.0.1`.
+The read endpoint accepts only the numeric `after` cursor. Query errors and storage failures
+return fixed public messages, not rejected values or internal parser/storage diagnostics.
 
 ### Pool indexer (`erebus-pool-indexer`)
 
@@ -1362,6 +2099,10 @@ The indexer serves shielded public events from the configured deployment block a
 rebuild from RPC. It never accepts note openings and cannot spend. Its outage delays discovery
 only. An endpoint switch means a new host with an empty cache; sync from the deployment block.
 Wallet openings are local and unaffected.
+`/v1/blocks` accepts only `after` and `limit` (1 through 128) and an empty body.
+Unknown fields, malformed cursors and nonempty bodies return a plain 400 status.
+The empty-body check has a one-second deadline. Send public cursors only; a hosting proxy
+can observe a request even when the service rejects it.
 
 ---
 
@@ -1882,6 +2623,82 @@ issue or a chat. Those are the private material the protocol exists to protect.
   expiry cannot erase plaintext already disclosed.
 - **Transcript stores:** contain plaintext commercial terms and the blinding; keep them private.
 
+### Shielded Testnet Deployment Preparation
+
+These commands prepare and verify a test-only candidate. They do not authorize spending.
+Run from the repository root with the M5 Node dependencies installed.
+
+The planner input has exactly these fields: `version: 1`, `test_only: true`,
+`chain_id: 10143`, `bundle_dir`, `manifest_sha256`, `deployer`, `starting_nonce`,
+and `assets`. Supply one or two assets. Each asset has `name`, `address`, and
+`runtime_keccak256` (64 lowercase hex digits without `0x`). Use reviewed asset identities.
+The deployer is a public address; do not include a key in this file.
+
+```sh
+node circuits/m5/scripts/prepare-testnet-deployment.mjs plan.json prepared.json
+```
+
+The output contains five or six creation calls, predicted addresses, runtime pins and
+unfinished pool configurations. The planner checks the manifest against current circuit
+and witness sources. It compiles only the production pool, Poseidon and pinned verifiers.
+It never loads a gas key or connects to an RPC endpoint.
+
+Before broadcasting, confirm the pending nonce, asset qualification, gas estimates,
+funding and explicit budgets. Use a durable signed-transaction journal. A changed nonce
+changes every predicted address; regenerate the plan instead of editing it.
+The preparation tool never broadcasts. The separate testnet executor requires explicit
+authorization and a reviewed prepared-plan pin:
+
+```sh
+node circuits/m5/scripts/submit-testnet-deployment.mjs prepared.json "$REVIEWED_PLAN_SHA256" \
+  "$LOCAL_GAS_KEY_FILE" "$PRIVATE_DEPLOYMENT_JOURNAL" "$PRIMARY_RPC_URL" "$SECONDARY_RPC_URL" \
+  --authorize-testnet-transactions test-only-unaudited
+```
+
+Use a dedicated owner-only gas key and journal directory. The executor estimates each
+creation after its dependencies finalize. It persists exact signed bytes and an attempt
+record before submission, then checks canonical finalized receipts and runtime identities
+through both endpoints. Resuming an attempted call only observes it; it does not replace
+fees, select a new nonce or send it again. A dropped or ambiguous attempt therefore stays
+held and may require an explicit recovery procedure. A failed or partial record fails closed.
+An abandoned executor lock needs operator inspection, not automatic deletion.
+This executor supports chain 10143 and test-only artifacts only. It is not a general
+wallet, an audited deployment service or permission to spend mainnet funds.
+
+After separately authorized deployment, put the creation transaction hashes in a JSON
+array in prepared-call order. Verify through two independently configured RPC endpoints:
+
+```sh
+node circuits/m5/scripts/check-testnet-deployment.mjs prepared.json hashes.json \
+  "$PRIMARY_RPC_URL" "$SECONDARY_RPC_URL" verified.json "$REVIEWED_PLAN_SHA256"
+```
+
+Record `REVIEWED_PLAN_SHA256` from the exact reviewed `prepared.json` before deployment.
+Keep that pin separate from the file; do not recompute it from an unreviewed replacement.
+The checker requires it before any RPC read and records it in the verified configuration.
+This detects file substitution, not malicious content approved during review.
+Verification uses only reads. Both providers must supply explicit finalized blocks.
+Creation receipts and input, canonical block hashes, runtime hashes, asset code and pool
+getters must match. State reads use a shared finalized block hash. A failed check writes
+no output configuration. Neither script overwrites an existing output file.
+Distinct URLs do not establish independent providers or consensus correctness.
+
+Bind a separate artifact manifest to each verified pool address and the approved hosted
+artifact URLs through `build-artifact-bundle.mjs`. Reverify every artifact hash and runtime.
+Do not use the rehearsal-domain manifest as a live wallet configuration.
+The test-only setup remains unaudited and requires explicit client opt-in.
+
+Local regression command (includes mock assets, never a live network):
+
+```sh
+EREBUS_M5_TEST_BUNDLE=/absolute/path/to/bundle \
+EREBUS_M5_TEST_BUNDLE_SHA256=explicit_manifest_sha256 \
+  npm --prefix circuits/m5 run test:deployment
+```
+
+Without both bundle variables, only input-rejection tests run. That is not deployment
+or finalized-verification evidence.
+
 ### Hosting and deployment boundaries
 
 - There is no hosted deployment. The Render blueprint is prepared but **not deployed**, and paid
@@ -1896,4 +2713,3 @@ issue or a chat. Those are the private material the protocol exists to protect.
   separate auditor process with the encrypted grant, its own key, and independently configured
   deployment anchors verifies payment, and even that does not verify delivery.
 - All live Monad evidence in this guide is team-operated. It is not third-party acceptance.
-

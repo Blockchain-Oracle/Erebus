@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
 
 use erebus_core::{
-    shielded::{note_commitment, note_nullifier, note_spend_tag, ShieldedDeal},
+    shielded::{note_commitment, note_domain, note_nullifier, note_spend_tag, ShieldedDeal},
     terms::AgreementTerms,
 };
 
@@ -51,26 +51,36 @@ pub enum WalletError {
     Note(&'static str),
 }
 
-/// Chain instance and pool address bound into wallet authenticated encryption.
+/// Chain instance, pool address, and verifier version bound into wallet authenticated
+/// encryption and note hashing. Wallet format version 2.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct WalletDomain {
     /// EVM chain ID.
     pub chain_id: u64,
     /// Deployed shielded pool address.
     pub pool: [u8; 20],
+    /// Verifier version bound into the note domain.
+    pub verifier_version: u32,
 }
 
 impl WalletDomain {
-    fn aad(self) -> [u8; 36] {
-        let mut aad = [0u8; 36];
+    fn aad(self) -> [u8; 40] {
+        let mut aad = [0u8; 40];
         aad[..8].copy_from_slice(MAGIC);
         aad[8..16].copy_from_slice(&self.chain_id.to_be_bytes());
-        aad[16..].copy_from_slice(&self.pool);
+        aad[16..36].copy_from_slice(&self.pool);
+        aad[36..].copy_from_slice(&self.verifier_version.to_be_bytes());
         aad
     }
 
+    /// Deployment domain element bound into every note of this wallet.
+    pub fn note_domain(self) -> Result<[u8; 32], WalletError> {
+        note_domain(self.chain_id, &self.pool, self.verifier_version)
+            .map_err(|_| WalletError::Note("wallet note domain"))
+    }
+
     fn validate(self) -> Result<(), WalletError> {
-        if self.chain_id == 0 || self.pool == [0; 20] {
+        if self.chain_id == 0 || self.pool == [0; 20] || self.verifier_version == 0 {
             return Err(WalletError::Note("empty deployment domain"));
         }
         Ok(())
@@ -110,6 +120,7 @@ pub struct OwnedNote {
     owner_y: [u8; 32],
     spend_secret: [u8; 32],
     salt: [u8; 32],
+    note_domain: [u8; 32],
     commitment: [u8; 32],
     nullifier: [u8; 32],
     inclusion: Option<NoteInclusion>,
@@ -161,6 +172,7 @@ impl OwnedNote {
             spend_secret,
             deal.payment_salt()
                 .map_err(|_| WalletError::Note("payment salt"))?,
+            deal.note_domain(),
         )?;
         if note.commitment
             != deal
@@ -179,14 +191,15 @@ impl OwnedNote {
         owner: [u8; 64],
         spend_secret: [u8; 32],
         salt: [u8; 32],
+        note_domain: [u8; 32],
     ) -> Result<Self, WalletError> {
         if amount == 0 {
             return Err(WalletError::Note("zero-value owned note"));
         }
         let tag = note_spend_tag(&spend_secret).map_err(|_| WalletError::Note("spend secret"))?;
-        let commitment = note_commitment(&asset, amount, &owner, &tag, &salt)
+        let commitment = note_commitment(&note_domain, &asset, amount, &owner, &tag, &salt)
             .map_err(|_| WalletError::Note("note opening"))?;
-        let nullifier = note_nullifier(&spend_secret, &commitment)
+        let nullifier = note_nullifier(&note_domain, &spend_secret, &commitment)
             .map_err(|_| WalletError::Note("note nullifier"))?;
         let mut owner_x = [0u8; 32];
         let mut owner_y = [0u8; 32];
@@ -199,6 +212,7 @@ impl OwnedNote {
             owner_y,
             spend_secret,
             salt,
+            note_domain,
             commitment,
             nullifier,
             inclusion: None,
@@ -215,6 +229,11 @@ impl OwnedNote {
     /// One-time note spend identity.
     pub fn nullifier(&self) -> [u8; 32] {
         self.nullifier
+    }
+
+    /// Deployment domain element this note was created under.
+    pub fn note_domain(&self) -> [u8; 32] {
+        self.note_domain
     }
 
     /// Note value in token base units.
@@ -240,6 +259,16 @@ impl OwnedNote {
         self.inclusion
     }
 
+    /// Current verified spend evidence, if the caller's indexer observed consumption.
+    pub fn consumption(&self) -> Option<NoteConsumption> {
+        self.consumption
+    }
+
+    /// Local operation identity that currently reserves this note, if any.
+    pub fn reserved(&self) -> Option<[u8; 32]> {
+        self.reserved_operation
+    }
+
     /// Returns the spend opening only to the local caller.
     pub fn input_note(&self) -> InputNote {
         InputNote {
@@ -253,8 +282,14 @@ impl OwnedNote {
         let mut owner = [0u8; 64];
         owner[..32].copy_from_slice(&self.owner_x);
         owner[32..].copy_from_slice(&self.owner_y);
-        let reconstructed =
-            Self::new(self.asset, self.amount, owner, self.spend_secret, self.salt)?;
+        let reconstructed = Self::new(
+            self.asset,
+            self.amount,
+            owner,
+            self.spend_secret,
+            self.salt,
+            self.note_domain,
+        )?;
         if reconstructed.commitment != self.commitment || reconstructed.nullifier != self.nullifier
         {
             return Err(WalletError::Note("stored opening mismatch"));
@@ -322,7 +357,7 @@ struct TransferReservation {
 impl Default for WalletSnapshot {
     fn default() -> Self {
         Self {
-            version: 1,
+            version: 2,
             notes: Vec::new(),
             transfers: Vec::new(),
             choices: Vec::new(),
@@ -564,6 +599,33 @@ impl WalletSnapshot {
         Ok(())
     }
 
+    /// Clears a local spend reservation once verified consumption is recorded.
+    ///
+    /// Refuses without consumption evidence, so an ambiguous broadcast stays reserved and
+    /// cannot be re-planned. The operation identity must be the one that reserved the note.
+    pub fn conclude_reservation(
+        &mut self,
+        commitment: &[u8; 32],
+        operation: [u8; 32],
+    ) -> Result<(), WalletError> {
+        let note = self
+            .notes
+            .iter_mut()
+            .find(|note| &note.commitment == commitment)
+            .ok_or(WalletError::Note("unknown note"))?;
+        if note.consumption.is_none() {
+            return Err(WalletError::Note("no verified consumption"));
+        }
+        if note.reserved_operation != Some(operation) {
+            return Err(WalletError::Note("reservation mismatch"));
+        }
+        note.reserved_operation = None;
+        if let Some(reservation) = self.transfers.iter_mut().find(|r| r.operation == operation) {
+            reservation.released = true;
+        }
+        Ok(())
+    }
+
     /// Applies one verified public insertion event to a precomputed local commitment.
     pub fn observe_insertion(
         &mut self,
@@ -636,14 +698,18 @@ impl WalletSnapshot {
         }
     }
 
-    fn validate(&self) -> Result<(), WalletError> {
-        if self.version != 1 {
+    fn validate(&self, domain: WalletDomain) -> Result<(), WalletError> {
+        if self.version != 2 {
             return Err(WalletError::InvalidFile);
         }
+        let note_domain = domain.note_domain()?;
         let mut commitments = HashSet::new();
         let mut nullifiers = HashSet::new();
         for note in &self.notes {
             note.validate()?;
+            if note.note_domain != note_domain {
+                return Err(WalletError::Note("note outside wallet domain"));
+            }
             if !commitments.insert(note.commitment) || !nullifiers.insert(note.nullifier) {
                 return Err(WalletError::Note("duplicate stored note"));
             }
@@ -743,7 +809,7 @@ impl WalletStore {
         let lock = self.lock()?;
         let mut snapshot = self.read_locked()?;
         let result = change(&mut snapshot)?;
-        snapshot.validate()?;
+        snapshot.validate(self.domain)?;
         self.write_locked(&snapshot)?;
         drop(lock);
         Ok(result)
@@ -794,7 +860,7 @@ impl WalletStore {
         let plaintext = Zeroizing::new(plaintext);
         let snapshot: WalletSnapshot =
             serde_json::from_slice(&plaintext).map_err(|_| WalletError::InvalidFile)?;
-        snapshot.validate()?;
+        snapshot.validate(self.domain)?;
         Ok(snapshot)
     }
 

@@ -251,6 +251,7 @@ async fn paired_bounded_wallet_recovery_persists_only_public_progress_until_comp
         WalletDomain {
             chain_id: 31337,
             pool: [3; 20],
+            verifier_version: 2,
         },
         [7; 32],
     )
@@ -301,6 +302,7 @@ async fn paired_finalized_wallet_recovery_never_writes_on_disagreement_or_peer_f
         WalletDomain {
             chain_id: 31_337,
             pool: [3; 20],
+            verifier_version: 2,
         },
         [7; 32],
     )
@@ -399,7 +401,8 @@ async fn shielded_history_rewinds_a_long_orphaned_suffix_with_bounded_rpc_work()
             through: 20
         }))
     ));
-    assert_eq!(state.logs.load(Ordering::SeqCst) - logs, 3);
+    // Three replayed blocks now share one bounded, contiguous log-range query.
+    assert_eq!(state.logs.load(Ordering::SeqCst) - logs, 1);
     assert!(state.headers.load(Ordering::SeqCst) - headers < 20);
     assert_eq!(
         store.load().unwrap().tip().unwrap().hash,

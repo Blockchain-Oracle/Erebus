@@ -7,7 +7,7 @@ use std::{
 };
 
 use erebus_shielded_prover::artifacts::{
-    ArtifactRelease, CircuitKind, InstallOptions, MAX_MANIFEST_BYTES,
+    ArtifactRelease, CircuitKind, InstallOptions, ManifestAuthorization, MAX_MANIFEST_BYTES,
 };
 use serde::Deserialize;
 use zeroize::Zeroizing;
@@ -17,6 +17,8 @@ use zeroize::Zeroizing;
 struct Request {
     manifest_file: PathBuf,
     manifest_sha256: String,
+    #[serde(default)]
+    manifest_authorization: Option<ManifestAuthorization>,
     circuit: CircuitKind,
     cache_root: PathBuf,
     witness_file: PathBuf,
@@ -91,8 +93,12 @@ async fn prove(request: Request) -> Result<serde_json::Value, &'static str> {
         .try_into()
         .map_err(|_| "invalid manifest digest")?;
     let bytes = read_file(&request.manifest_file, MAX_MANIFEST_BYTES, false)?;
-    let release = ArtifactRelease::authenticate(&bytes, expected)
-        .map_err(|_| "manifest not authenticated")?;
+    let release = ArtifactRelease::authenticate_authorized(
+        &bytes,
+        expected,
+        request.manifest_authorization.as_ref(),
+    )
+    .map_err(|_| "manifest not authenticated")?;
     let witness = read_file(&request.witness_file, 512 * 1024, true)?;
     let input = serde_json::from_slice(&witness).map_err(|_| "invalid local witness")?;
     let proof = release
