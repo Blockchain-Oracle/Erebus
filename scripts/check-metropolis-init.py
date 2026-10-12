@@ -129,7 +129,19 @@ def pool_flow(bins: Path, work: Path, pins: Path, pool: str, port_base: int, onl
         require(doctor.get("status") in expected, f"{pool} {role} doctor: {doctor}")
         if online:
             require(doctor["problems"] == ["the gas signer has no testnet MON yet"], f"{pool} {role} doctor problems: {doctor['problems']}")
+        policy = run(bins, work, ["--metropolis", "wallet-policy", "--directory", str(root / role), "--maximum-amount", "1000"])
+        require(policy.get("status") == "wallet-policy-written" and policy.get("allowed_methods") == ["notes", "sync"],
+                f"{pool} {role} default wallet policy: {policy}")
+        capabilities = run(bins, work, [], json.dumps({"method": "version"}), "erebus-wallet").get("result") or {}
+        funding = run(bins, work, ["--metropolis", "wallet-policy", "--directory", str(root / role), "--maximum-amount", "1000",
+                                   "--allow", "deposit"])
+        expected_funding = "wallet-policy-written" if capabilities.get("deposit_operation_references") is True else "error"
+        require(funding.get("status") == expected_funding, f"{pool} {role} deposit opt-in vs installed capability: {funding}")
+        if role == "buyer":
+            require("relay" not in json.loads((root / role / "payment.json").read_text()), f"{pool} direct buyer carries a relay field")
         report[role] = {"wallet_opens": True, "mcp_tools": tools, "doctor": doctor.get("status"),
+                        "wallet_policy_default": policy.get("allowed_methods"),
+                        "deposit_opt_in": funding.get("status"), "wallet_deposit_references": capabilities.get("deposit_operation_references") is True,
                         "doctor_checks": {k: v for k, v in doctor.get("checks", {}).items() if k != "owner_only"}}
     service = subprocess.Popen([str(bins / "erebus-access-service")], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                env={"PATH": f"{bins}:/usr/bin:/bin", "HOME": str(work / "home"),
@@ -156,7 +168,8 @@ def pool_flow(bins: Path, work: Path, pins: Path, pool: str, port_base: int, onl
     require(report["disclosure_check"] == "ok", f"{pool} disclosure check: {report['disclosure_check']}")
     # Operator configs must be owner-only; the hosting manifest copy and the Rust-written descriptor are public.
     configs = [root / role / name for role in ("buyer", "seller") for name in
-               ("wallet.json", "payment.json", "negotiate.json", "access.json", "mcp.json", "operator.json")] + [root / "auditor/disclosure.json"]
+               ("wallet.json", "payment.json", "negotiate.json", "access.json", "mcp.json", "operator.json", "wallet-policy.json")] + [
+               root / "auditor/disclosure.json"] + [p for p in root.rglob("*.key")]
     loose = [str(p.relative_to(root)) for p in configs if p.exists() and p.stat().st_mode & 0o077]
     require(not loose, f"{pool} configs readable by others: {loose}")
     return report

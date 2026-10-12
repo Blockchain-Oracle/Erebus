@@ -113,6 +113,7 @@ def init_args(world, role, **changes):
                   deployment=world.deployment, endpoint=f"127.0.0.1:{9101 if role == 'buyer' else 9102}",
                   rpc_url="https://a.example.net/", peer_rpc_url="https://b.example.net/", signer_address="0x" + "12" * 20,
                   transaction_key_file=None, maximum_price="800" if role == "buyer" else None,
+                  relay_url=None, relay_identity=None, relay_sponsor=None, relay_auth_key_file=None, relay_timeout_seconds=60,
                   descriptor_lifetime_seconds=86400, binding_lifetime_seconds=21600)
     values.update(changes)
     return SimpleNamespace(**values)
@@ -336,3 +337,66 @@ def test_wallet_status_is_optional_and_gated_on_paired_diagnostics(world, monkey
         init.wallet_policy(policy_args(world, allow=["status"]))
     monkeypatch.setattr(init, "command", capable(True))
     assert init.wallet_policy(policy_args(world, allow=["status"]))["allowed_methods"] == ["notes", "status", "sync"]
+
+
+
+def sponsored(world, **changes):
+    key = world.root / "relay.token"
+    if not key.exists():
+        key.write_bytes(b"\0" * 32)
+        key.chmod(0o600)
+    values = dict(relay_url="https://relay.example.net/v1/relay", relay_identity="ab" * 32,
+                  relay_sponsor="0x" + "5a" * 20, relay_auth_key_file=key)
+    values.update(changes)
+    return values
+
+
+def payment_capability(monkeypatch, advertised):
+    real = init.command
+
+    def fake(bins, name, request, cwd):
+        if name == "erebus-payment" and request == {"method": "version"}:
+            return {"status": "ok", "protocol_version": 1, **({"sponsored_relay": True} if advertised else {})}
+        return real(bins, name, request, cwd)
+    monkeypatch.setattr(init, "command", fake)
+
+
+def test_direct_buyers_never_get_a_relay_field(world):
+    init.init(init_args(world, "buyer"))
+    assert "relay" not in json.loads((world.root / "buyer/payment.json").read_text())
+
+
+def test_sponsored_setup_is_refused_without_the_advertised_payment_capability(world, monkeypatch):
+    payment_capability(monkeypatch, advertised=False)
+    with pytest.raises(ValueError, match="sponsored_relay: true"):
+        init.init(init_args(world, "buyer", **sponsored(world)))
+    assert not (world.root / "buyer").exists()
+
+
+@pytest.mark.parametrize("changes,message", [
+    (dict(transaction_key_file=Path("/etc/hosts")), "must not hold a transaction key"),
+    (dict(relay_url="http://relay.example.net/v1/relay"), "https"),
+    (dict(relay_url="https://relay.example.net/v1/other"), "/v1/relay"),
+    (dict(relay_identity="00" * 32), "nonzero 32-byte"),
+    (dict(relay_sponsor="0x" + "0" * 40), "nonzero gas address"),
+    (dict(relay_identity=None), "needs --relay-url"),
+])
+def test_sponsored_setup_validates_every_pinned_value(world, monkeypatch, changes, message):
+    payment_capability(monkeypatch, advertised=True)
+    values = {**sponsored(world), **changes}
+    with pytest.raises(ValueError, match=message):
+        init.init(init_args(world, "buyer", **values))
+    with pytest.raises(ValueError, match="only a buyer"):
+        init.init(init_args(world, "seller", **sponsored(world)))
+
+
+def test_sponsored_buyer_pins_the_relay_and_holds_no_transaction_key(world, monkeypatch):
+    payment_capability(monkeypatch, advertised=True)
+    init.init(init_args(world, "buyer", **sponsored(world)))
+    payment = json.loads((world.root / "buyer/payment.json").read_text())
+    assert payment["transaction_key_file"] is None
+    assert payment["relay"] == {"url": "https://relay.example.net/v1/relay", "identity": "ab" * 32,
+                                "authentication_key_file": str(world.root / "relay.token"),
+                                "sponsor_address": "0x" + "5a" * 20, "timeout_seconds": 60}
+    if (ROOT / "sdk/shielded/src/relay_client.rs").exists():
+        assert set(payment["relay"]) <= rust_fields("sdk/shielded/src/relay_client.rs", "pub struct RelayEndpoint")

@@ -57,6 +57,7 @@ import stat
 import subprocess
 import sys
 import time
+import urllib.parse
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -64,6 +65,7 @@ NAMESPACE_CHAIN = 10143
 COMMANDS = ("erebus-negotiate", "erebus-payment", "erebus-wallet", "erebus-access", "erebus-access-service",
             "erebus-shielded-disclosure", "erebus-artifacts", "erebus-local-prove", "erebus-mcp-server")
 ADDRESS = re.compile(r"0x[0-9a-f]{40}", re.ASCII)
+HEX64 = re.compile(r"[0-9a-f]{64}", re.ASCII)
 UNSIGNED = re.compile(r"[0-9]{1,78}", re.ASCII)
 GAS = {"gas_limit": 3000000, "max_fee_per_gas": "300000000000", "max_priority_fee_per_gas": "2000000000"}
 
@@ -201,6 +203,48 @@ def pins(args, opener=None) -> dict:
             "note": "publisher and digests come from the release's own commit; confirm them through a channel you trust"}
 
 
+PAYMENT_RELAY_CAPABILITY = "sponsored_relay"
+
+
+def sponsored_relay(args, bins: Path, cwd: Path) -> dict | None:
+    """Validate an explicitly requested sponsored relay, before anything is written.
+
+    Direct buyers get no `relay` field at all, which keeps configs valid for published payment binaries. A sponsored
+    buyer pins the relay URL, identity, sponsor and authentication key file, never holds a transaction key, and is
+    refused unless the installed erebus-payment advertises `sponsored_relay: true` in its version reply."""
+    values = [args.relay_url, args.relay_identity, args.relay_sponsor, args.relay_auth_key_file]
+    if not any(values):
+        return None
+    if not all(values):
+        raise ValueError("sponsored setup needs --relay-url, --relay-identity, --relay-sponsor and --relay-auth-key-file")
+    if args.role != "buyer":
+        raise ValueError("only a buyer submits through a sponsored relay")
+    if args.transaction_key_file is not None:
+        raise ValueError("a sponsored buyer must not hold a transaction key; omit --transaction-key-file")
+    url = urllib.parse.urlsplit(args.relay_url)
+    if url.scheme != "https" or url.path != "/v1/relay" or url.username or url.password or url.query or url.fragment or not url.hostname:
+        raise ValueError("--relay-url must be https://<host>/v1/relay without credentials, query or fragment")
+    identity = args.relay_identity.lower().removeprefix("0x")
+    if not HEX64.fullmatch(identity) or identity == "0" * 64:
+        raise ValueError("--relay-identity must be a nonzero 32-byte hex identity")
+    sponsor = args.relay_sponsor.lower()
+    if not ADDRESS.fullmatch(sponsor) or sponsor == "0x" + "0" * 40:
+        raise ValueError("--relay-sponsor must be the relay's canonical nonzero gas address")
+    key = args.relay_auth_key_file
+    if not key.is_absolute() or not key.is_file():
+        raise ValueError("--relay-auth-key-file must be an existing absolute owner-only file (it is not read here)")
+    if stat.S_IMODE(key.stat().st_mode) & 0o077:
+        raise ValueError("--relay-auth-key-file must be owner-only")
+    if not 1 <= args.relay_timeout_seconds <= 900:
+        raise ValueError("--relay-timeout-seconds must be between 1 and 900")
+    reply = command(bins, "erebus-payment", {"method": "version"}, cwd)
+    if reply.get(PAYMENT_RELAY_CAPABILITY) is not True:
+        raise ValueError(f"the installed erebus-payment does not advertise `{PAYMENT_RELAY_CAPABILITY}: true` in its version "
+                         "reply; sponsored setup refused and nothing was written. Direct submission is not used instead.")
+    return {"url": args.relay_url, "identity": identity, "authentication_key_file": str(key),
+            "sponsor_address": sponsor, "timeout_seconds": args.relay_timeout_seconds}
+
+
 def init(args) -> dict:
     directory = args.directory.resolve()
     if directory.exists():
@@ -221,6 +265,7 @@ def init(args) -> dict:
     record, pool = pool_entry(args.deployment, args.pool)
     pins = release_pins(args.pins.resolve(), args.pool)
     checked = verify_installed(bins, pins["release"])
+    sponsored = sponsored_relay(args, bins, directory.parent)
     manifest = json.loads(pins["manifest"].read_text())
     if str(manifest.get("settlement_contract")).lower() != pool["pool"].lower() or manifest.get("chain_id") != NAMESPACE_CHAIN:
         raise ValueError("the hosting manifest names a different pool")
@@ -287,7 +332,8 @@ def init(args) -> dict:
             "manifest_file": wallet["artifact_manifest_file"], "manifest_sha256": pins["manifest_sha256"],
             "manifest_authorization": authorization, "artifact_cache": wallet["artifact_cache_root"],
             "allow_test_artifacts": wallet["allow_test_artifacts"], "allow_loopback_http": False,
-            "maximum_price": args.maximum_price, **GAS, "timeout_seconds": 30, "max_scan_blocks": 1000})
+            "maximum_price": args.maximum_price, **({"relay": sponsored} if sponsored else {}), **GAS,
+            "timeout_seconds": 30, "max_scan_blocks": 1000})
         written.append("payment.json")
     summary = {"version": 1, "role": args.role, "pool": args.pool, "settlement_contract": pool["pool"].lower(),
                "asset": asset, "chain_id": NAMESPACE_CHAIN, "endpoint": args.endpoint, "signer_address": signer,
@@ -582,6 +628,11 @@ def main(argv=None) -> int:
     first.add_argument("--signer-address", required=True)
     first.add_argument("--transaction-key-file", type=Path)
     first.add_argument("--maximum-price", help="buyer: highest price in base units")
+    first.add_argument("--relay-url", help="sponsored buyer: https://<host>/v1/relay (needs an advertised payment capability)")
+    first.add_argument("--relay-identity", help="sponsored buyer: the relay's 32-byte service identity")
+    first.add_argument("--relay-sponsor", help="sponsored buyer: the relay's public gas address")
+    first.add_argument("--relay-auth-key-file", type=Path, help="sponsored buyer: owner-only bearer key file (path only)")
+    first.add_argument("--relay-timeout-seconds", type=int, default=60)
     first.add_argument("--descriptor-lifetime-seconds", type=int, default=86400)
     first.add_argument("--binding-lifetime-seconds", type=int, default=21600)
     second = commands.add_parser("connect")
