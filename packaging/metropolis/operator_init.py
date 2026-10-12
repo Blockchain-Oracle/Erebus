@@ -7,6 +7,7 @@
                              --signer-address 0x.. [--transaction-key-file PATH] [--maximum-price N]
     operator_init.py connect --directory DIR --peer-share DIR --resource NAME --amount N
                              [--payload-file FILE --port N] (seller)   [--minimum-price N]
+    operator_init.py doctor  --directory DIR [--offline]
     operator_init.py auditor --pool wmon|usdc --directory NEW --bin DIR --deployment FILE
                              --rpc-url URL --peer-rpc-url URL
 
@@ -27,6 +28,12 @@ descriptor and binding for the counterparty, plus the seller's offer after `conn
 the terms template and writes `negotiate.json`, the seller's `access.json`, and `mcp.json` (environment for
 `erebus-mcp-server` with `EREBUS_BACKEND=metropolis`).
 
+`doctor` is read-only and prints no secrets. It reports whether the installed commands still match the hashes
+recorded at `init`, whether every configured key file, config and state directory is owner-only (key files
+are never opened), whether the pinned manifest is unchanged, how much of it is cached, whether the wallet
+opens (note count only), and, unless `--offline`, whether both RPC endpoints pass the installed network check
+on chain 10143 and the gas signer's native balance on each.
+
 `auditor` creates an auditor key with the installed `erebus-shielded-disclosure` and renders the disclosure
 deployment config (see `disclosure_config.py`).
 
@@ -44,6 +51,7 @@ import os
 import platform
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -381,6 +389,83 @@ def release_pins_from(operator: dict) -> dict:
                                     "binaries": {name: {"sha256": digest} for name, digest in operator["binaries_sha256"].items()}}}}
 
 
+def rpc_balance(url: str, address: str) -> int:
+    import urllib.request
+    body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "eth_getBalance", "params": [address, "finalized"]}).encode()
+    with urllib.request.urlopen(urllib.request.Request(url, body, {"content-type": "application/json"}), timeout=30) as response:
+        return int(json.loads(response.read(1 << 16))["result"], 16)
+
+
+def network_check(bins: Path, url: str, cwd: Path) -> dict:
+    """The installed read-only network check; its reply carries `passed`, not `status`."""
+    result = subprocess.run([str(bins / "erebus-network-check")], capture_output=True, text=True, timeout=120, cwd=cwd,
+                            input=json.dumps({"chain_id": NAMESPACE_CHAIN, "rpc_url": url, "timeout_ms": 15000}),
+                            env={"PATH": f"{bins}{os.pathsep}/usr/bin:/bin", "HOME": str(cwd)})
+    return json.loads(result.stdout)
+
+
+def doctor(args) -> dict:
+    directory = args.directory.resolve()
+    operator = json.loads((directory / "operator.json").read_text())
+    bins = Path(operator["bin"])
+    checks, problems = {}, []
+
+    def owner_only(path: Path, directory_expected: bool = False) -> bool:
+        info = path.lstat()
+        kind_ok = stat.S_ISDIR(info.st_mode) if directory_expected else stat.S_ISREG(info.st_mode)
+        return kind_ok and not stat.S_IMODE(info.st_mode) & 0o077
+
+    try:
+        verify_installed(bins, release_pins_from(operator))
+        checks["installed_commands"] = "match the release"
+    except ValueError as error:
+        problems.append(str(error))
+    configs = [name for name in ("wallet.json", "payment.json", "negotiate.json", "access.json", "mcp.json", "operator.json")
+               if (directory / name).exists()]
+    keys = [Path(path) for name, path in operator["operator"].items() if name.endswith("_file") and "descriptor" not in name]
+    wallet = json.loads((directory / "wallet.json").read_text())
+    if wallet.get("transaction_key_file"):
+        keys.append(Path(wallet["transaction_key_file"]))
+    loose = [str(path.relative_to(directory)) if path.is_relative_to(directory) else path.name
+             for path in [directory / name for name in configs] + keys if not path.exists() or not owner_only(path)]
+    loose += [name for name in ("state", "keys", "share") if not owner_only(directory / name, True)]
+    if loose:
+        problems.append(f"not owner-only or missing: {loose}")
+    checks["owner_only"] = {"configs": len(configs), "key_files": len(keys), "problems": loose}
+    manifest = Path(wallet["artifact_manifest_file"])
+    if sha256(manifest) != wallet["artifact_manifest_sha256"] or wallet["artifact_manifest_sha256"] != operator["hosting_manifest_sha256"]:
+        problems.append("the pinned artifact manifest changed")
+    circuits = json.loads(manifest.read_text())["circuits"]
+    wanted = [circuit[field]["sha256"] for circuit in circuits for field in ("wasm", "r1cs", "zkey")]
+    cache = Path(wallet["artifact_cache_root"])
+    checks["artifact_cache"] = {"cached": sum((cache / f"{digest}.artifact").exists() for digest in wanted), "of": len(wanted),
+                                "note": "missing artifacts download over HTTPS on first proof"}
+    try:
+        notes = command(bins, "erebus-wallet", {"method": "notes", "config_file": str(directory / "wallet.json")}, directory)
+        checks["wallet"] = {"opens": True, "notes": len(notes["result"]["notes"]), "operations": len(notes["result"]["operations"])}
+    except ValueError as error:
+        problems.append(f"wallet does not open: {error}")
+    if not args.offline:
+        endpoints = {}
+        for label in ("rpc_url", "peer_rpc_url"):
+            url = wallet[label]
+            try:
+                check = network_check(bins, url, directory)
+                endpoints[label] = {"passed": check.get("passed"), "finalized": (check.get("finalized") or {}).get("number"),
+                                    "signer_balance_wei": rpc_balance(url, wallet["signer_address"])}
+                if check.get("passed") is not True:
+                    problems.append(f"{label} failed the network check")
+            except (OSError, ValueError, KeyError, subprocess.TimeoutExpired) as error:
+                endpoints[label] = {"passed": False}
+                problems.append(f"{label} unreachable: {type(error).__name__}")
+        checks["endpoints"] = endpoints
+        if all(entry.get("signer_balance_wei") == 0 for entry in endpoints.values()):
+            problems.append("the gas signer has no testnet MON yet")
+    return {"status": "healthy" if not problems else "attention", "role": operator["role"], "pool": operator["pool"],
+            "release_version": operator["release_version"], "signer_address": operator["signer_address"],
+            "checks": checks, "problems": problems, "secrets_printed": False}
+
+
 def auditor(args) -> dict:
     directory = args.directory.resolve()
     if directory.exists():
@@ -427,6 +512,9 @@ def main() -> int:
     second.add_argument("--payload-file", type=Path)
     second.add_argument("--port", type=int)
     second.add_argument("--delivery-seconds", type=int, default=21600)
+    checkup = commands.add_parser("doctor")
+    checkup.add_argument("--directory", type=Path, required=True)
+    checkup.add_argument("--offline", action="store_true", help="skip RPC endpoint and balance checks")
     third = commands.add_parser("auditor")
     third.add_argument("--pool", choices=("wmon", "usdc"), required=True)
     third.add_argument("--directory", type=Path, required=True)
@@ -436,7 +524,7 @@ def main() -> int:
     third.add_argument("--peer-rpc-url", required=True)
     args = parser.parse_args()
     try:
-        result = {"pins": pins, "init": init, "connect": connect, "auditor": auditor}[args.command](args)
+        result = {"pins": pins, "init": init, "connect": connect, "doctor": doctor, "auditor": auditor}[args.command](args)
     except (OSError, ValueError, KeyError, TypeError) as error:
         print(json.dumps({"status": "error", "error": str(error) if isinstance(error, ValueError) else type(error).__name__}))
         return 2

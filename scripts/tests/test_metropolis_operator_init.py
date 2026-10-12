@@ -79,7 +79,9 @@ def world(tmp_path, monkeypatch):
     manifests = {}
     for name, (pool, _) in POOLS.items():
         manifest = {"version": 2, "chain_id": 10143, "settlement_contract": pool, "verifier_version": 2, "test_only": True,
-                    "circuits": [{"kind": kind, "identity": {"verifier_runtime_keccak256": PIN}} for kind in ("deposit", "transfer", "withdraw")]}
+                    "circuits": [{"kind": kind, "identity": {"verifier_runtime_keccak256": PIN},
+                                  **{field: {"sha256": hashlib.sha256(f"{kind}.{field}".encode()).hexdigest(), "bytes": 1}
+                                     for field in ("wasm", "r1cs", "zkey")}} for kind in ("deposit", "transfer", "withdraw")]}
         (pins / f"manifest-{name}.json").write_text(json.dumps(manifest))
         (pins / f"manifest-{name}.signature.json").write_text(json.dumps({"version": 1, "signature_hex": "ab"}))
         manifests[name] = hashlib.sha256((pins / f"manifest-{name}.json").read_bytes()).hexdigest()
@@ -224,3 +226,18 @@ def test_pins_downloads_over_https_from_the_release_commit_and_checks_manifests(
         init.pins(SimpleNamespace(version="0.3.0.dev1", directory=tmp_path / "pins-2"), opener)
     with pytest.raises(ValueError, match="https"):
         init.https("http://example.net/x", opener)
+
+
+def test_doctor_is_read_only_and_flags_drift_without_printing_secrets(world, monkeypatch):
+    init.init(init_args(world, "buyer"))
+    monkeypatch.setattr(init, "command", lambda bins, name, request, cwd: {"status": "ok", "result": {"notes": [], "operations": []}})
+    healthy = init.doctor(SimpleNamespace(directory=world.root / "buyer", offline=True))
+    assert healthy["status"] == "healthy" and healthy["secrets_printed"] is False
+    assert healthy["checks"]["owner_only"]["problems"] == [] and healthy["checks"]["artifact_cache"]["of"] == 9
+    rendered = json.dumps(healthy)
+    for key in (world.root / "buyer/keys").glob("*.key"):
+        assert key.read_bytes().hex() not in rendered
+    (world.root / "buyer/wallet.json").chmod(0o644)
+    (world.bins / "erebus-wallet").write_text("#!/bin/sh\necho changed\n")
+    problems = " ".join(init.doctor(SimpleNamespace(directory=world.root / "buyer", offline=True))["problems"])
+    assert "erebus-wallet is not the published binary" in problems and "wallet.json" in problems

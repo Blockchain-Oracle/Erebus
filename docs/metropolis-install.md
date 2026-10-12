@@ -341,6 +341,14 @@ for the buyer. `connect` re-checks the installed hashes, prepares the terms temp
 `negotiate.json` and `mcp.json` (an `erebus-mcp-server` entry with `EREBUS_BACKEND=metropolis`). `auditor`
 creates an auditor key and the disclosure config.
 
+`doctor --directory DIR` is read-only and prints no secrets. It checks:
+
+- installed binary hashes against those recorded at `init`;
+- that configs, key files (never opened) and state directories are owner-only;
+- the pinned manifest and artifact cache coverage;
+- that the wallet opens (note count only);
+- both RPC endpoints, via the installed network check, and the gas signer's balance on each. Use `--offline` to skip these.
+
 On 2026-10-12, with the published release, the installed commands accepted the generated configs:
 `erebus-wallet notes` read both wallets, both MCP servers listed their tools, and the access service
 answered `/healthz` from `access.json`. Funding still uses `erebus-wallet` (`wrap`, `approve`, `deposit`).
