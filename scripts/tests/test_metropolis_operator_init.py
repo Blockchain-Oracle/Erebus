@@ -54,6 +54,15 @@ print(json.dumps({"status": "ok", "public_key": "00" * 32}))
 '''
 
 
+def rust_optional(relative: str, opener: str, within: str | None = None) -> set[str]:
+    """Fields marked `#[serde(default)]`: the binary accepts them absent."""
+    source = (ROOT / relative).read_text()
+    if within is not None:
+        source = source[source.index(within):]
+    match = re.search(re.escape(opener) + r"\s*\{(.*?)\n\s*\}", source, re.S)
+    return set(re.findall(r"#\[serde\(default[^\]]*\)\]\s*(?:///[^\n]*\s*)*(?:pub\s+)?([a-z_][a-z0-9_]*)\s*:", match.group(1)))
+
+
 def rust_fields(relative: str, opener: str, within: str | None = None) -> set[str]:
     """Field names of a strict Rust struct or struct-like enum variant, read from the source."""
     source = (ROOT / relative).read_text()
@@ -140,8 +149,15 @@ def test_full_setup_writes_exactly_the_strict_rust_schemas(world):
         seller / "access.json": rust_fields(f"{shielded}/erebus_access_service.rs", "struct Config")
         - {"profile", "max_response_bytes", "feed_file"},
     }
+    optional = {buyer / "wallet.json": (f"{shielded}/erebus_wallet.rs", "struct Config"),
+                buyer / "payment.json": (f"{shielded}/payment/shielded.rs", "struct ShieldedConfig"),
+                buyer / "negotiate.json": (f"{shielded}/erebus_negotiate.rs", "struct Config"),
+                seller / "negotiate.json": (f"{shielded}/erebus_negotiate.rs", "struct Config"),
+                seller / "access.json": (f"{shielded}/erebus_access_service.rs", "struct Config")}
     for path, fields in expected.items():
-        assert set(json.loads(path.read_text())) == fields, path.name
+        keys = set(json.loads(path.read_text()))
+        accepted_absent = rust_optional(*optional[path])
+        assert fields - accepted_absent <= keys <= fields, (path.name, sorted(fields - keys - accepted_absent), sorted(keys - fields))
         assert owner_only(path), path.name
     backend = json.loads((seller / "access.json").read_text())["backend"]
     assert set(backend) - {"mode"} == rust_fields(f"{shielded}/erebus_access_service.rs", "Shielded", within="enum Backend")
