@@ -182,3 +182,20 @@ def test_wheels_without_their_licenses_are_refused(tmp_path):
     wheel("erebus_mcp_server-0.1-py3-none-any.whl", [])
     with pytest.raises(ValueError, match="missing license"):
         registry.require_licenses(tmp_path)
+
+
+# Binaries that exist in a crate but are deliberately not shipped. Empty today; the relayer service, when it
+# gains a binary, must be added to BINARY_GROUPS (and qualified) or listed here with a reason.
+UNPACKAGED_BINARIES: dict[str, str] = {}
+
+
+def test_every_shielded_binary_is_packaged_or_explicitly_excluded():
+    crate = ROOT / "sdk/shielded"
+    manifest = tomllib.loads((crate / "Cargo.toml").read_text())
+    explicit = manifest.get("bin", [])
+    claimed = {binary.get("path") for binary in explicit}
+    targets = {binary["name"] for binary in explicit} | {
+        path.stem for path in (crate / "src/bin").glob("*.rs") if f"src/bin/{path.name}" not in claimed}
+    packaged = set(registry.BINARY_GROUPS["sdk/shielded"])
+    unaccounted = sorted(targets - packaged - set(UNPACKAGED_BINARIES))
+    assert not unaccounted, f"new shielded binaries need a packaging decision: {unaccounted}"

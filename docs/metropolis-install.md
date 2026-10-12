@@ -257,7 +257,7 @@ uv pip install --python erebus-metropolis/bin/python \
   --no-config \
   --index https://poulavbhowmick03.github.io/erebus-metropolis/simple/ \
   --default-index https://pypi.org/simple --index-strategy first-index \
-  "erebus-mcp-server==0.3.0.dev5"
+  "erebus-mcp-server==0.3.0.dev2026101202"
 export PATH="$PWD/erebus-metropolis/bin:$PATH"
 printf '%s' '{"method":"version"}' | erebus-negotiate
 ```
@@ -304,6 +304,89 @@ uv run --locked python scripts/build-metropolis-registry.py \
   --version 0.3.0.dev20261004 --profile release --build --output artifacts/metropolis-registry
 uv run --locked python scripts/check-metropolis-install.py --registry artifacts/metropolis-registry
 ```
+
+### One-step operator setup (private settlement)
+
+After installing, `packaging/metropolis/operator_init.py` prepares one operator from the published release.
+`pins` downloads the public inputs over HTTPS:
+
+- the release manifest;
+- the owner authorization and deployment record at the release's source commit;
+- each authorized pool's hosting manifest and signature.
+
+It checks the manifests against the authorization. Confirm the publisher address through a channel you trust.
+
+```sh
+B="$PWD/erebus-metropolis/bin"
+python3 packaging/metropolis/operator_init.py pins --version 0.3.0.dev2026101202 --directory ./pins
+python3 packaging/metropolis/operator_init.py init --role buyer --pool wmon --directory ./buyer \
+  --bin "$B" --pins ./pins --deployment ./pins/monad-testnet-shielded-v2.json \
+  --endpoint 127.0.0.1:9101 --rpc-url https://testnet-rpc.monad.xyz --peer-rpc-url https://rpc.ankr.com/monad_testnet \
+  --signer-address <your funded gas address> --transaction-key-file <owner-only gas key file> \
+  --maximum-price <base units>
+# send ./buyer/share to the seller; after receiving the seller's share (including offer.json):
+python3 packaging/metropolis/operator_init.py connect --directory ./buyer --peer-share ./seller-share \
+  --resource dataset.snapshot.v1 --amount <opening price>
+```
+
+`init` checks that every installed command matches the release manifest for this platform, and that the
+pool's hosting manifest matches the authorization and the deployment's verifier pins. It then runs the
+installed `erebus-negotiate` to create suite-2 keys and the identity binding. Rust creates all keys; the
+script passes paths only, and the gas key is the operator's own. It writes owner-only `wallet.json`, plus
+`payment.json` for a buyer. Both carry the five runtime pins and the publisher-signed manifest
+authorization, so artifacts install over HTTPS on first use.
+
+A seller runs `connect` with `--payload-file` and `--port`. That writes `access.json` and an `offer.json`
+for the buyer. `connect` re-checks the installed hashes, prepares the terms template, and writes
+`negotiate.json` and `mcp.json` (an `erebus-mcp-server` entry with `EREBUS_BACKEND=metropolis`). `auditor`
+creates an auditor key and the disclosure config.
+
+On 2026-10-12, with the published release, the installed commands accepted the generated configs:
+`erebus-wallet notes` read both wallets, both MCP servers listed their tools, and the access service
+answered `/healthz` from `access.json`. Funding still uses `erebus-wallet` (`wrap`, `approve`, `deposit`).
+The script lives in the repository, not in the wheels.
+
+### Verify a public installation
+
+`scripts/check-metropolis-public-install.py --version V --authorization packaging/metropolis/testnet-release.json
+--witnesses wmon=DIR --witnesses usdc=DIR` works in a new directory with a new uv cache:
+
+1. installs from the public index;
+2. requires every installed command to match the release manifest;
+3. proves deposit, transfer and withdrawal for both pools over public HTTPS from empty caches, with the
+   pinned publisher;
+4. requires a wrong publisher to be refused.
+
+`.github/workflows/metropolis-public-install.yml` runs the same check on native `macos-14` and
+`ubuntu-latest` runners, dispatch-only and read-only. It regenerates synthetic per-pool witnesses from the
+hosted artifacts. It has not been dispatched yet. Locally on macOS arm64, version `0.3.0.dev2026101202`
+verified: 16 commands matched, both pools proved, and both wrong-publisher attempts were refused.
+
+### Read-only demo
+
+`scripts/metropolis-demo-readonly.py --bin <installed bin>` prints labelled sections for a recording:
+
+- CURRENT: installed command versions and hashes;
+- CURRENT: the live network check;
+- CURRENT: each pool's runtime keccak at the finalized block, compared with the deployment pins (needs `cast`);
+- HISTORICAL: the finalized private WMON payment receipt, including its public gas sender.
+
+It needs no keys and sends nothing.
+
+### Withdrawing or superseding a release
+
+Releases are never overwritten or deleted. The index lists every non-draft `v…devN` release, so pinned
+installs of older versions keep working. To supersede a release, publish a fixed version and note the
+reason in the old release's notes. To withdraw one from new installs, the owner converts that GitHub
+release to a draft and re-runs the registry index (`Metropolis package index`, dispatch with the latest
+tag). Its wheels then disappear from the index; existing environments are unaffected. Retention was last
+verified on 2026-10-12: the index lists dev4, dev5 and dev2026101202.
+
+### Relayer packaging
+
+The relayer is library code only. When it gains a binary, `test_every_shielded_binary_is_packaged_or_explicitly_excluded`
+fails until the binary is added to the build inventory (and then qualified) or explicitly excluded. Its
+installed gates are qualified on a separately frozen revision, never on the published release's identity.
 
 ## 11. Candidate package qualification (unreleased)
 
@@ -656,7 +739,27 @@ The first Linux check attempt failed before any proof. Its harness was mounted a
 the retry with the harness under `/harness/scripts` passed. Reports are in
 `.local/metropolis/candidate-20261010/` (`*-r2*`, `bundle-source-check.txt`, `candidate-identity-r2.json`).
 
-### 2026-10-12 results, r7 packages (current)
+### 2026-10-12: published 0.3.0.dev2026101202 (shielded testnet prerelease)
+
+Built natively from clean commit `07e6949c9a6593cc8c051ddbd096ea64c82e7ee1` (input tree `e4e4f832…`) by
+[run 38227563253](https://github.com/PoulavBhowmick03/Erebus/actions/runs/38227563253) with `publish=false`.
+Both native legs and compare passed. Each leg installed outside the checkout and passed onboarding. It
+proved all three transitions for both pools over real HTTPS with publisher
+`0xcd71b49f350f536ee4c4a27c8d0104be91f684fe`, and every refusal held. It passed the asset, metered and x402
+rehearsals on local Anvil, with `native_platform_qualification: true`. The pure wheels are byte-identical
+across legs.
+
+`publish-metropolis-release.py --authorization packaging/metropolis/testnet-release.json --run-id 38227563253`
+qualified the artifacts, then published
+[v0.3.0.dev2026101202](https://github.com/PoulavBhowmick03/erebus-metropolis/releases/tag/v0.3.0.dev2026101202)
+(`release-manifest.json` `f5a98837…4c99`). Uploaded digests match the CI artifacts. The registry's `pages.yml`
+was first updated from the cumulative template (it skips `artifacts-*` releases); the index now lists
+dev4, dev5 and dev2026101202. A fresh public install on macOS arm64, with a fresh cache, matched all 16
+installed hashes. It produced verified proofs for both pools over public HTTPS from empty caches and
+refused a wrong publisher. That is team evidence: test-only, single-operator, unaudited, with no outside
+acceptance and no live payment from this release yet.
+
+### 2026-10-12 results, r7 packages (local; superseded by the published release)
 
 Codex's withdrawal-receipt candidate `e4e4f8323ba40e34ac4701d04d52d55f1ca5182328d9b2bf81a75fcc8f495130` (HEAD `94aa059`,
 merge `a5dd7a2`, 191 inputs, 59 changed, `release_eligible: false`). The identity was the same before the build,
