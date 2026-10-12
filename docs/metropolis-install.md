@@ -410,7 +410,8 @@ one. `wallet-policy` writes an owner-only `wallet-policy.json` and adds `EREBUS_
 `EREBUS_WALLET_POLICY` and `EREBUS_WALLET_CLI` to `mcp.json`. It enables a funding method only if the installed
 `erebus-wallet` advertises durable operation references for it. Releases up to `0.3.0.dev2026101202` advertise
 none, so those get reads only. It refuses `wrap`/`unwrap` outside the WMON pool, `withdraw` without named
-recipients, and `replace` without fee caps. The MCP wallet tools ship only in releases that include them. `doctor` reports an unfunded signer until it holds testnet MON. To change RPC endpoints there is no
+recipients, and `replace` without fee caps. `--allow status` adds the read-only paired account diagnostic, but
+only when the installed wallet advertises `paired_account_diagnostics`. The MCP wallet tools ship only in releases that include them. `doctor` reports an unfunded signer until it holds testnet MON. To change RPC endpoints there is no
 installed command yet; see "Operations rehearsals" below.
 
 ### Installed-init and operations qualification

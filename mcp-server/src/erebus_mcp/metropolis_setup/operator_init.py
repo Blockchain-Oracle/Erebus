@@ -470,6 +470,8 @@ def doctor(args) -> dict:
 
 WALLET_READS = ("notes", "sync")
 WALLET_WRITES = ("approve", "wrap", "unwrap", "deposit", "withdraw", "resume", "replace")
+# Optional read actions: never enabled by default, each gated on an installed capability.
+WALLET_OPTIONAL_READS = {"status": "paired_account_diagnostics"}
 
 
 def replace_private_json(path: Path, data: dict) -> None:
@@ -492,7 +494,7 @@ def wallet_policy(args) -> dict:
     if int(maximum) == 0:
         raise ValueError("--maximum-amount must be positive")
     allowed = set(args.allow)
-    unknown = allowed - set(WALLET_WRITES)
+    unknown = allowed - set(WALLET_WRITES) - set(WALLET_OPTIONAL_READS)
     if unknown:
         raise ValueError(f"unsupported wallet methods: {sorted(unknown)}")
     if {"wrap", "unwrap"} & allowed and operator["pool"] != "wmon":
@@ -522,6 +524,9 @@ def wallet_policy(args) -> dict:
         raise ValueError("the installed erebus-wallet lacks durable deposit references; deposit stays disabled")
     if {"approve", "wrap", "unwrap"} & allowed and capabilities.get("funding_operation_references") is not True:
         raise ValueError("the installed erebus-wallet lacks durable funding references; approve/wrap/unwrap stay disabled")
+    for method, capability in WALLET_OPTIONAL_READS.items():
+        if method in allowed and capabilities.get(capability) is not True:
+            raise ValueError(f"the installed erebus-wallet lacks {capability}; {method} stays disabled")
     policy = {"version": 1, "maximum_amount": maximum, "allowed_methods": sorted(set(WALLET_READS) | allowed),
               "withdrawal_recipients": recipients}
     if fees is not None:
@@ -596,8 +601,8 @@ def main(argv=None) -> int:
     policy = commands.add_parser("wallet-policy", help="explicit agent wallet permissions (default: notes and sync only)")
     policy.add_argument("--directory", type=Path, required=True)
     policy.add_argument("--maximum-amount", required=True, help="per-action cap in base units")
-    policy.add_argument("--allow", action="append", default=[], choices=WALLET_WRITES,
-                        help="repeatable: a write method agents may call; none by default")
+    policy.add_argument("--allow", action="append", default=[], choices=(*WALLET_WRITES, *WALLET_OPTIONAL_READS),
+                        help="repeatable: a write method, or the optional status read, agents may call; none by default")
     policy.add_argument("--withdrawal-recipient", action="append", default=[], help="repeatable; required with --allow withdraw")
     policy.add_argument("--replacement-fees", nargs=2, metavar=("MAX_FEE", "PRIORITY_FEE"), help="required with --allow replace")
     third = commands.add_parser("auditor")

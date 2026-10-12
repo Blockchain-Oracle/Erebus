@@ -317,3 +317,22 @@ def test_wallet_policy_refuses_wrap_on_the_usdc_pool_and_changed_binaries(world,
     (world.bins / "erebus-wallet").write_text("#!/bin/sh\necho changed\n")
     with pytest.raises(ValueError, match="erebus-wallet is not the published binary"):
         init.wallet_policy(policy_args(world))
+
+
+def test_wallet_status_is_optional_and_gated_on_paired_diagnostics(world, monkeypatch):
+    init.init(init_args(world, "buyer"))
+    real = init.command
+
+    def capable(diagnostics):
+        def fake(bins, name, request, cwd):
+            if name == "erebus-wallet" and request == {"method": "version"}:
+                return {"status": "ok", "result": {"protocol": 1, "methods": ["notes", "sync", "status", *init.WALLET_WRITES],
+                        "paired_account_diagnostics": diagnostics}}
+            return real(bins, name, request, cwd)
+        return fake
+    monkeypatch.setattr(init, "command", capable(False))
+    assert "status" not in init.wallet_policy(policy_args(world))["allowed_methods"]
+    with pytest.raises(ValueError, match="paired_account_diagnostics"):
+        init.wallet_policy(policy_args(world, allow=["status"]))
+    monkeypatch.setattr(init, "command", capable(True))
+    assert init.wallet_policy(policy_args(world, allow=["status"]))["allowed_methods"] == ["notes", "status", "sync"]
