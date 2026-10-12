@@ -37,6 +37,9 @@ on:
       deployment_record:
         description: "Deployment record whose every pool the hosted packages must record and prove"
         default: "contracts/evm/deployments/monad-testnet-shielded-v2.json"
+      public_install_version:
+        description: "Only verify a published version from the public index on native runners (no build, no publish)"
+        default: ""
 
 permissions:
   contents: read
@@ -46,8 +49,16 @@ env:
   METROPOLIS_VERSION: ${{ inputs.version || format('0.3.0.dev{0}', github.run_number) }}
 
 jobs:
+  public-install:
+    name: Public install
+    if: ${{ inputs.public_install_version != '' && inputs.public_install_version != null }}
+    uses: ./.github/workflows/metropolis-public-install.yml
+    with:
+      version: ${{ inputs.public_install_version }}
+
   build:
     name: ${{ matrix.platform }}
+    if: ${{ inputs.public_install_version == '' || inputs.public_install_version == null }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false

@@ -10,6 +10,13 @@ on:
       version:
         description: "Published version, for example 0.3.0.dev2026101202"
         required: true
+  # Also called by metropolis-registry.yml (public_install_version), which is dispatchable from the
+  # default branch while this file exists only on metropolis.
+  workflow_call:
+    inputs:
+      version:
+        type: string
+        required: true
 
 permissions:
   contents: read

@@ -51,3 +51,10 @@ def test_the_workflow_runs_the_check_on_both_native_platforms_without_publishing
     assert "on:\n  workflow_dispatch:\n    inputs:\n      version:" in text and "push:" not in text
     for forbidden in ("gh release", "gh api", "secrets.", "mapfile", "git push"):
         assert forbidden not in text
+
+
+def test_the_registry_workflow_can_run_only_the_public_install_check():
+    text = (ROOT / ".github/workflows/metropolis-registry.yml").read_text()
+    assert "uses: ./.github/workflows/metropolis-public-install.yml" in text
+    assert "if: ${{ inputs.public_install_version == '' || inputs.public_install_version == null }}" in text
+    assert "workflow_call:" in (ROOT / ".github/workflows/metropolis-public-install.yml").read_text()
