@@ -8,6 +8,8 @@
     operator_init.py connect --directory DIR --peer-share DIR --resource NAME --amount N
                              [--payload-file FILE --port N] (seller)   [--minimum-price N]
     operator_init.py doctor  --directory DIR [--offline]
+    operator_init.py wallet-policy --directory DIR --maximum-amount N [--allow METHOD ...]
+                             [--withdrawal-recipient ADDR ...] [--replacement-fees MAX PRIORITY]
     operator_init.py auditor --pool wmon|usdc --directory NEW --bin DIR --deployment FILE
                              --rpc-url URL --peer-rpc-url URL
 
@@ -466,6 +468,82 @@ def doctor(args) -> dict:
             "checks": checks, "problems": problems, "secrets_printed": False}
 
 
+WALLET_READS = ("notes", "sync")
+WALLET_WRITES = ("approve", "wrap", "unwrap", "deposit", "withdraw", "resume", "replace")
+
+
+def replace_private_json(path: Path, data: dict) -> None:
+    """Rewrite an owner-only file atomically; the new file is created 0600 before any bytes are written."""
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    private_json(temporary, data)
+    os.replace(temporary, path)
+
+
+def wallet_policy(args) -> dict:
+    """Write an explicit wallet action policy and add the wallet to this operator's MCP settings.
+
+    Reads (notes, sync) are always allowed; every write method must be named with --allow. Funding methods
+    are enabled only when the installed erebus-wallet advertises durable operation references."""
+    directory = args.directory.resolve()
+    operator = json.loads((directory / "operator.json").read_text())
+    bins = Path(operator["bin"])
+    verify_installed(bins, release_pins_from(operator))
+    maximum = require_unsigned(args.maximum_amount, "--maximum-amount")
+    if int(maximum) == 0:
+        raise ValueError("--maximum-amount must be positive")
+    allowed = set(args.allow)
+    unknown = allowed - set(WALLET_WRITES)
+    if unknown:
+        raise ValueError(f"unsupported wallet methods: {sorted(unknown)}")
+    if {"wrap", "unwrap"} & allowed and operator["pool"] != "wmon":
+        raise ValueError("wrap and unwrap apply only to the wrapped-native (wmon) pool")
+    recipients = sorted({value.lower() for value in args.withdrawal_recipient})
+    if any(not ADDRESS.fullmatch(value) or value == "0x" + "0" * 40 for value in recipients):
+        raise ValueError("withdrawal recipients must be canonical nonzero addresses")
+    if "withdraw" in allowed and not recipients:
+        raise ValueError("allowing withdraw requires at least one --withdrawal-recipient")
+    if recipients and "withdraw" not in allowed:
+        raise ValueError("--withdrawal-recipient applies only when withdraw is allowed")
+    fees = None
+    if "replace" in allowed:
+        if args.replacement_fees is None:
+            raise ValueError("allowing replace requires --replacement-fees MAX_FEE PRIORITY_FEE")
+        fees = [require_unsigned(value, "--replacement-fees") for value in args.replacement_fees]
+        if int(fees[1]) > int(fees[0]):
+            raise ValueError("the replacement priority fee exceeds its cap")
+    elif args.replacement_fees is not None:
+        raise ValueError("--replacement-fees applies only when replace is allowed")
+    # Same reading as the SDK's MetropolisWallet.version(): the envelope's result advertises protocol, methods
+    # and durable-reference capabilities.
+    capabilities = command(bins, "erebus-wallet", {"method": "version"}, directory).get("result") or {}
+    if capabilities.get("protocol") != 1 or not set(WALLET_READS) | allowed <= set(capabilities.get("methods") or []):
+        raise ValueError("the installed erebus-wallet does not advertise the requested methods")
+    if "deposit" in allowed and capabilities.get("deposit_operation_references") is not True:
+        raise ValueError("the installed erebus-wallet lacks durable deposit references; deposit stays disabled")
+    if {"approve", "wrap", "unwrap"} & allowed and capabilities.get("funding_operation_references") is not True:
+        raise ValueError("the installed erebus-wallet lacks durable funding references; approve/wrap/unwrap stay disabled")
+    policy = {"version": 1, "maximum_amount": maximum, "allowed_methods": sorted(set(WALLET_READS) | allowed),
+              "withdrawal_recipients": recipients}
+    if fees is not None:
+        policy["replacement_fees"] = fees
+    target = directory / "wallet-policy.json"
+    (replace_private_json if target.exists() else private_json)(target, policy)
+    written = ["wallet-policy.json"]
+    mcp = directory / "mcp.json"
+    if mcp.exists():
+        settings = json.loads(mcp.read_text())
+        entry = next(iter(settings["mcpServers"].values()))
+        entry["env"].update({"EREBUS_WALLET_CONFIG": str(directory / "wallet.json"), "EREBUS_WALLET_POLICY": str(target),
+                             "EREBUS_WALLET_CLI": str(bins / "erebus-wallet")})
+        replace_private_json(mcp, settings)
+        written.append("mcp.json")
+    return {"status": "wallet-policy-written", "directory": str(directory), "written": written,
+            "allowed_methods": policy["allowed_methods"], "maximum_amount": maximum,
+            "funding_enabled": sorted(allowed & {"approve", "wrap", "unwrap", "deposit"}),
+            "next": "restart the MCP server; agents can call only the methods above, each capped at maximum_amount"
+            if mcp.exists() else "run connect to generate mcp.json, then re-run wallet-policy"}
+
+
 def auditor(args) -> dict:
     directory = args.directory.resolve()
     if directory.exists():
@@ -515,6 +593,13 @@ def main(argv=None) -> int:
     checkup = commands.add_parser("doctor")
     checkup.add_argument("--directory", type=Path, required=True)
     checkup.add_argument("--offline", action="store_true", help="skip RPC endpoint and balance checks")
+    policy = commands.add_parser("wallet-policy", help="explicit agent wallet permissions (default: notes and sync only)")
+    policy.add_argument("--directory", type=Path, required=True)
+    policy.add_argument("--maximum-amount", required=True, help="per-action cap in base units")
+    policy.add_argument("--allow", action="append", default=[], choices=WALLET_WRITES,
+                        help="repeatable: a write method agents may call; none by default")
+    policy.add_argument("--withdrawal-recipient", action="append", default=[], help="repeatable; required with --allow withdraw")
+    policy.add_argument("--replacement-fees", nargs=2, metavar=("MAX_FEE", "PRIORITY_FEE"), help="required with --allow replace")
     third = commands.add_parser("auditor")
     third.add_argument("--pool", choices=("wmon", "usdc"), required=True)
     third.add_argument("--directory", type=Path, required=True)
@@ -524,7 +609,8 @@ def main(argv=None) -> int:
     third.add_argument("--peer-rpc-url", required=True)
     args = parser.parse_args(argv)
     try:
-        result = {"pins": pins, "init": init, "connect": connect, "doctor": doctor, "auditor": auditor}[args.command](args)
+        result = {"pins": pins, "init": init, "connect": connect, "doctor": doctor, "auditor": auditor,
+                  "wallet-policy": wallet_policy}[args.command](args)
     except (OSError, ValueError, KeyError, TypeError) as error:
         print(json.dumps({"status": "error", "error": str(error) if isinstance(error, ValueError) else type(error).__name__}))
         return 2

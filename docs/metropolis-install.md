@@ -394,6 +394,10 @@ printf '%s' '{"method":"deposit","config_file":"'"$PWD"'/buyer/wallet.json","amo
 "$B/erebus-init" --metropolis doctor --directory ./buyer
 #   give ./buyer/mcp.json to the buyer agent; its tools are negotiate_deal, check_settlement_funding,
 #   settle_deal and recover_deal. The seller agent uses ./seller/mcp.json (negotiate_deal).
+#   Optional, explicit: let the agent use the wallet. By default only notes and sync; each write is opt-in.
+"$B/erebus-init" --metropolis wallet-policy --directory ./buyer --maximum-amount <per-action cap>
+#   e.g. also allow deposits:  ... --allow deposit
+#   withdrawals need named recipients: --allow withdraw --withdrawal-recipient <address>
 
 # Auditor (after the buyer grants a disclosure)
 "$B/erebus-init" --metropolis auditor --pool wmon --directory ./auditor --bin "$B" \
@@ -402,7 +406,11 @@ printf '%s' '{"method":"deposit","config_file":"'"$PWD"'/buyer/wallet.json","amo
 ```
 
 Each funding request is a real testnet transaction from the operator's gas address; nothing in setup sends
-one. `doctor` reports an unfunded signer until it holds testnet MON. To change RPC endpoints there is no
+one. `wallet-policy` writes an owner-only `wallet-policy.json` and adds `EREBUS_WALLET_CONFIG`,
+`EREBUS_WALLET_POLICY` and `EREBUS_WALLET_CLI` to `mcp.json`. It enables a funding method only if the installed
+`erebus-wallet` advertises durable operation references for it. Releases up to `0.3.0.dev2026101202` advertise
+none, so those get reads only. It refuses `wrap`/`unwrap` outside the WMON pool, `withdraw` without named
+recipients, and `replace` without fee caps. The MCP wallet tools ship only in releases that include them. `doctor` reports an unfunded signer until it holds testnet MON. To change RPC endpoints there is no
 installed command yet; see "Operations rehearsals" below.
 
 ### Installed-init and operations qualification

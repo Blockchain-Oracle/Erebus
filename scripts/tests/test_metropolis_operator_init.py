@@ -257,3 +257,63 @@ def test_doctor_is_read_only_and_flags_drift_without_printing_secrets(world, mon
     (world.bins / "erebus-wallet").write_text("#!/bin/sh\necho changed\n")
     problems = " ".join(init.doctor(SimpleNamespace(directory=world.root / "buyer", offline=True))["problems"])
     assert "erebus-wallet is not the published binary" in problems and "wallet.json" in problems
+
+
+def wallet_capabilities(monkeypatch, deposit=True, funding=True):
+    real = init.command
+
+    def fake(bins, name, request, cwd):
+        if name == "erebus-wallet" and request == {"method": "version"}:
+            return {"status": "ok", "result": {"protocol": 1, "methods": ["notes", "sync", *init.WALLET_WRITES],
+                    "deposit_operation_references": deposit, "funding_operation_references": funding}}
+        return real(bins, name, request, cwd)
+    monkeypatch.setattr(init, "command", fake)
+
+
+def policy_args(world, role="buyer", **changes):
+    values = dict(directory=world.root / role, maximum_amount="1000", allow=[], withdrawal_recipient=[], replacement_fees=None)
+    values.update(changes)
+    return SimpleNamespace(**values)
+
+
+def test_wallet_policy_defaults_to_reads_and_adds_the_wallet_to_mcp_settings(world, monkeypatch):
+    for role in ("buyer", "seller"):
+        init.init(init_args(world, role))
+    init.connect(connect_args(world, "seller"))
+    init.connect(connect_args(world, "buyer"))
+    wallet_capabilities(monkeypatch)
+    result = init.wallet_policy(policy_args(world))
+    policy = json.loads((world.root / "buyer/wallet-policy.json").read_text())
+    assert policy == {"version": 1, "maximum_amount": "1000", "allowed_methods": ["notes", "sync"], "withdrawal_recipients": []}
+    assert result["funding_enabled"] == [] and owner_only(world.root / "buyer/wallet-policy.json")
+    environment = json.loads((world.root / "buyer/mcp.json").read_text())["mcpServers"]["erebus-buyer"]["env"]
+    assert environment["EREBUS_WALLET_POLICY"].endswith("wallet-policy.json") and environment["EREBUS_WALLET_CLI"].endswith("erebus-wallet")
+    assert environment["EREBUS_BACKEND"] == "metropolis" and owner_only(world.root / "buyer/mcp.json")
+    init.wallet_policy(policy_args(world, allow=["deposit", "wrap"], maximum_amount="5"))
+    assert json.loads((world.root / "buyer/wallet-policy.json").read_text())["allowed_methods"] == ["deposit", "notes", "sync", "wrap"]
+
+
+def test_wallet_policy_refuses_unsafe_or_unsupported_permissions(world, monkeypatch):
+    init.init(init_args(world, "buyer"))
+    wallet_capabilities(monkeypatch, deposit=False, funding=False)
+    for changes, message in ((dict(allow=["deposit"]), "durable deposit references"),
+                             (dict(allow=["approve"]), "durable funding references"),
+                             (dict(allow=["withdraw"]), "requires at least one --withdrawal-recipient"),
+                             (dict(withdrawal_recipient=["0x" + "ab" * 20]), "applies only when withdraw"),
+                             (dict(allow=["replace"]), "--replacement-fees"),
+                             (dict(allow=["replace"], replacement_fees=["1", "2"]), "exceeds its cap"),
+                             (dict(allow=["withdraw"], withdrawal_recipient=["0x" + "0" * 40]), "canonical nonzero"),
+                             (dict(maximum_amount="0"), "positive")):
+        with pytest.raises(ValueError, match=message):
+            init.wallet_policy(policy_args(world, **changes))
+    assert not (world.root / "buyer/wallet-policy.json").exists()
+
+
+def test_wallet_policy_refuses_wrap_on_the_usdc_pool_and_changed_binaries(world, monkeypatch):
+    init.init(init_args(world, "buyer", pool="usdc"))
+    wallet_capabilities(monkeypatch)
+    with pytest.raises(ValueError, match="wmon"):
+        init.wallet_policy(policy_args(world, allow=["wrap"]))
+    (world.bins / "erebus-wallet").write_text("#!/bin/sh\necho changed\n")
+    with pytest.raises(ValueError, match="erebus-wallet is not the published binary"):
+        init.wallet_policy(policy_args(world))
