@@ -357,6 +357,76 @@ On 2026-10-12, with the published release, the installed commands accepted the g
 answered `/healthz` from `access.json`. Funding still uses `erebus-wallet` (`wrap`, `approve`, `deposit`).
 The script lives in the repository, not in the wheels.
 
+### Walkthrough: buyer, seller and auditor from public packages
+
+Each party runs these commands on its own machine with its own install. Nothing below edits JSON by hand;
+the `printf` lines are single requests to installed commands. Replace `<...>` values. Amounts are base units
+of the pool asset. Never share files under `keys/` or the gas key.
+
+```sh
+# Every party: install, then pin the release (the version must contain `erebus-init --metropolis`).
+V=<version>; B="$PWD/erebus-metropolis/bin"
+"$B/erebus-init" --metropolis pins --version "$V" --directory ./pins
+COMMON=(--pool wmon --bin "$B" --pins ./pins --deployment ./pins/monad-testnet-shielded-v2.json \
+        --rpc-url https://testnet-rpc.monad.xyz --peer-rpc-url https://rpc.ankr.com/monad_testnet)
+
+# Seller
+"$B/erebus-init" --metropolis init --role seller --directory ./seller --endpoint <host:port> \
+  --signer-address <seller gas address> --transaction-key-file <seller gas key file> "${COMMON[@]}"
+#   send ./seller/share to the buyer; receive the buyer's share as ./buyer-share
+"$B/erebus-init" --metropolis connect --directory ./seller --peer-share ./buyer-share \
+  --resource dataset.snapshot.v1 --amount <price> --payload-file <resource file> --port <access port>
+#   send ./seller/share again (it now holds offer.json)
+EREBUS_ACCESS_CONFIG="$PWD/seller/access.json" "$B/erebus-access-service" &   # loopback; put TLS in front
+"$B/erebus-init" --metropolis doctor --directory ./seller
+
+# Buyer
+"$B/erebus-init" --metropolis init --role buyer --directory ./buyer --endpoint <host:port> \
+  --signer-address <buyer gas address> --transaction-key-file <buyer gas key file> --maximum-price <max> "${COMMON[@]}"
+"$B/erebus-init" --metropolis connect --directory ./buyer --peer-share ./seller-share \
+  --resource dataset.snapshot.v1 --amount <opening offer>
+#   fund the shielded wallet (WMON pool: wrap testnet MON first; USDC pool: skip wrap).
+#   REF identifies the wrap; keep it and reuse the same value if you retry, so it is never sent twice.
+REF=$(openssl rand -hex 32)
+printf '%s' '{"method":"wrap","config_file":"'"$PWD"'/buyer/wallet.json","amount":"<amount>","operation_ref":"'"$REF"'"}' | "$B/erebus-wallet"
+printf '%s' '{"method":"approve","config_file":"'"$PWD"'/buyer/wallet.json","amount":"<amount>"}' | "$B/erebus-wallet"
+printf '%s' '{"method":"deposit","config_file":"'"$PWD"'/buyer/wallet.json","amount":"<amount>"}' | "$B/erebus-wallet"
+"$B/erebus-init" --metropolis doctor --directory ./buyer
+#   give ./buyer/mcp.json to the buyer agent; its tools are negotiate_deal, check_settlement_funding,
+#   settle_deal and recover_deal. The seller agent uses ./seller/mcp.json (negotiate_deal).
+
+# Auditor (after the buyer grants a disclosure)
+"$B/erebus-init" --metropolis auditor --pool wmon --directory ./auditor --bin "$B" \
+  --deployment ./pins/monad-testnet-shielded-v2.json \
+  --rpc-url https://testnet-rpc.monad.xyz --peer-rpc-url https://rpc.ankr.com/monad_testnet
+```
+
+Each funding request is a real testnet transaction from the operator's gas address; nothing in setup sends
+one. `doctor` reports an unfunded signer until it holds testnet MON. To change RPC endpoints there is no
+installed command yet; see "Operations rehearsals" below.
+
+### Installed-init and operations qualification
+
+- `scripts/check-metropolis-init.py (--registry DIR | --index URL) --version V --pins-version P [--online]`
+  installs in a new directory with a new cache. It requires plain `erebus-init` to stay Starknet onboarding,
+  runs `erebus-init --metropolis` pins, init, connect, auditor and doctor for every authorized pool, and
+  validates every generated file with the installed commands.
+- `scripts/rehearse-metropolis-operations.py --work DIR --pool P [--upgrade-registry DIR --upgrade-version V
+  --rollback-version R]` covers, on that installation, interrupted HTTPS artifact downloads, a corrupted cache,
+  persistence, backup and restore, diagnostics with a dead endpoint, an endpoint change, and upgrade/rollback.
+
+On 2026-10-13 both passed for WMON and USDC (local macOS arm64, team rehearsal). They ran against a local,
+unpublished candidate `0.3.0.dev2026101301` built from clean commit `ab6dc3b` (identity `3ce0d433…1436`), whose
+native binaries are byte-identical to the published `0.3.0.dev2026101202`. Rollback to `0.3.0.dev2026101202`
+kept the operator's files, binaries and wallet working; that version predates `erebus-init --metropolis`.
+
+Open items:
+- `doctor` misreports an RPC that rejects Python's default User-Agent (seen with
+  `rpc-testnet.monadinfra.com`), and errors instead of warning on a damaged `wallet.json`;
+- endpoint changes need an installed command; the rehearsal rewrites the configs itself.
+
+Native CI for this candidate and any release need `ab6dc3b` on the remote and a new authorization.
+
 ### Verify a public installation
 
 `scripts/check-metropolis-public-install.py --version V --authorization packaging/metropolis/testnet-release.json
