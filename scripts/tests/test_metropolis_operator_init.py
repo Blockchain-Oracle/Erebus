@@ -92,8 +92,9 @@ def world(tmp_path, monkeypatch):
                                   **{field: {"sha256": hashlib.sha256(f"{kind}.{field}".encode()).hexdigest(), "bytes": 1}
                                      for field in ("wasm", "r1cs", "zkey")}} for kind in ("deposit", "transfer", "withdraw")]}
         (pins / f"manifest-{name}.json").write_text(json.dumps(manifest))
-        (pins / f"manifest-{name}.signature.json").write_text(json.dumps({"version": 1, "signature_hex": "ab"}))
         manifests[name] = hashlib.sha256((pins / f"manifest-{name}.json").read_bytes()).hexdigest()
+        (pins / f"manifest-{name}.signature.json").write_text(json.dumps({"version": 1, "signature_hex": "ab",
+                                                                         "manifest_sha256": manifests[name]}))
     binaries = {name: {"sha256": hashlib.sha256((bins / name).read_bytes()).hexdigest()} for name in init.COMMANDS}
     (pins / "release-manifest.json").write_text(json.dumps({"version": "0.3.0.dev2026101202", "source_commit": "07e6949",
         "platforms": {"macosx-11.0-arm64": {"platform_qualification": {"wheel_tag": "macosx_11_0_arm64"}, "binaries": binaries}}}))
@@ -193,6 +194,7 @@ def test_init_refuses_tampered_binaries_unpinned_manifests_and_bad_inputs(world)
 def test_init_refuses_a_manifest_bound_to_another_pool(world):
     other = world.pins / "manifest-usdc.json"
     (world.pins / "manifest-wmon.json").write_bytes(other.read_bytes())
+    (world.pins / "manifest-wmon.signature.json").write_bytes((world.pins / "manifest-usdc.signature.json").read_bytes())
     authorization = json.loads((world.pins / "testnet-release.json").read_text())
     authorization["hosting_manifests"]["wmon"] = authorization["hosting_manifests"]["usdc"]
     (world.pins / "testnet-release.json").write_text(json.dumps(authorization))
@@ -215,7 +217,7 @@ def test_connect_requires_the_sellers_offer_and_unchanged_binaries(world):
 
 
 def test_auditor_setup_uses_the_installed_keygen_and_the_strict_disclosure_schema(world):
-    init.auditor(SimpleNamespace(pool="usdc", directory=world.root / "auditor", bin=world.bins, deployment=world.deployment,
+    init.auditor(SimpleNamespace(pool="usdc", directory=world.root / "auditor", bin=world.bins, pins=world.pins, deployment=world.deployment,
                                  rpc_url="https://a.example.net/", peer_rpc_url="https://b.example.net/"))
     config = json.loads((world.root / "auditor/disclosure.json").read_text())
     assert set(config) == rust_fields("sdk/shielded/src/bin/erebus_shielded_disclosure.rs", "struct Deployment")
@@ -534,3 +536,216 @@ def test_doctor_separates_balance_failures_from_the_network_verdict(world, monke
 def test_operator_requests_carry_an_explicit_user_agent():
     request = init.request("https://rpc.example.net/", b"{}", {"content-type": "application/json"})
     assert request.get_header("User-agent").startswith("erebus-init/")
+
+
+# ---- endpoint-change recovery matrix -------------------------------------------------------------------------
+
+ENDPOINT_FILES = ("wallet.json", "payment.json")  # a buyer's endpoint-bearing configs, in replacement order
+
+
+def snapshot(directory):
+    return {name: (directory / name).read_bytes() for name in ENDPOINT_FILES}
+
+
+def crash_on(monkeypatch, target_name, after):
+    """Make os.replace fail when it touches `target_name`, either before or after the real replacement."""
+    real = init.os.replace
+
+    def replace(source, target):
+        if Path(target).name == target_name:
+            if after:
+                real(source, target)
+            raise OSError(f"injected crash {'after' if after else 'before'} {target_name}")
+        return real(source, target)
+    monkeypatch.setattr(init.os, "replace", replace)
+    return real
+
+
+def change(world, **changes):
+    return init.endpoints(endpoint_args(world, "buyer", **changes))
+
+
+@pytest.mark.parametrize("target_name", ENDPOINT_FILES)
+@pytest.mark.parametrize("after", [False, True])
+@pytest.mark.parametrize("recovery", ["resume", "abort"])
+def test_every_interruption_point_recovers_to_one_consistent_pair(world, monkeypatch, target_name, after, recovery):
+    connected_buyer_and_seller(world)
+    offline_chain(monkeypatch)
+    buyer = world.root / "buyer"
+    before = snapshot(buyer)
+    real = crash_on(monkeypatch, target_name, after)
+    with pytest.raises(OSError, match="injected crash"):
+        change(world)
+    monkeypatch.setattr(init.os, "replace", real)
+    report = init.doctor(SimpleNamespace(directory=buyer, offline=True))
+    assert report["status"] == "attention" and any("incomplete" in p for p in report["problems"])
+    result = change(world, rpc_url=None, peer_rpc_url=None, **{recovery: True})
+    assert result["status"] == ("resumed" if recovery == "resume" else "aborted")
+    pairs = {(json.loads((buyer / n).read_text())["rpc_url"], json.loads((buyer / n).read_text())["peer_rpc_url"]) for n in ENDPOINT_FILES}
+    expected = ("https://c.example.net/", "https://d.example.net/") if recovery == "resume" else ("https://a.example.net/", "https://b.example.net/")
+    assert pairs == {expected}
+    if recovery == "abort":
+        assert snapshot(buyer) == before
+    assert all(owner_only(buyer / n) for n in ENDPOINT_FILES) and not (buyer / ".endpoint-change").exists()
+    assert init.doctor(SimpleNamespace(directory=buyer, offline=True))["status"] == "healthy"
+    for again in ("resume", "abort"):
+        with pytest.raises(ValueError, match="no interrupted endpoint change"):
+            change(world, rpc_url=None, peer_rpc_url=None, **{again: True})
+
+
+def test_an_interruption_before_the_journal_commits_changes_nothing(world, monkeypatch):
+    connected_buyer_and_seller(world)
+    offline_chain(monkeypatch)
+    buyer = world.root / "buyer"
+    before = snapshot(buyer)
+    crash_on(monkeypatch, "journal.json", after=False)
+    with pytest.raises(OSError):
+        change(world)
+    monkeypatch.undo()
+    offline_chain(monkeypatch)
+    assert snapshot(buyer) == before and (buyer / ".endpoint-change").exists()
+    with pytest.raises(ValueError, match="before it was committed"):
+        change(world, rpc_url=None, peer_rpc_url=None, resume=True)
+    assert change(world, rpc_url=None, peer_rpc_url=None, abort=True)["status"] == "aborted"
+    assert snapshot(buyer) == before and not (buyer / ".endpoint-change").exists()
+
+
+def interrupted_after_first(world, monkeypatch):
+    connected_buyer_and_seller(world)
+    offline_chain(monkeypatch)
+    real = crash_on(monkeypatch, "payment.json", after=False)
+    with pytest.raises(OSError):
+        change(world)
+    monkeypatch.setattr(init.os, "replace", real)
+    return world.root / "buyer"
+
+
+@pytest.mark.parametrize("damage", ["truncate", "garbage", "drop_files", "bad_hash"])
+def test_a_damaged_journal_is_refused_without_touching_any_config(world, monkeypatch, damage):
+    buyer = interrupted_after_first(world, monkeypatch)
+    journal = buyer / ".endpoint-change/journal.json"
+    data = json.loads(journal.read_text())
+    journal.write_text({"truncate": journal.read_text()[:40], "garbage": "\0\0not json",
+                        "drop_files": json.dumps({**data, "files": []}),
+                        "bad_hash": json.dumps({**data, "files": [{**data["files"][0], "new_sha256": "zz"}]})}[damage])
+    current = snapshot(buyer)
+    for recovery in ("resume", "abort"):
+        with pytest.raises(ValueError, match="journal is damaged"):
+            change(world, rpc_url=None, peer_rpc_url=None, **{recovery: True})
+    assert snapshot(buyer) == current
+    assert init.doctor(SimpleNamespace(directory=buyer, offline=True))["status"] == "attention"
+
+
+def test_damaged_staged_files_are_refused_and_abort_still_restores(world, monkeypatch):
+    buyer = interrupted_after_first(world, monkeypatch)
+    (buyer / ".endpoint-change/payment.json.new").write_text("{}")
+    with pytest.raises(ValueError, match="staged payment.json is missing or damaged"):
+        change(world, rpc_url=None, peer_rpc_url=None, resume=True)
+    (buyer / ".endpoint-change/wallet.json.orig").write_text("{}")
+    with pytest.raises(ValueError, match="saved original of wallet.json"):
+        change(world, rpc_url=None, peer_rpc_url=None, abort=True)
+
+
+def test_a_concurrent_edit_after_staging_is_never_overwritten(world, monkeypatch):
+    buyer = interrupted_after_first(world, monkeypatch)
+    edited = json.loads((buyer / "payment.json").read_text())
+    edited["maximum_price"] = "1"
+    (buyer / "payment.json").write_text(json.dumps(edited))
+    with pytest.raises(ValueError, match="payment.json was changed by something else"):
+        change(world, rpc_url=None, peer_rpc_url=None, resume=True)
+    assert json.loads((buyer / "payment.json").read_text())["maximum_price"] == "1"
+    with pytest.raises(ValueError, match="changed by something else"):
+        change(world, rpc_url=None, peer_rpc_url=None, abort=True)
+    assert json.loads((buyer / "payment.json").read_text())["maximum_price"] == "1"
+    assert init.doctor(SimpleNamespace(directory=buyer, offline=True))["status"] == "attention"
+
+
+def test_symlinks_and_unsafe_permissions_are_refused_before_staging(world, monkeypatch, tmp_path):
+    connected_buyer_and_seller(world)
+    offline_chain(monkeypatch)
+    buyer = world.root / "buyer"
+    outside = tmp_path / "elsewhere.json"
+    outside.write_bytes((buyer / "payment.json").read_bytes())
+    (buyer / "payment.json").unlink()
+    (buyer / "payment.json").symlink_to(outside)
+    with pytest.raises(ValueError, match="payment.json must be a regular owner-only file"):
+        change(world)
+    (buyer / "payment.json").unlink()
+    (buyer / "payment.json").write_bytes(outside.read_bytes())
+    (buyer / "payment.json").chmod(0o644)
+    with pytest.raises(ValueError, match="regular owner-only"):
+        change(world)
+    (buyer / "payment.json").chmod(0o600)
+    (buyer / ".endpoint-change").symlink_to(tmp_path)
+    with pytest.raises(ValueError, match="not a real directory"):
+        change(world)
+    (buyer / ".endpoint-change").unlink()
+    buyer.chmod(0o770)
+    try:
+        with pytest.raises(ValueError, match="only its owner can write"):
+            change(world)
+    finally:
+        buyer.chmod(0o700)
+    assert not (buyer / ".endpoint-change").exists() and outside.read_bytes() == (buyer / "payment.json").read_bytes()
+
+
+def test_a_second_concurrent_endpoint_change_is_refused(world, monkeypatch):
+    import fcntl
+    import os
+    connected_buyer_and_seller(world)
+    offline_chain(monkeypatch)
+    held = os.open(world.root / "buyer/.endpoint-change.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        with pytest.raises(ValueError, match="another endpoint change is running"):
+            change(world)
+    finally:
+        os.close(held)
+    assert change(world)["status"] == "changed"
+
+
+def test_doctor_reports_a_mixed_endpoint_configuration(world, monkeypatch):
+    connected_buyer_and_seller(world)
+    offline_chain(monkeypatch)
+    payment = world.root / "buyer/payment.json"
+    data = json.loads(payment.read_text())
+    data["rpc_url"] = "https://other.example.net/"
+    payment.write_text(json.dumps(data))
+    report = init.doctor(SimpleNamespace(directory=world.root / "buyer", offline=True))
+    assert report["status"] == "attention" and any("different RPC endpoint pairs" in p for p in report["problems"])
+
+
+def test_init_refuses_a_signature_envelope_for_another_manifest(world):
+    other = json.loads((world.pins / "manifest-usdc.signature.json").read_text())
+    (world.pins / "manifest-wmon.signature.json").write_text(json.dumps(other))
+    with pytest.raises(ValueError, match="signature envelope is not for its pinned hosting manifest"):
+        init.init(init_args(world, "buyer"))
+    assert not (world.root / "buyer").exists()
+
+
+def test_auditor_rechecks_installed_binaries_before_keygen(world):
+    (world.bins / "erebus-shielded-disclosure").write_text("#!/bin/sh\necho changed\n")
+    with pytest.raises(ValueError, match="erebus-shielded-disclosure is not the published binary"):
+        init.auditor(SimpleNamespace(pool="wmon", directory=world.root / "auditor", bin=world.bins, pins=world.pins,
+                                     deployment=world.deployment, rpc_url="https://a.example.net/", peer_rpc_url="https://b.example.net/"))
+    assert not (world.root / "auditor").exists()
+
+
+def test_no_command_output_contains_key_material_and_the_relay_key_is_never_read(world, monkeypatch, capsys):
+    payment_capability(monkeypatch, advertised=True)
+    values = sponsored(world)
+    values["relay_auth_key_file"].write_bytes(b"RELAY-SECRET-" + b"7" * 19)
+    values["relay_auth_key_file"].chmod(0o000)  # unreadable: any attempt to open it would fail the command
+    outputs = [init.init(init_args(world, "buyer", **values)), init.init(init_args(world, "seller"))]
+    values["relay_auth_key_file"].chmod(0o600)
+    outputs += [init.connect(connect_args(world, "seller")), init.connect(connect_args(world, "buyer"))]
+    wallet_capabilities(monkeypatch)
+    outputs.append(init.wallet_policy(policy_args(world)))
+    offline_chain(monkeypatch)
+    outputs.append(init.doctor(SimpleNamespace(directory=world.root / "buyer", offline=True)))
+    outputs.append(init.endpoints(endpoint_args(world, "seller")))
+    rendered = json.dumps(outputs) + capsys.readouterr().out
+    secrets = [p.read_bytes() for p in world.root.rglob("*.key")] + [values["relay_auth_key_file"].read_bytes()]
+    assert secrets and not any(secret.hex() in rendered or secret.decode("latin-1") in rendered for secret in secrets)
+    configs = "".join(p.read_text() for p in world.root.rglob("*.json") if "share" not in p.parts)
+    assert "RELAY-SECRET" not in configs and all(secret.hex() not in configs for secret in secrets)

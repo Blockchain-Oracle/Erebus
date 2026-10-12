@@ -169,7 +169,7 @@ def pool_flow(bins: Path, work: Path, pins: Path, pool: str, port_base: int, onl
     reply = run(bins, work, ["--metropolis", "connect", "--directory", str(root / "buyer"), "--peer-share", str(root / "seller/share"),
                              "--resource", "dataset.snapshot.v1", "--amount", "600000"])
     require(reply.get("status") == "connected", f"{pool} buyer connect: {reply}")
-    reply = run(bins, work, ["--metropolis", "auditor", "--pool", pool, "--directory", str(root / "auditor"), "--bin", str(bins),
+    reply = run(bins, work, ["--metropolis", "auditor", "--pool", pool, "--directory", str(root / "auditor"), "--bin", str(bins), "--pins", str(pins),
                              "--deployment", deployment, "--rpc-url", RPC[0], "--peer-rpc-url", RPC[1]])
     require(reply.get("status") == "auditor-ready", f"{pool} auditor: {reply}")
     for role in ("buyer", "seller"):

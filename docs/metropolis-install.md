@@ -400,7 +400,7 @@ printf '%s' '{"method":"deposit","config_file":"'"$PWD"'/buyer/wallet.json","amo
 #   withdrawals need named recipients: --allow withdraw --withdrawal-recipient <address>
 
 # Auditor (after the buyer grants a disclosure)
-"$B/erebus-init" --metropolis auditor --pool wmon --directory ./auditor --bin "$B" \
+"$B/erebus-init" --metropolis auditor --pool wmon --directory ./auditor --bin "$B" --pins ./pins \
   --deployment ./pins/monad-testnet-shielded-v2.json \
   --rpc-url https://testnet-rpc.monad.xyz --peer-rpc-url https://rpc.ankr.com/monad_testnet
 ```
@@ -413,12 +413,22 @@ none, so those get reads only. It refuses `wrap`/`unwrap` outside the WMON pool,
 recipients, and `replace` without fee caps. `--allow status` adds the read-only paired account diagnostic, but
 only when the installed wallet advertises `paired_account_diagnostics`. The MCP wallet tools ship only in releases that include them. `doctor` reports an unfunded signer until it holds testnet MON. To change RPC endpoints, run
 `erebus-init --metropolis endpoints --directory DIR --rpc-url <primary> --peer-rpc-url <peer>`. Before
-changing anything, it checks both endpoints with the installed network check for chain 10143. It then
-stages new and original copies of every config that names endpoints (`wallet.json`, `payment.json`,
-`access.json`, an auditor's `disclosure.json`) and replaces them atomically. Wallet notes, checkpoints, keys
-and every other setting are left untouched. After an interruption, `doctor` reports the change as
-incomplete; `endpoints --resume` finishes it and `endpoints --abort` restores the saved originals. It never
-signs or sends anything. Operator HTTPS and JSON-RPC requests send an explicit `erebus-init/<version>`
+changing anything, it checks both endpoints with the installed network check for chain 10143. It refuses
+symlinked or non-owner-only configs and a directory others can write.
+
+This is a journaled, recoverable update, not a collectively atomic one:
+
+- It stages new and original copies of every config that names endpoints (`wallet.json`, `payment.json`,
+  `access.json`, an auditor's `disclosure.json`), then commits a journal.
+- It then replaces each file atomically, one at a time. A process reading several configs mid-update can see
+  the old pair in one file and the new pair in another, because readers are not fenced. Stop the MCP server and
+  access service first.
+- `doctor` reports an incomplete change, or configs that name different endpoint pairs, as "attention".
+- `endpoints --resume` finishes the change; `endpoints --abort` restores the saved originals.
+- A config edited by anything else after staging is never overwritten: the command stops and keeps both
+  copies.
+- One endpoint change runs per directory at a time; a second is refused.
+- Wallet notes, checkpoints, keys and every other setting are left untouched. It never signs or sends anything. Operator HTTPS and JSON-RPC requests send an explicit `erebus-init/<version>`
 User-Agent. Some providers, such as `rpc-testnet.monadinfra.com`, reject library defaults.
 
 ### Installed-init and operations qualification

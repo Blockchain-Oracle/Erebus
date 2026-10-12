@@ -10,7 +10,7 @@
     operator_init.py doctor  --directory DIR [--offline]
     operator_init.py wallet-policy --directory DIR --maximum-amount N [--allow METHOD ...]
                              [--withdrawal-recipient ADDR ...] [--replacement-fees MAX PRIORITY]
-    operator_init.py auditor --pool wmon|usdc --directory NEW --bin DIR --deployment FILE
+    operator_init.py auditor --pool wmon|usdc --directory NEW --bin DIR --pins DIR --deployment FILE
                              --rpc-url URL --peer-rpc-url URL
 
 `pins` downloads, over HTTPS only, the package release's `release-manifest.json`, the owner authorization and
@@ -122,6 +122,11 @@ def release_pins(pins: Path, pool: str) -> dict:
     publisher = authorization.get("publisher", "")
     if not ADDRESS.fullmatch(publisher):
         raise ValueError("the release authorization does not pin a publisher")
+    envelope = json.loads(signature.read_text())
+    if not isinstance(envelope, dict) or str(envelope.get("manifest_sha256", "")).removeprefix("0x") != expected:
+        # The installed erebus-artifacts verifies the signature itself before accepting any artifact byte; this only
+        # catches a pins directory whose signature belongs to another manifest.
+        raise ValueError("the pool's signature envelope is not for its pinned hosting manifest")
     release = json.loads((pins / "release-manifest.json").read_text())
     if release.get("version") != authorization.get("package_version"):
         raise ValueError("the release manifest is not the authorized package version")
@@ -468,6 +473,7 @@ def network_check(bins: Path, url: str, cwd: Path) -> dict:
 
 ENDPOINT_STAGING = ".endpoint-change"
 ENDPOINT_JOURNAL = f"{ENDPOINT_STAGING}/journal.json"
+ENDPOINT_LOCK = ".endpoint-change.lock"
 # Generated configs that name RPC endpoints, and where the pair lives inside each.
 ENDPOINT_CONFIGS = {"wallet.json": (), "payment.json": (), "access.json": ("backend",), "disclosure.json": ()}
 
@@ -482,17 +488,82 @@ def endpoint_url(url: str) -> str:
 
 
 def file_digest(path: Path) -> str | None:
-    return sha256(path) if path.is_file() else None
+    """Digest of a regular, non-symlink file; None if it is missing or anything else."""
+    try:
+        info = path.lstat()
+    except OSError:
+        return None
+    return sha256(path) if stat.S_ISREG(info.st_mode) else None
+
+
+def endpoint_pair(data: dict, nesting: tuple) -> tuple | None:
+    holder = data
+    for key in nesting:
+        holder = holder.get(key) if isinstance(holder, dict) else None
+    if not isinstance(holder, dict) or "rpc_url" not in holder or "peer_rpc_url" not in holder:
+        return None
+    return holder["rpc_url"], holder["peer_rpc_url"]
+
+
+def endpoint_state(directory: Path) -> dict:
+    """What doctor needs: an incomplete change, and whether every config names the same endpoint pair."""
+    pairs = {}
+    for name, nesting in ENDPOINT_CONFIGS.items():
+        data = read_config(directory / name)
+        pair = endpoint_pair(data, nesting) if data is not None else None
+        if pair is not None:
+            pairs[name] = pair
+    staging = directory / ENDPOINT_STAGING
+    return {"incomplete": staging.exists() or staging.is_symlink(), "mixed": len(set(pairs.values())) > 1,
+            "configs": sorted(pairs)}
+
+
+def valid_journal(journal: dict | None) -> bool:
+    if not isinstance(journal, dict) or journal.get("version") != 1 or not isinstance(journal.get("files"), list) \
+            or not journal["files"]:
+        return False
+    for key in ("rpc_url", "peer_rpc_url", "old_rpc_url", "old_peer_rpc_url"):
+        if not isinstance(journal.get(key), str):
+            return False
+    names = []
+    for entry in journal["files"]:
+        if not isinstance(entry, dict) or entry.get("name") not in ENDPOINT_CONFIGS \
+                or not all(isinstance(entry.get(k), str) and HEX64.fullmatch(entry[k]) for k in ("old_sha256", "new_sha256")):
+            return False
+        names.append(entry["name"])
+    return len(names) == len(set(names))
 
 
 def endpoints(args) -> dict:
     """Change the primary and peer RPC endpoints of every generated config in one operator or auditor directory.
 
-    Both endpoints are checked read-only with the installed network check for chain 10143 before anything changes.
-    New and original copies are staged owner-only with a journal, then each config is replaced atomically; an
-    interrupted change is finished with --resume or undone with --abort. Wallet notes, checkpoints, keys and every
-    other setting are left untouched. Nothing is signed or sent."""
+    This is a journaled, recoverable multi-file update, not a collectively atomic one: each file is replaced
+    atomically, but a process reading several configs during the update could see the old pair in one and the new
+    pair in another. Readers are not fenced; `doctor` reports an incomplete or mixed configuration until the change
+    is finished with --resume or undone with --abort. A file edited by anything else after staging is never
+    overwritten: the update stops and both copies stay for the operator. Endpoint invocations on one directory are
+    serialized by an exclusive lock. Wallet notes, checkpoints, keys and every other setting are untouched, and
+    nothing is signed or sent."""
+    import fcntl
     directory = args.directory.resolve()
+    info = directory.lstat()
+    if not stat.S_ISDIR(info.st_mode) or stat.S_IMODE(info.st_mode) & 0o022:
+        raise ValueError("the operator directory must be a real directory that only its owner can write")
+    lock_path = directory / ENDPOINT_LOCK
+    if lock_path.is_symlink():
+        raise ValueError(f"{ENDPOINT_LOCK} must not be a symlink")
+    descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise ValueError("another endpoint change is running in this directory") from None
+        return _endpoints_locked(args, directory)
+    finally:
+        os.close(descriptor)
+
+
+def _endpoints_locked(args, directory: Path) -> dict:
     staging = directory / ENDPOINT_STAGING
     journal_path = directory / ENDPOINT_JOURNAL
     operator = read_config(directory / "operator.json")
@@ -501,90 +572,122 @@ def endpoints(args) -> dict:
         raise ValueError("an auditor directory needs --bin (the installed release bin directory)")
     if operator is not None:
         verify_installed(bins, release_pins_from(operator))
+    if staging.is_symlink() or (staging.exists() and not staging.is_dir()):
+        raise ValueError(f"{ENDPOINT_STAGING} is not a real directory; refusing to touch it")
 
-    def apply(journal: dict) -> list[str]:
-        applied = []
+    def staged_journal() -> dict:
+        journal = read_config(journal_path)
+        if not valid_journal(journal):
+            raise ValueError("the endpoint journal is damaged; no file was changed by this command. Inspect "
+                             f"{ENDPOINT_STAGING}/ (the .orig files are the configs from before the change)")
         for entry in journal["files"]:
-            target, staged = directory / entry["name"], staging / f"{entry['name']}.new"
-            if file_digest(target) == entry["new_sha256"]:
-                continue
-            if file_digest(staged) != entry["new_sha256"]:
-                raise ValueError(f"staged {entry['name']} is missing or changed; run --abort")
-            os.replace(staged, target)
-            applied.append(entry["name"])
-        return applied
+            if file_digest(staging / f"{entry['name']}.orig") != entry["old_sha256"]:
+                raise ValueError(f"the saved original of {entry['name']} is missing or changed")
+        return journal
 
-    def finish(journal: dict, action: str, applied: list[str]) -> dict:
+    def replace_checked(entry: dict, source: Path, want: str, have_ok: str) -> bool:
+        """Replace one target only if it still holds `have_ok`; True if replaced, False if already `want`."""
+        target = directory / entry["name"]
+        current = file_digest(target)
+        if current == want:
+            return False
+        if target.is_symlink() or current != have_ok:
+            raise ValueError(f"{entry['name']} was changed by something else after staging; nothing more was replaced. "
+                             f"Reconcile it with {ENDPOINT_STAGING}/{entry['name']}.orig and .new, then run --abort or --resume")
+        os.replace(source, target)
+        return True
+
+    def finish(journal: dict, action: str, changed: list[str]) -> dict:
         wallet_opens = None
         if (directory / "wallet.json").exists():
             notes = command(bins, "erebus-wallet", {"method": "notes", "config_file": str(directory / "wallet.json")}, directory)
             wallet_opens = notes.get("status") == "ok"
         shutil.rmtree(staging)
+        state = endpoint_state(directory)
         return {"status": action, "directory": str(directory), "rpc_url": journal["rpc_url"],
                 "peer_rpc_url": journal["peer_rpc_url"], "configs": [entry["name"] for entry in journal["files"]],
-                "applied_now": applied, "wallet_opens": wallet_opens, "transactions_sent": 0}
+                "applied_now": changed, "wallet_opens": wallet_opens, "mixed_endpoints": state["mixed"],
+                "transactions_sent": 0}
 
     if args.resume or args.abort:
-        journal = read_config(journal_path)
-        if journal is None:
+        if not staging.exists():
             raise ValueError("no interrupted endpoint change to resume or abort")
+        if not journal_path.exists():
+            # The journal is the commit point and is written after all staged copies; without it no config was
+            # replaced, so the staged copies are leftovers.
+            if args.resume:
+                raise ValueError("the change was interrupted before it was committed; run --abort to discard it")
+            shutil.rmtree(staging)
+            return {"status": "aborted", "directory": str(directory), "applied_now": [], "transactions_sent": 0,
+                    "note": "interrupted before commit; no config had been changed"}
+        journal = staged_journal()
         if args.abort:
             restored = []
             for entry in journal["files"]:
-                original = staging / f"{entry['name']}.orig"
-                if file_digest(original) != entry["old_sha256"]:
-                    raise ValueError(f"the saved original of {entry['name']} is missing or changed")
-                if file_digest(directory / entry["name"]) != entry["old_sha256"]:
-                    temporary = directory / f".{entry['name']}.restore"
-                    shutil.copyfile(original, temporary)
-                    temporary.chmod(0o600)
-                    os.replace(temporary, directory / entry["name"])
+                temporary = staging / f"{entry['name']}.restore"
+                shutil.copyfile(staging / f"{entry['name']}.orig", temporary)
+                temporary.chmod(0o600)
+                if replace_checked(entry, temporary, want=entry["old_sha256"], have_ok=entry["new_sha256"]):
                     restored.append(entry["name"])
             journal = {**journal, "rpc_url": journal["old_rpc_url"], "peer_rpc_url": journal["old_peer_rpc_url"]}
             return finish(journal, "aborted", restored)
-        return finish(journal, "resumed", apply(journal))
+        applied = []
+        for entry in journal["files"]:
+            staged = staging / f"{entry['name']}.new"
+            if file_digest(directory / entry["name"]) != entry["new_sha256"] and file_digest(staged) != entry["new_sha256"]:
+                raise ValueError(f"the staged {entry['name']} is missing or damaged; run --abort")
+            if replace_checked(entry, staged, want=entry["new_sha256"], have_ok=entry["old_sha256"]):
+                applied.append(entry["name"])
+        return finish(journal, "resumed", applied)
 
-    if journal_path.exists() or staging.exists():
+    if staging.exists():
         raise ValueError("an endpoint change is already staged; run --resume or --abort first")
     if not args.rpc_url or not args.peer_rpc_url:
         raise ValueError("a new endpoint change needs --rpc-url and --peer-rpc-url")
     primary, peer = endpoint_url(args.rpc_url), endpoint_url(args.peer_rpc_url)
     if primary.rstrip("/") == peer.rstrip("/"):
         raise ValueError("the primary and peer RPC endpoints must differ")
-    for label, url in (("--rpc-url", primary), ("--peer-rpc-url", peer)):
-        check = network_check(bins, url, directory)
-        if check.get("passed") is not True or check.get("chain_id") not in (None, NAMESPACE_CHAIN):
-            raise ValueError(f"{label} did not pass the installed network check for chain {NAMESPACE_CHAIN}; nothing changed")
-    changes, old_pair = [], None
+    changes, pairs = [], set()
     for name, nesting in ENDPOINT_CONFIGS.items():
         path = directory / name
-        if not path.exists():
+        if not path.exists() and not path.is_symlink():
             continue
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) & 0o077:
+            raise ValueError(f"{name} must be a regular owner-only file (not a symlink); nothing changed")
         data = read_config(path)
-        if data is None:
-            raise ValueError(f"{name} is damaged; restore it before changing endpoints")
+        pair = endpoint_pair(data, nesting) if data is not None else None
+        if pair is None:
+            raise ValueError(f"{name} is damaged or carries no endpoint pair; restore it before changing endpoints")
+        pairs.add(pair)
         holder = data
         for key in nesting:
             holder = holder[key]
-        if "rpc_url" not in holder or "peer_rpc_url" not in holder:
-            raise ValueError(f"{name} does not carry an endpoint pair")
-        old_pair = old_pair or (holder["rpc_url"], holder["peer_rpc_url"])
         holder["rpc_url"], holder["peer_rpc_url"] = primary, peer
         changes.append((name, path, data))
     if not changes:
         raise ValueError("no generated config with RPC endpoints in this directory")
+    for label, url in (("--rpc-url", primary), ("--peer-rpc-url", peer)):
+        check = network_check(bins, url, directory)
+        if check.get("passed") is not True or check.get("chain_id") not in (None, NAMESPACE_CHAIN):
+            raise ValueError(f"{label} did not pass the installed network check for chain {NAMESPACE_CHAIN}; nothing changed")
+    old_pair = sorted(pairs)[0]
     staging.mkdir(mode=0o700)
     entries = []
     for name, path, data in changes:
         shutil.copyfile(path, staging / f"{name}.orig")
         (staging / f"{name}.orig").chmod(0o600)
         private_json(staging / f"{name}.new", data)
-        entries.append({"name": name, "old_sha256": sha256(path), "new_sha256": sha256(staging / f"{name}.new")})
+        entries.append({"name": name, "old_sha256": sha256(staging / f"{name}.orig"), "new_sha256": sha256(staging / f"{name}.new")})
     journal = {"version": 1, "rpc_url": primary, "peer_rpc_url": peer, "old_rpc_url": old_pair[0],
-               "old_peer_rpc_url": old_pair[1], "files": entries}
+               "old_peer_rpc_url": old_pair[1], "mixed_before": len(pairs) > 1, "files": entries}
     private_json(staging / "journal.tmp", journal)
     os.replace(staging / "journal.tmp", journal_path)
-    return finish(journal, "changed", apply(journal))
+    applied = []
+    for entry in entries:
+        if replace_checked(entry, staging / f"{entry['name']}.new", want=entry["new_sha256"], have_ok=entry["old_sha256"]):
+            applied.append(entry["name"])
+    return finish(journal, "changed", applied)
 
 
 def read_config(path: Path) -> dict | None:
@@ -637,9 +740,11 @@ def doctor(args) -> dict:
     if loose:
         problems.append(f"not owner-only or missing: {loose}")
     checks["owner_only"] = {"configs": len(configs), "key_files": len(keys), "problems": loose}
-    pending = directory / ENDPOINT_JOURNAL
-    if pending.exists():
+    endpoint = endpoint_state(directory)
+    if endpoint["incomplete"]:
         problems.append("an endpoint change is incomplete; run `endpoints --resume` or `endpoints --abort`")
+    if endpoint["mixed"]:
+        problems.append(f"configs name different RPC endpoint pairs: {endpoint['configs']}")
     wallet_fields = ("artifact_manifest_file", "artifact_manifest_sha256", "artifact_cache_root", "rpc_url", "peer_rpc_url",
                      "signer_address")
     if wallet is None or any(key not in wallet for key in wallet_fields):
@@ -772,12 +877,13 @@ def wallet_policy(args) -> dict:
 
 
 def auditor(args) -> dict:
+    bins = args.bin.resolve()
+    verify_installed(bins, release_pins(args.pins.resolve(), args.pool)["release"])
     directory = args.directory.resolve()
     if directory.exists():
         raise ValueError("use a new auditor directory")
     disclosure = load("disclosure_config")
     directory.mkdir(mode=0o700)
-    bins = args.bin.resolve()
     command(bins, "erebus-shielded-disclosure", {"method": "keygen", "key_file": str(directory / "auditor.key")}, directory)
     (directory / "cache").mkdir(mode=0o700)
     private_json(directory / "disclosure.json", disclosure.render(args.deployment, args.pool, args.rpc_url,
@@ -844,6 +950,7 @@ def main(argv=None) -> int:
     third.add_argument("--pool", choices=("wmon", "usdc"), required=True)
     third.add_argument("--directory", type=Path, required=True)
     third.add_argument("--bin", type=Path, required=True)
+    third.add_argument("--pins", type=Path, required=True, help="release pins directory; installed binaries are checked against it")
     third.add_argument("--deployment", type=Path, required=True)
     third.add_argument("--rpc-url", required=True)
     third.add_argument("--peer-rpc-url", required=True)
