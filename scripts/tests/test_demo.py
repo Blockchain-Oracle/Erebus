@@ -17,7 +17,7 @@ def test_repository_demo_contract() -> None:
 
 
 def test_stale_privacy_copy_is_rejected(tmp_path: Path) -> None:
-    shutil.copytree(ROOT / "web", tmp_path / "web")
+    shutil.copytree(ROOT / "web", tmp_path / "web", ignore=shutil.ignore_patterns("node_modules", ".next"))
     (tmp_path / "strk20.json").write_bytes((ROOT / "strk20.json").read_bytes())
     path = tmp_path / "web" / "lib" / "content.ts"
     path.write_text(path.read_text().replace("Readable for one deal", "Readable for one channel"))
@@ -26,7 +26,7 @@ def test_stale_privacy_copy_is_rejected(tmp_path: Path) -> None:
 
 
 def test_pre_canary_video_copy_is_rejected(tmp_path: Path) -> None:
-    shutil.copytree(ROOT / "web", tmp_path / "web")
+    shutil.copytree(ROOT / "web", tmp_path / "web", ignore=shutil.ignore_patterns("node_modules", ".next"))
     (tmp_path / "strk20.json").write_bytes((ROOT / "strk20.json").read_bytes())
     path = tmp_path / "web" / "components" / "Proof.tsx"
     path.write_text(

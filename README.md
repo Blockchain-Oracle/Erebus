@@ -134,6 +134,16 @@ and review of the Metropolis work. AI-generated code requires human review and d
 not establish security or release readiness. The pre-existing Starknet/STRK20
 implementation is prior work; the Metropolis roadmap records the new branch work.
 
+### External Code Attribution
+
+The Metropolis implementation uses Circom, circomlib, circomlibjs and snarkjs for
+circuits and proving, arkworks and ark-circom for Rust proving and verification,
+and ethers and solc for EVM tooling. These are external projects, not Erebus inventions.
+Dependency versions are recorded in the [circuit manifest](./circuits/m5/package.json),
+its lockfile, the [shielded Rust manifest](./sdk/shielded/Cargo.toml) and its lockfile.
+The [MCP package manifest](./mcp-server/pyproject.toml) records the external MCP tooling.
+The older Starknet implementation composes `starkware-libs/starknet-privacy`.
+
 The `metropolis` branch targets a developer/agent product on Monad testnet. `0.3.0.dev5` is a
 published prerelease and both rails have team-operated live Monad runs, but this is not yet a
 shipped or externally accepted Monad release.

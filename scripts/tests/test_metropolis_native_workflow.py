@@ -1,8 +1,42 @@
 """Native generated-agent qualification must use public inputs and exact authorization."""
 
 from pathlib import Path
+import ast
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+def mode_checker():
+    source = ast.parse((ROOT / "scripts/rehearse-metropolis-workflow.py").read_text())
+    functions = [node for node in source.body if isinstance(node, ast.FunctionDef)
+                 and node.name in {"require", "check_operator_mode"}]
+    namespace = {"Failure": RuntimeError}
+    exec(compile(ast.Module(body=functions, type_ignores=[]), "workflow-mode", "exec"), namespace)
+    return namespace["check_operator_mode"]
+
+
+@pytest.mark.parametrize("prepublication", [False, True])
+def test_operator_mode_accepts_only_matching_pins(prepublication):
+    check = mode_checker()
+    replies = {name: {} if prepublication else {"rehearsal": True}
+               for name in ("seller_init", "buyer_init", "auditor")}
+    summary = ({"prepublication": True, "labels": ["test-only"]} if prepublication else
+               {"labels": ["rehearsal-pins"], "rehearsal": {"publication_evidence": False}})
+    check(replies, [summary, summary], prepublication)
+    with pytest.raises(RuntimeError):
+        check(replies, [summary], not prepublication)
+    with pytest.raises(RuntimeError):
+        check(replies, [{}], prepublication)
+
+
+def test_prepublication_refuses_rehearsal_auditor_and_mixed_summary():
+    check = mode_checker()
+    with pytest.raises(RuntimeError):
+        check({"auditor": {"rehearsal": True}}, [{"prepublication": True}], True)
+    with pytest.raises(RuntimeError):
+        check({}, [{"prepublication": True, "labels": ["rehearsal-pins"]}], True)
 
 
 def workflow_step():

@@ -52,6 +52,10 @@ class LocalGateway:
     `pending_states` is the sequence of `status` values a retrieval returns before it is
     served. The defaults model a submitted payment and one dropped response, so a demo shows
     that retries reuse the permit instead of paying again.
+
+    The permit and payment counters are this model's own bookkeeping, so they show what the
+    model does, not what the driver does. `negotiate_calls` is the driver-side signal: retries
+    must reach the seller as retrievals only, never as a fresh negotiation.
     """
 
     endpoint: GatewayEndpoint
@@ -60,6 +64,8 @@ class LocalGateway:
     _operations: dict[str, _Operation] = field(default_factory=dict)
     permits_signed: int = 0
     payments_collected: int = 0
+    negotiate_calls: int = 0
+    retrieve_calls: int = 0
 
     def _operation(self, operation_ref: str) -> _Operation:
         return self._operations.setdefault(operation_ref, _Operation())
@@ -74,12 +80,14 @@ class LocalGateway:
         return GatewaySession(self, "seller")
 
     def _negotiate(self, operation_ref: str) -> dict[str, Any]:
+        self.negotiate_calls += 1
         return {"ok": True, "result": {
             "deal_commitment": self._commitment(operation_ref),
             "evidence_file": f"/operator/state/agent/{operation_ref}.0.tx",
         }}
 
     def _retrieve(self, operation_ref: str) -> dict[str, Any]:
+        self.retrieve_calls += 1
         operation = self._operation(operation_ref)
         if not operation.permit_signed:
             operation.permit_signed = True

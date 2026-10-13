@@ -9,9 +9,11 @@ keep three facts distinct and never collapse them:
 * the payment matched the agreement,
 * delivery was observed off-chain (never proven by the protocol).
 
-A receipt that claims delivery verification is rejected on construction. "Payment pending" is
-rendered as pending, not as failure: on a public RPC it can stay pending indefinitely, and
-pending is not evidence of non-payment.
+A receipt that claims delivery verification is rejected on construction. So is a rehearsal
+receipt that claims agreement or payment verification: a rehearsal is the participant's own view,
+so its status is always `rehearsal`, never `verified`. "Payment pending" is rendered as pending,
+not as failure: on a public RPC it can stay pending indefinitely, and pending is not evidence of
+non-payment.
 """
 
 from __future__ import annotations
@@ -42,6 +44,7 @@ class DealReceipt:
     network: str | None = None
     operation_ref: str | None = None
     source: str = "disclosure"
+    reported_settled: bool | None = None
 
     def __post_init__(self) -> None:
         if not _COMMITMENT.fullmatch(self.deal_commitment):
@@ -50,6 +53,10 @@ class DealReceipt:
             raise ValueError("issuer must not be empty")
         if self.delivery_verified:
             raise ValueError("disclosure never proves delivery; a receipt claiming it is rejected")
+        if self.source not in ("disclosure", "rehearsal"):
+            raise ValueError("source must be disclosure or rehearsal")
+        if self.source == "rehearsal" and (self.agreement_verified or self.payment_verified):
+            raise ValueError("a rehearsal is never independent verification; it cannot claim verified flags")
         object.__setattr__(self, "deal_commitment", self.deal_commitment.lower())
 
     @property
@@ -60,6 +67,8 @@ class DealReceipt:
 
     @property
     def status(self) -> str:
+        if self.source == "rehearsal":
+            return "rehearsal"
         if self.agreement_verified and self.payment_verified:
             return "verified"
         if self.agreement_verified:
@@ -82,6 +91,7 @@ class DealReceipt:
             "operation_ref": self.operation_ref,
             "status": self.status,
             "source": self.source,
+            "reported_settled": self.reported_settled,
         }
 
 
@@ -89,17 +99,25 @@ def _flag(value: Any) -> bool:
     return value is True
 
 
-def receipt_from_report(report: dict[str, Any], *, issuer: str, **meta: Any) -> DealReceipt:
+def receipt_from_report(report: dict[str, Any], *, issuer: str, deal_commitment: str | None = None,
+                        **meta: Any) -> DealReceipt:
     """Build a receipt from an auditor report or a rehearsal record.
 
     An auditor report carries an ``auditor`` block of independent flags. A rehearsal record
-    carries ``settled`` and ``audit.compliant`` from the participant's own view, which is
-    agreement and payment evidence but never independent verification.
+    carries ``settled`` from the participant's own view, which is recorded as
+    ``reported_settled`` and never as verification.
+
+    ``deal_commitment`` fills in a commitment the report omits. It never replaces one an auditor
+    already verified: a different value is refused.
     """
     auditor = report.get("auditor")
     if isinstance(auditor, dict):
+        verified_commitment = auditor.get("deal_commitment")
+        if (deal_commitment is not None and verified_commitment
+                and str(verified_commitment).lower() != deal_commitment.lower()):
+            raise ValueError("deal_commitment differs from the commitment the auditor verified")
         return DealReceipt(
-            deal_commitment=str(auditor.get("deal_commitment", "")),
+            deal_commitment=str(verified_commitment or deal_commitment or ""),
             issuer=issuer,
             agreement_verified=_flag(auditor.get("agreement_verified")),
             payment_verified=_flag(auditor.get("payment_verified")),
@@ -110,12 +128,12 @@ def receipt_from_report(report: dict[str, Any], *, issuer: str, **meta: Any) -> 
         )
     agreed = report.get("agreed_amount")
     paid = report.get("paid_amount")
-    audit = report.get("audit") or {}
     return DealReceipt(
-        deal_commitment=str(report.get("deal_commitment") or report.get("deal_ref") or ""),
+        deal_commitment=str(deal_commitment or report.get("deal_commitment") or report.get("deal_ref") or ""),
         issuer=issuer,
-        agreement_verified=bool(report.get("settled")),
-        payment_verified=bool(audit.get("compliant")) and bool(report.get("settled")),
+        agreement_verified=False,
+        payment_verified=False,
+        reported_settled=report.get("settled") is True,
         agreed_amount=agreed if isinstance(agreed, int) else None,
         paid_amount=paid if isinstance(paid, int) else None,
         operation_ref=report.get("operation_ref"),
@@ -124,9 +142,26 @@ def receipt_from_report(report: dict[str, Any], *, issuer: str, **meta: Any) -> 
     )
 
 
+_REHEARSAL_FLAG = "not verified (rehearsal, participant's own view)"
+_PENDING_NOTE = "Payment pending is not evidence of non-payment; re-check later, do not pay again."
+_REHEARSAL_NOTE = "Rehearsal record: nothing here was independently verified against chain data."
+
+
+def _flag_text(receipt: DealReceipt, flag: bool) -> str:
+    if receipt.source == "rehearsal":
+        return _REHEARSAL_FLAG
+    return "verified" if flag else "pending"
+
+
+def _note(receipt: DealReceipt) -> str | None:
+    if receipt.source == "rehearsal":
+        return _REHEARSAL_NOTE
+    return None if receipt.payment_verified else _PENDING_NOTE
+
+
 def render_text(receipt: DealReceipt) -> str:
     def mark(flag: bool) -> str:
-        return "verified" if flag else "pending"
+        return _flag_text(receipt, flag)
 
     lines = [
         "Private deal receipt",
@@ -153,10 +188,13 @@ def render_text(receipt: DealReceipt) -> str:
         lines.append(f"Consistent: {receipt.consistency}")
     if receipt.network:
         lines.append(f"Network:    {receipt.network}")
+    if receipt.reported_settled is not None:
+        lines.append(f"Reported:   {'settled' if receipt.reported_settled else 'not settled'} (participant's own view)")
     lines.append(f"Source:     {receipt.source}")
-    if not receipt.payment_verified:
+    note = _note(receipt)
+    if note:
         lines.append("")
-        lines.append("Payment pending is not evidence of non-payment; re-check later, do not pay again.")
+        lines.append(note)
     return "\n".join(lines) + "\n"
 
 
@@ -166,7 +204,7 @@ def render_html(receipt: DealReceipt) -> str:
         return f"<tr><th>{html.escape(label)}</th><td{klass}>{html.escape(value)}</td></tr>"
 
     def flag(label: str, value: bool) -> str:
-        return row(label, "verified" if value else "pending", "ok" if value else "warn")
+        return row(label, _flag_text(receipt, value), "ok" if value else "warn")
 
     amounts = ""
     if receipt.agreed_amount is not None or receipt.paid_amount is not None:
@@ -187,12 +225,12 @@ def render_html(receipt: DealReceipt) -> str:
         + row("Delivery", "not proven (disclosure never proves delivery)", "muted")
         + amounts
         + (row("Network", receipt.network) if receipt.network else "")
+        + (row("Reported", f"{'settled' if receipt.reported_settled else 'not settled'} (participant's own view)",
+               "muted") if receipt.reported_settled is not None else "")
         + row("Source", receipt.source)
     )
-    note = (
-        "" if receipt.payment_verified
-        else '<p class="note">Payment pending is not evidence of non-payment; re-check later, do not pay again.</p>'
-    )
+    note_text = _note(receipt)
+    note = f'<p class="note">{html.escape(note_text)}</p>' if note_text else ""
     return (
         "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">"
         "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
@@ -219,15 +257,14 @@ def main() -> None:
     parser.add_argument("--parties", nargs="*", default=[], help="participant identities, if known")
     parser.add_argument("--asset", help="ERC-20 ticker or address")
     parser.add_argument("--network", help="network label, e.g. eip155:10143")
-    parser.add_argument("--deal-commitment", help="override the commitment when the report omits it")
+    parser.add_argument("--deal-commitment", help="fill in the commitment when the report omits it; never replaces a verified one")
     parser.add_argument("--format", choices=["text", "json", "html"], default="text")
     parser.add_argument("--out", type=Path, help="write to a file instead of stdout")
     args = parser.parse_args()
     report = json.loads(args.report.read_text())
-    if args.deal_commitment:
-        report = {**report, "deal_commitment": args.deal_commitment}
     receipt = receipt_from_report(
-        report, issuer=args.issuer, parties=tuple(args.parties), asset=args.asset, network=args.network)
+        report, issuer=args.issuer, deal_commitment=args.deal_commitment,
+        parties=tuple(args.parties), asset=args.asset, network=args.network)
     if args.format == "json":
         rendered = json.dumps(receipt.to_dict(), indent=2) + "\n"
     elif args.format == "html":

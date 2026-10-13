@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import tempfile
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -25,6 +26,26 @@ from erebus_mcp.interface import AgentId
 
 _SERVICE_ID = re.compile(r"[a-z0-9][a-z0-9._-]*")
 _SHA256_HEX = re.compile(r"[a-f0-9]{64}")
+
+
+def write_private_json(path: Path, value: dict[str, object]) -> None:
+    """Atomically replace `path` with `value`, owner-only from the first byte written."""
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        os.chmod(temporary, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            descriptor = -1
+            json.dump(value, stream, indent=2)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
 
 
 @dataclass(frozen=True)
@@ -119,12 +140,7 @@ class ServiceRegistry:
         target = path or self._path
         if target is None:
             raise ValueError("no registry path configured")
-        payload = json.dumps({"listings": [listing.to_dict() for listing in self.listings()]}, indent=2)
-        tmp = target.with_suffix(target.suffix + ".tmp")
-        tmp.write_text(payload)
-        tmp.replace(target)
-        if os.name == "posix":
-            target.chmod(0o600)
+        write_private_json(target, {"listings": [listing.to_dict() for listing in self.listings()]})
         return target
 
     @classmethod

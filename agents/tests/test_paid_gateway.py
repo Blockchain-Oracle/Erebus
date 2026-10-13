@@ -2,6 +2,7 @@
 
 import asyncio
 import secrets
+import time
 
 import pytest
 
@@ -19,17 +20,28 @@ def test_endpoint_rejects_empty_identity_or_nonpositive_price():
         GatewayEndpoint("svc", "c", 0, "0xa")
 
 
+async def _no_wait(_seconds: float) -> None:
+    return None
+
+
 def test_each_call_pays_exactly_once():
+    started = time.monotonic()
     record = asyncio.run(rehearse(ENDPOINT, 3))
+    assert time.monotonic() - started < 1.0, "the offline rehearsal must not sleep between retries"
+    assert record["negotiate_calls"] == 6, "one negotiation per side per call, none on retry"
     assert record["permits_signed"] == 3 and record["payments_collected"] == 3
     assert record["total_billed"] == 75
     assert record["payment_verified"] is False
     assert all(call["resource_bytes"] == len(b"paid resource body") for call in record["calls"])
 
 
-def test_retries_reuse_one_permit_and_one_payment():
+def test_driver_retries_only_by_retrieval_never_by_renegotiating():
+    # The permit/payment counters are the model's own bookkeeping; what this pins about the real
+    # driver is that every retry reaches the seller as a retrieval and never as a new negotiation.
     gateway = LocalGateway(ENDPOINT)
-    record = asyncio.run(drive_x402_deal(gateway.buyer_session(), gateway.seller_session(), secrets.token_hex(32)))
+    record = asyncio.run(drive_x402_deal(gateway.buyer_session(), gateway.seller_session(), secrets.token_hex(32),
+                                         sleep=_no_wait))
+    assert gateway.negotiate_calls == 2 and gateway.retrieve_calls == 3
     assert record["retrieval_attempts"] == 3
     assert record["retrieval_states"] == ["payment_pending", "paid_but_undelivered", "retrieved"]
     assert gateway.permits_signed == 1 and gateway.payments_collected == 1
@@ -38,7 +50,8 @@ def test_retries_reuse_one_permit_and_one_payment():
 
 def test_immediate_serving_needs_no_retry():
     gateway = LocalGateway(ENDPOINT, pending_states=())
-    record = asyncio.run(drive_x402_deal(gateway.buyer_session(), gateway.seller_session(), secrets.token_hex(32)))
+    record = asyncio.run(drive_x402_deal(gateway.buyer_session(), gateway.seller_session(), secrets.token_hex(32),
+                                         sleep=_no_wait))
     assert record["retrieval_attempts"] == 1
     assert gateway.permits_signed == 1 and gateway.payments_collected == 1
 

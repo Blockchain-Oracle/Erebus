@@ -45,8 +45,32 @@ def test_receipt_from_auditor_report_maps_the_independent_flags():
 
 def test_receipt_from_rehearsal_report_is_not_independent_verification():
     receipt = receipt_from_report(REHEARSAL_REPORT, issuer=ISSUER)
-    assert receipt.agreement_verified and receipt.payment_verified
+    assert not receipt.agreement_verified and not receipt.payment_verified
+    assert receipt.status == "rehearsal" and receipt.reported_settled is True
     assert receipt.agreed_amount == receipt.paid_amount == 64 and receipt.source == "rehearsal"
+    text = render_text(receipt)
+    assert "Status:     rehearsal" in text
+    assert not any(line.rstrip().endswith(": verified") or line.split(":", 1)[-1].strip() == "verified"
+                   for line in text.splitlines())
+    assert "Status</th><td class=\"warn\">rehearsal" in render_html(receipt)
+
+
+def test_a_rehearsal_receipt_cannot_claim_verification():
+    with pytest.raises(ValueError, match="rehearsal"):
+        DealReceipt(COMMITMENT, ISSUER, True, True, source="rehearsal")
+    with pytest.raises(ValueError, match="source"):
+        DealReceipt(COMMITMENT, ISSUER, True, True, source="self-reported")
+
+
+def test_commitment_override_fills_a_gap_but_never_replaces_a_verified_one():
+    missing = {"auditor": {**AUDITOR_REPORT["auditor"], "deal_commitment": None}}
+    assert receipt_from_report(missing, issuer=ISSUER, deal_commitment=COMMITMENT).deal_commitment == COMMITMENT
+    same = receipt_from_report(AUDITOR_REPORT, issuer=ISSUER, deal_commitment=COMMITMENT.upper())
+    assert same.deal_commitment == COMMITMENT
+    with pytest.raises(ValueError, match="auditor verified"):
+        receipt_from_report(AUDITOR_REPORT, issuer=ISSUER, deal_commitment="cd" * 32)
+    rehearsal = {k: v for k, v in REHEARSAL_REPORT.items() if k != "deal_ref"}
+    assert receipt_from_report(rehearsal, issuer=ISSUER, deal_commitment=COMMITMENT).deal_commitment == COMMITMENT
 
 
 def test_text_render_flags_pending_without_calling_it_failure():

@@ -80,7 +80,7 @@ seller-authored offer.
 # Marketplace: search, negotiate, settle, deliver, audit (mock rehearsal)
 uv run python agents/src/erebus_agents/marketplace_demo.py --latency 0
 
-# Paid API gateway: per-call private access over the x402-exact sequencing
+# Paid API gateway: per-call access over the public x402-exact sequencing (not private)
 uv run python agents/src/erebus_agents/api_gateway_demo.py --calls 3
 
 # Receipt explorer: format a verification result an auditor already produced
