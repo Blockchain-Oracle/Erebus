@@ -1,9 +1,14 @@
-"""A capability marketplace over the negotiation and settlement loop.
+"""A capability marketplace over the real Metropolis negotiation and settlement loop.
 
-A seller publishes a capability with a unit-price band and an asset. A buyer searches the
-registry for a capability, picks the cheapest listing inside its ceiling, negotiates, and
-pays once. Nothing here is protocol logic: the registry is ordinary I/O and the delivery
-record is ordinary policy.
+A seller publishes a capability with an advertised unit-price band and an asset. A buyer
+searches the registry, picks the cheapest listing inside its ceiling, and buys it through the
+configured Metropolis servers its operator wired to that seller (`PurchaseRoute`). Nothing here
+is protocol logic: the registry and routes are ordinary I/O and the delivery record is ordinary
+policy.
+
+The advertised band only decides which seller to approach. The price actually agreed is fixed
+by the operators' negotiation files and enforced natively: the buyer's `maximum_price` caps it,
+and the agent never supplies or sees an amount.
 
 Delivery is an off-chain acknowledgement, never settlement evidence. The proof says nothing
 about whether a resource arrived, so a `DeliveryRecord` records what an operator observed and
@@ -149,6 +154,55 @@ class ServiceRegistry:
         for entry in json.loads(path.read_text()).get("listings", []):
             registry.publish(ServiceListing.from_dict(entry))
         return registry
+
+
+@dataclass(frozen=True)
+class PurchaseRoute:
+    """The buyer operator's local wiring from one listing to the configured servers for that seller.
+
+    Each Metropolis negotiation file pins exactly one peer descriptor, so every seller a buyer can
+    buy from has its own buyer negotiation file. Paths are absolute operator files; keys stay in
+    the files they name and never pass through the agent.
+    """
+
+    service_id: str
+    buyer_negotiation_config: str
+    buyer_payment_config: str
+    seller_negotiation_config: str
+    buyer_access_file: str | None = None
+
+    def __post_init__(self) -> None:
+        if not _SERVICE_ID.fullmatch(self.service_id):
+            raise ValueError("service_id must be a lowercase, greppable identifier")
+        for name in ("buyer_negotiation_config", "buyer_payment_config", "seller_negotiation_config",
+                     "buyer_access_file"):
+            value = getattr(self, name)
+            if value is None and name == "buyer_access_file":
+                continue
+            if not value or not Path(value).is_absolute():
+                raise ValueError(f"{name} must be an absolute operator file path")
+
+    @classmethod
+    def from_dict(cls, value: dict[str, object]) -> "PurchaseRoute":
+        access = value.get("buyer_access_file")
+        return cls(
+            service_id=str(value["service_id"]),
+            buyer_negotiation_config=str(value["buyer_negotiation_config"]),
+            buyer_payment_config=str(value["buyer_payment_config"]),
+            seller_negotiation_config=str(value["seller_negotiation_config"]),
+            buyer_access_file=None if access is None else str(access),
+        )
+
+
+def load_routes(path: Path) -> dict[str, PurchaseRoute]:
+    """Read the buyer operator's route file: ``{"routes": [{service_id, ...config paths}]}``."""
+    routes: dict[str, PurchaseRoute] = {}
+    for entry in json.loads(path.read_text()).get("routes", []):
+        route = PurchaseRoute.from_dict(entry)
+        if route.service_id in routes:
+            raise ValueError(f"service_id {route.service_id!r} is routed twice")
+        routes[route.service_id] = route
+    return routes
 
 
 class DeliveryStatus(str, Enum):
