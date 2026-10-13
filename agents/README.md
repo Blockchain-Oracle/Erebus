@@ -54,6 +54,26 @@ seller-authored offer.
 - `receipt_explorer.py`. Renders one disclosed deal as a private receipt, from an auditor report
   or a rehearsal. It keeps agreement, payment and delivery distinct, refuses a receipt that claims
   delivery verification, and exports text, JSON or a self-contained static HTML file. Also a CLI.
+- `rfq.py` / `rfq_demo.py`. A confidential request-for-quote desk: one buyer issues a
+  `RequestForQuote` with a hidden ceiling, suppliers return sealed `Quote`s, and `award` picks the
+  cheapest valid quote (rejecting expired, over-ceiling and outbid ones) without revealing the
+  losers. The winner is then negotiated and settled through the ordinary loop.
+- `vendor_selection.py` / `vendor_selection_demo.py`. `negotiate_amount` runs a private
+  negotiation with each candidate seller *without settling*, and `select` picks the cheapest
+  agreement at or below the ceiling. The buyer pays exactly one seller; losing candidates are
+  never paid.
+- `firewall.py` / `firewall_demo.py`. The agent-side spending policy: per-token per-deal and daily
+  caps, a `SpendLedger`, and the counterparty allowlist the MCP `SpendGuard` does not have.
+- `grant.py` / `grant_demo.py`. A sponsor's `BudgetGrant` (token, total budget, per-deal cap,
+  counterparty allowlist, expiry) and a `GrantLedger`, so an agent's spending is attributable to a
+  sponsor's intent. Shares the firewall's refusal codes.
+- `discovery.py` / `discovery_demo.py`. A `DiscoveryDirectory` of `ServiceRecord`s: capability,
+  asset, price band, endpoint and an optional signed-descriptor digest. It indexes; the Rust
+  `ServiceDescriptor` verifies.
+- `metering.py` / `saas_metering_demo.py`. Prepaid `CreditBundle` accounting over the existing
+  metered-access profile: buy N calls in one settlement, spend them, refuse an overdraw.
+- `offchain_purchase_demo.py`. Compute, dataset or API purchases reusing the marketplace loop
+  unchanged.
 - `demo.py` / `demo_mcp.py`, the two CLI entry points above.
 
 ```bash
@@ -66,6 +86,15 @@ uv run python agents/src/erebus_agents/api_gateway_demo.py --calls 3
 # Receipt explorer: format a verification result an auditor already produced
 uv run python agents/src/erebus_agents/receipt_explorer.py --report audit.json \
   --issuer <participant> --format text   # or --format html --out receipt.html
+
+# RFQ desk, vendor selection, spending firewall, grants, discovery, metering, off-chain buys
+uv run python agents/src/erebus_agents/rfq_demo.py --latency 0
+uv run python agents/src/erebus_agents/vendor_selection_demo.py --latency 0
+uv run python agents/src/erebus_agents/firewall_demo.py
+uv run python agents/src/erebus_agents/grant_demo.py
+uv run python agents/src/erebus_agents/discovery_demo.py
+uv run python agents/src/erebus_agents/saas_metering_demo.py --latency 0
+uv run python agents/src/erebus_agents/offchain_purchase_demo.py --kind compute --latency 0
 ```
 
 ## Where it sits
