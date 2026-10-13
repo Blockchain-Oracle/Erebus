@@ -196,11 +196,21 @@ fn command_lock(root: &Path) -> Result<fs::File, &'static str> {
     Ok(file)
 }
 
+fn capabilities() -> Value {
+    json!({"status":"ok","protocol_version":1,
+    "service":"erebus-payment","modes":["public-bound","shielded"],"automatic_rebroadcast":false,
+    "sponsored_relay":true})
+}
+
 #[tokio::main]
 async fn main() {
     let args: Vec<_> = std::env::args().skip(1).collect();
     if matches!(args.as_slice(), [arg] if arg == "--help") {
         println!("{HELP}");
+        return;
+    }
+    if matches!(args.as_slice(), [arg] if arg == "--version") {
+        println!("{}", capabilities());
         return;
     }
     if !args.is_empty() {
@@ -242,10 +252,7 @@ fn finish(result: Result<Value, &'static str>) -> ! {
 
 async fn handle(request: Request) -> Result<Value, &'static str> {
     let (path, operation, submit, funding_only) = match request {
-        Request::Version {} => {
-            return Ok(json!({"status":"ok","protocol_version":1,
-            "service":"erebus-payment","modes":["public-bound","shielded"],"automatic_rebroadcast":false}))
-        }
+        Request::Version {} => return Ok(capabilities()),
         Request::Funding {
             config_file,
             operation_ref,

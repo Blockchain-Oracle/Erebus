@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use zeroize::Zeroize;
 
 use crate::broadcast::{AttemptRecord, BroadcastOutcome, Replacement};
-use crate::{Diagnostic, Error, Stage};
+use crate::{Diagnostic, Error, Stage, SubmissionDelegation};
 
 pub(crate) const MAX_STATE_BYTES: u64 = 16 * 1024 * 1024;
 pub(crate) const MAX_EVIDENCE_BYTES: usize = 64 * 1024;
@@ -91,6 +91,8 @@ pub(crate) struct Intent {
     pub(crate) broadcast_attempts: Vec<AttemptRecord>,
     #[serde(default)]
     pub(crate) replacements: Vec<Replacement>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) delegation: Option<SubmissionDelegation>,
 }
 
 impl Drop for Intent {
@@ -136,6 +138,7 @@ impl Intent {
             transaction_plan: None,
             broadcast_attempts: Vec::new(),
             replacements: Vec::new(),
+            delegation: None,
         }
     }
 
@@ -199,6 +202,7 @@ impl Intent {
             unknown_attempts,
             last_broadcast_outcome: self.broadcast_attempts.last().map(|a| a.outcome),
             replacements: self.replacements.len(),
+            submission_delegated: self.delegation.is_some(),
         }
     }
 }
@@ -266,6 +270,19 @@ impl State {
                 return Err(Error::Storage);
             }
             let (terms, blinding) = intent.opening()?;
+            if let Some(delegation) = &intent.delegation {
+                let prepared = intent.prepared.as_ref().ok_or(Error::Storage)?;
+                if terms.settlement_mode != erebus_core::terms::SettlementMode::Shielded
+                    || delegation.relay_identity == [0; 32]
+                    || delegation.calldata_keccak256 != erebus_core::suite::keccak256(&[prepared])
+                    || intent.signed_transaction.is_some()
+                    || intent.transaction_plan.is_some()
+                    || !intent.broadcast_attempts.is_empty()
+                    || !intent.replacements.is_empty()
+                {
+                    return Err(Error::Storage);
+                }
+            }
             if terms.buyer_authorization_key.as_bytes() != self.buyer
                 || intent.created_at >= terms.expiry
             {

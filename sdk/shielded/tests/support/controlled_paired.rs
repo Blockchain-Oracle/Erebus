@@ -2275,7 +2275,7 @@ async fn slow_access_history_outlives_thirty_seconds_without_recharging() {
     // stored checkpoint before the slow read.
     mine(&client, &environment.deployed.url, 2200).await;
     let selected = environment.selected();
-    let request = environment.access_request(&selected, [42; 32], [45; 32], clock() + 280);
+    let request = environment.access_request(&selected, [42; 32], [45; 32], clock() + 295);
     let patient = reqwest::Client::builder()
         .timeout(Duration::from_secs(120))
         .build()
@@ -2297,6 +2297,9 @@ async fn slow_access_history_outlives_thirty_seconds_without_recharging() {
     let checkpoint = environment
         .service_history_tip(&state_root, "pool-history.json")
         .expect("the bounded scan must persist a checkpoint");
+    // A fresh request lifetime starts here, so a slow first scan cannot let the signed
+    // request expire before the deliberately slow phase.
+    let request = environment.access_request(&selected, [42; 32], [46; 32], clock() + 295);
 
     // Every service log read now outlives a thirty-second client until the retry phase
     // disarms the delay. The aborted attempt must keep the stored checkpoint, and the retry

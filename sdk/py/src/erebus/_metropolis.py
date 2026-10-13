@@ -24,9 +24,11 @@ class MetropolisSeam:
     def __init__(self, *, negotiation_config: str, state_root: str, role: str,
                  payment_config: str | None = None, mode: str | None = None,
                  negotiation_binary: str | None = None, payment_binary: str | None = None,
-                 timeout: int = 600) -> None:
+                 timeout: int = 600, submission_mode: str = "direct") -> None:
         if role not in {"buyer", "seller"} or type(timeout) is not int or not 1 <= timeout <= 900:
             raise MetropolisError("configure a participant role and bounded native timeout")
+        if submission_mode not in {"direct", "sponsored"} or (submission_mode == "sponsored" and (role != "buyer" or mode != "shielded")):
+            raise MetropolisError("sponsorship requires an explicitly configured shielded buyer")
         paths = [negotiation_config, state_root] + ([payment_config] if payment_config is not None else [])
         if any(not isinstance(path, str) or len(path) > 4096 or not Path(path).is_absolute() for path in paths):
             raise MetropolisError("configure absolute operator paths")
@@ -39,6 +41,7 @@ class MetropolisSeam:
             raise MetropolisError("install the Metropolis native binaries")
         self._negotiation_config, self._payment_config = negotiation_config, payment_config
         self._state_root, self._role, self._mode, self._timeout = Path(state_root), role, mode, timeout
+        self._submission_mode = submission_mode
 
     def _run(self, binary: str, request: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         try:
@@ -66,7 +69,11 @@ class MetropolisSeam:
             code, response = self._run(self._payment, {"method": "version"})
             expected = {"status": "ok", "protocol_version": 1, "service": "erebus-payment",
                         "modes": ["public-bound", "shielded"], "automatic_rebroadcast": False}
-            if code != 0 or response != expected or type(response.get("protocol_version")) is not int or type(response.get("automatic_rebroadcast")) is not bool:
+            reply = dict(response)
+            sponsored = reply.pop("sponsored_relay", None)
+            if sponsored is not None and sponsored is not True:
+                raise MetropolisError("payment binary protocol mismatch")
+            if code != 0 or reply != expected or type(response.get("protocol_version")) is not int or type(response.get("automatic_rebroadcast")) is not bool:
                 raise MetropolisError("payment binary protocol mismatch")
         return {"protocol_version": 1, "role": self._role, "mode": self._mode, "automatic_rebroadcast": False}
 
@@ -109,7 +116,8 @@ class MetropolisSeam:
                     "deal_commitment", "deal_nullifier", "submitted_this_call", "retry_without_new_payment", "measurements_ms"}
         optional = {"history_pending", "next_log_block", "through", "ancestry_block", "stage", "broadcast_attempts",
                     "winning_commitment", "nonce_cleanup_pending", "wallet_release_required", "funding", "proof_required",
-                    "transaction_hash", "locally_signed_transaction_hash", "downloaded_bytes", "chain_times"}
+                    "transaction_hash", "locally_signed_transaction_hash", "downloaded_bytes", "chain_times",
+                    "submission_delegated", "relay_operation_ref", "relay_transaction_hash", "relay_status"}
         status = response.get("status")
         if (not required <= set(response) or not set(response) <= required | optional
             or status not in {"ok", "ready", "pending", "funding_required", "closed_unpaid"}
@@ -118,16 +126,27 @@ class MetropolisSeam:
             or response.get("delivery_verified") is not False or response.get("retry_without_new_payment") is not True
             or not all(_digest(response.get(field)) for field in ("deal_commitment", "deal_nullifier"))):
             raise MetropolisError("invalid payment result or configured mode mismatch")
-        for field in ("payment_verified", "submitted_this_call", "history_pending", "nonce_cleanup_pending", "wallet_release_required", "proof_required"):
+        for field in ("payment_verified", "submitted_this_call", "history_pending", "nonce_cleanup_pending", "wallet_release_required", "proof_required", "submission_delegated"):
             if field in response and type(response[field]) is not bool:
                 raise MetropolisError("invalid payment boolean")
         if response["submitted_this_call"] and method != "settle":
             raise MetropolisError("read-only operation claimed submission")
+        if response.get("submission_delegated") and response["submitted_this_call"]:
+            raise MetropolisError("delegated operation claimed a buyer broadcast")
+        if self._submission_mode == "sponsored" and response["submitted_this_call"]:
+            raise MetropolisError("sponsored operation claimed direct buyer submission")
+        relay_fields = {"relay_operation_ref", "relay_transaction_hash", "relay_status"}
+        if relay_fields & set(response) and response.get("submission_delegated") is not True:
+            raise MetropolisError("relay diagnostics lack a durable delegation")
+        if "relay_operation_ref" in response and not _digest(response["relay_operation_ref"]):
+            raise MetropolisError("invalid relay operation ID")
+        if "relay_status" in response and response["relay_status"] not in {"pending", "finalized", "reverted", "unavailable"}:
+            raise MetropolisError("invalid relay diagnostic status")
         if response["payment_verified"] and (status != "ok" or response.get("stage") != "Finalized" or response.get("winning_commitment") != response["deal_commitment"]):
             raise MetropolisError("payment lacks finalized matching evidence")
         if "winning_commitment" in response and not _digest(response["winning_commitment"]):
             raise MetropolisError("invalid winning commitment")
-        for field in ("transaction_hash", "locally_signed_transaction_hash"):
+        for field in ("transaction_hash", "locally_signed_transaction_hash", "relay_transaction_hash"):
             if field in response and (not isinstance(response[field], str) or re.fullmatch(r"0x[a-f0-9]{64}", response[field], re.ASCII) is None):
                 raise MetropolisError("invalid transaction hash")
         stages = {"Reserved", "AuthorizationUnknown", "BuyerAuthorized", "Authorized", "Prepared", "Signed", "BroadcastUnknown", "Submitted", "Finalized", "ClosedUnpaid"}
@@ -144,7 +163,7 @@ class MetropolisSeam:
                     or not response["payment_verified"]):
                 raise MetropolisError("invalid chain timing metadata")
         metrics = response["measurements_ms"]
-        metric_names = {"deployment_authentication", "observation", "funding", "artifact_installation", "proof_preparation", "local_signing", "submission"}
+        metric_names = {"deployment_authentication", "observation", "funding", "artifact_installation", "proof_preparation", "local_signing", "submission", "relay_submission"}
         if not isinstance(metrics, dict) or not set(metrics) <= metric_names or any(type(value) is not int or not 0 <= value <= 2**64 - 1 for value in metrics.values()):
             raise MetropolisError("invalid payment timing metadata")
         if "funding" in response:

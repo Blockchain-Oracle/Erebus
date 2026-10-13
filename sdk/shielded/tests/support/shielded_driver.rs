@@ -559,6 +559,460 @@ pub(super) async fn deploy_profile(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires Anvil, Node dependencies and existing M5 prototype proving artifacts"]
+async fn negotiated_sponsored_payment_delegates_before_transport_and_never_falls_back() {
+    use erebus_core::settlement::SettlementContext;
+    use erebus_shielded_prover::{
+        index_store::IndexDomain,
+        relay_admission::{RelayAdmissionPolicy, TransferVerifier},
+        relay_http::{RelayHttpPolicy, RelayHttpService},
+        relay_service::{SponsorConfig, SponsoredRelay},
+        rpc::PoolRuntimePins,
+    };
+    let deployed = deploy(false, None).await;
+    let (buyer, _) = deployed.fixture.pair(false);
+    let selected =
+        SelectedAgreement::decode(&fs::read(buyer["evidence_file"].as_str().unwrap()).unwrap())
+            .unwrap();
+    let context = SettlementContext {
+        domain: selected.terms.domain.clone(),
+        asset: selected.terms.asset.clone(),
+        suite_id: 2,
+        mode: selected.terms.settlement_mode,
+        required_guarantees: selected.terms.required_guarantees,
+        require_local_proving: true,
+    };
+    let mut config = deployed.config.clone();
+    let address = |name: &str| -> [u8; 20] {
+        hex::decode(config[name].as_str().unwrap().trim_start_matches("0x"))
+            .unwrap()
+            .try_into()
+            .unwrap()
+    };
+    let pin = |name: &str| -> [u8; 32] {
+        hex::decode(config[name].as_str().unwrap().trim_start_matches("0x"))
+            .unwrap()
+            .try_into()
+            .unwrap()
+    };
+    let sponsor_key = [24; 32];
+    let sponsor = TransactionKey::from_bytes(&sponsor_key).unwrap().address();
+    let sponsor_hex = format!("0x{}", hex::encode(sponsor));
+    rpc(
+        &deployed.client,
+        &deployed.url,
+        "anvil_setBalance",
+        json!([sponsor_hex, "0xde0b6b3a7640000"]),
+    )
+    .await;
+    let policy = RelayAdmissionPolicy {
+        context,
+        deployment: IndexDomain {
+            chain_id: 31337,
+            pool: address("pool"),
+            first_block: config["first_block"].as_u64().unwrap(),
+            first_hash: pin("first_hash"),
+        },
+        runtime_pins: PoolRuntimePins {
+            pool: pin("runtime_keccak256"),
+            poseidon: pin("poseidon_keccak256"),
+            deposit: pin("deposit_verifier_keccak256"),
+            transfer: pin("transfer_verifier_keccak256"),
+            withdraw: pin("withdraw_verifier_keccak256"),
+        },
+        sponsor,
+        gas_limit: 3_000_000,
+    };
+    let zkey = fs::read(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../circuits/m5/build/transfer.zkey"),
+    )
+    .unwrap();
+    let service = SponsoredRelay::connect(
+        SponsorConfig {
+            root: deployed.fixture.root.path().join("relay-state"),
+            signer_root: deployed.fixture.root.path().join("relay-nonces"),
+            admission: policy,
+            fees: erebus_evm::chain::Eip1559Fees::new(2_000_000_000, 1_000_000_000).unwrap(),
+            replacement_fees: None,
+            rpc_url: config["rpc_url"].as_str().unwrap().into(),
+            peer_rpc_url: config["peer_rpc_url"].as_str().unwrap().into(),
+            timeout: Duration::from_secs(10),
+        },
+        TransferVerifier::from_zkey_bytes(&zkey, &hex::encode(Sha256::digest(&zkey))).unwrap(),
+        &sponsor_key,
+    )
+    .await
+    .unwrap();
+    let transport = RelayHttpService::new(
+        service,
+        [7; 32],
+        &deployed.fixture.root.path().join("relay-quota"),
+        RelayHttpPolicy {
+            requests_per_window: 50,
+            window_seconds: 60,
+            maximum_gas_budget: 6_000_000_000_000_000,
+            maximum_operations: 1,
+            timeout_seconds: 60,
+        },
+    )
+    .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/v1/relay", listener.local_addr().unwrap());
+    let token = deployed.buyer_root.join("relay-token");
+    private(&token, &[7; 32]);
+    config["relay"] = json!({
+        "url": endpoint, "identity": "01".repeat(32),
+        "authentication_key_file": token,
+        "sponsor_address": sponsor_hex, "timeout_seconds": 1,
+        "allow_loopback_http": true,
+    });
+    config["transaction_key_file"] = Value::Null;
+    let unavailable_config = deployed.buyer_root.join("sponsored-unavailable.json");
+    private(&unavailable_config, &serde_json::to_vec(&config).unwrap());
+    let binary = native_binary("erebus-payment", env!("CARGO_BIN_EXE_erebus-payment"));
+    // No server is accepting requests yet. Delegation must already be durable.
+    let (_, first) = run_payment(
+        &binary,
+        deployed.fixture.root.path(),
+        &unavailable_config,
+        "settle",
+    )
+    .await;
+    assert_eq!(first["submission_delegated"], true, "{first}");
+    assert_eq!(first["submitted_this_call"], false);
+    assert_eq!(first["relay_status"], "unavailable");
+    assert_eq!(deployed.sends.load(Ordering::SeqCst), 0);
+    let server = tokio::spawn(async move {
+        axum::serve(listener, transport.router()).await.unwrap();
+    });
+    config["relay"]["timeout_seconds"] = json!(60);
+    let sponsored_config = deployed.buyer_root.join("sponsored.json");
+    private(&sponsored_config, &serde_json::to_vec(&config).unwrap());
+    let (_, sent) = run_payment(
+        &binary,
+        deployed.fixture.root.path(),
+        &sponsored_config,
+        "settle",
+    )
+    .await;
+    assert_eq!(sent["submission_delegated"], true, "{sent}");
+    assert_eq!(sent["submitted_this_call"], false);
+    assert_eq!(sent["payment_verified"], false);
+    assert_eq!(deployed.sends.load(Ordering::SeqCst), 1, "{sent}");
+    let tx = sent["relay_transaction_hash"].as_str().unwrap();
+    // Removing the relay and restoring a buyer key must not authorize direct signing.
+    config.as_object_mut().unwrap().remove("relay");
+    config["transaction_key_file"] = deployed.config["transaction_key_file"].clone();
+    let direct_config = deployed.buyer_root.join("sponsored-no-fallback.json");
+    private(&direct_config, &serde_json::to_vec(&config).unwrap());
+    let (_, fenced) = run_payment(
+        &binary,
+        deployed.fixture.root.path(),
+        &direct_config,
+        "settle",
+    )
+    .await;
+    assert_eq!(fenced["submitted_this_call"], false, "{fenced}");
+    assert_eq!(deployed.sends.load(Ordering::SeqCst), 1);
+    rpc(
+        &deployed.client,
+        &deployed.url,
+        "anvil_mine",
+        json!(["0x4"]),
+    )
+    .await;
+    let receipt = rpc(
+        &deployed.client,
+        &deployed.url,
+        "eth_getTransactionReceipt",
+        json!([tx]),
+    )
+    .await;
+    assert_eq!(receipt["from"], sponsor_hex);
+    assert_eq!(receipt["status"], "0x1");
+    let (ok, recovered) = run_payment(
+        &binary,
+        deployed.fixture.root.path(),
+        &direct_config,
+        "observe",
+    )
+    .await;
+    assert!(ok, "{recovered}");
+    assert_eq!(recovered["payment_verified"], true);
+    assert_eq!(recovered["submitted_this_call"], false);
+    assert_eq!(deployed.sends.load(Ordering::SeqCst), 1);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Anvil, Node dependencies and existing M5 prototype proving artifacts"]
+async fn sponsored_payment_failures_keep_delegation_and_never_fall_back() {
+    use erebus_core::settlement::SettlementContext;
+    use erebus_shielded_prover::{
+        index_store::IndexDomain,
+        relay_admission::{RelayAdmissionPolicy, TransferVerifier},
+        relay_http::{RelayHttpPolicy, RelayHttpService},
+        relay_service::{SponsorConfig, SponsoredRelay},
+        rpc::PoolRuntimePins,
+    };
+    let deployed = deploy(false, None).await;
+    let (buyer, _) = deployed.fixture.pair(false);
+    let selected =
+        SelectedAgreement::decode(&fs::read(buyer["evidence_file"].as_str().unwrap()).unwrap())
+            .unwrap();
+    let context = SettlementContext {
+        domain: selected.terms.domain.clone(),
+        asset: selected.terms.asset.clone(),
+        suite_id: 2,
+        mode: selected.terms.settlement_mode,
+        required_guarantees: selected.terms.required_guarantees,
+        require_local_proving: true,
+    };
+    let mut config = deployed.config.clone();
+    let address = |name: &str| -> [u8; 20] {
+        hex::decode(config[name].as_str().unwrap().trim_start_matches("0x"))
+            .unwrap()
+            .try_into()
+            .unwrap()
+    };
+    let pin = |name: &str| -> [u8; 32] {
+        hex::decode(config[name].as_str().unwrap().trim_start_matches("0x"))
+            .unwrap()
+            .try_into()
+            .unwrap()
+    };
+    let sponsor_key = [24; 32];
+    let sponsor = TransactionKey::from_bytes(&sponsor_key).unwrap().address();
+    let sponsor_hex = format!("0x{}", hex::encode(sponsor));
+    rpc(
+        &deployed.client,
+        &deployed.url,
+        "anvil_setBalance",
+        json!([sponsor_hex, "0xde0b6b3a7640000"]),
+    )
+    .await;
+    let policy = RelayAdmissionPolicy {
+        context,
+        deployment: IndexDomain {
+            chain_id: 31337,
+            pool: address("pool"),
+            first_block: config["first_block"].as_u64().unwrap(),
+            first_hash: pin("first_hash"),
+        },
+        runtime_pins: PoolRuntimePins {
+            pool: pin("runtime_keccak256"),
+            poseidon: pin("poseidon_keccak256"),
+            deposit: pin("deposit_verifier_keccak256"),
+            transfer: pin("transfer_verifier_keccak256"),
+            withdraw: pin("withdraw_verifier_keccak256"),
+        },
+        sponsor,
+        gas_limit: 3_000_000,
+    };
+    let zkey = fs::read(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../circuits/m5/build/transfer.zkey"),
+    )
+    .unwrap();
+    let service = SponsoredRelay::connect(
+        SponsorConfig {
+            root: deployed.fixture.root.path().join("relay-state"),
+            signer_root: deployed.fixture.root.path().join("relay-nonces"),
+            admission: policy,
+            fees: erebus_evm::chain::Eip1559Fees::new(2_000_000_000, 1_000_000_000).unwrap(),
+            replacement_fees: None,
+            rpc_url: config["rpc_url"].as_str().unwrap().into(),
+            peer_rpc_url: config["peer_rpc_url"].as_str().unwrap().into(),
+            timeout: Duration::from_secs(10),
+        },
+        TransferVerifier::from_zkey_bytes(&zkey, &hex::encode(Sha256::digest(&zkey))).unwrap(),
+        &sponsor_key,
+    )
+    .await
+    .unwrap();
+    let transport = RelayHttpService::new(
+        service,
+        [7; 32],
+        &deployed.fixture.root.path().join("relay-quota"),
+        RelayHttpPolicy {
+            requests_per_window: 50,
+            window_seconds: 60,
+            maximum_gas_budget: 6_000_000_000_000_000,
+            maximum_operations: 1,
+            timeout_seconds: 60,
+        },
+    )
+    .unwrap();
+    // One fixed port is reused for every server so the delegated destination never changes.
+    let port = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let endpoint = format!("http://127.0.0.1:{port}/v1/relay");
+    let token = deployed.buyer_root.join("relay-token");
+    private(&token, &[7; 32]);
+    config["relay"] = json!({
+        "url": endpoint, "identity": "01".repeat(32),
+        "authentication_key_file": token,
+        "sponsor_address": sponsor_hex, "timeout_seconds": 1,
+        "allow_loopback_http": true,
+    });
+    config["transaction_key_file"] = Value::Null;
+    let binary = native_binary("erebus-payment", env!("CARGO_BIN_EXE_erebus-payment"));
+
+    // 1. A service that accepts the connection and never answers: bounded timeout, no fallback.
+    let hang = tokio::net::TcpListener::bind(("127.0.0.1", port))
+        .await
+        .unwrap();
+    let hang_task = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((socket, _)) = hang.accept().await {
+            held.push(socket);
+        }
+    });
+    let timeout_config = deployed.buyer_root.join("sponsored-timeout.json");
+    private(&timeout_config, &serde_json::to_vec(&config).unwrap());
+    let (_, timed) = run_payment(
+        &binary,
+        deployed.fixture.root.path(),
+        &timeout_config,
+        "settle",
+    )
+    .await;
+    assert_eq!(timed["submission_delegated"], true, "{timed}");
+    assert_eq!(timed["relay_status"], "unavailable", "{timed}");
+    assert_eq!(timed["submitted_this_call"], false, "{timed}");
+    assert_eq!(deployed.sends.load(Ordering::SeqCst), 0);
+    hang_task.abort();
+    let _ = hang_task.await;
+
+    // 2. A live service that refuses the request: still delegated, still no fallback.
+    let refused = axum::Router::new().route(
+        "/v1/relay",
+        axum::routing::post(|| async { axum::http::StatusCode::SERVICE_UNAVAILABLE }),
+    );
+    let refused_listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+        .await
+        .unwrap();
+    let refused_task = tokio::spawn(async move {
+        axum::serve(refused_listener, refused).await.unwrap();
+    });
+    config["relay"]["timeout_seconds"] = json!(60);
+    let refused_config = deployed.buyer_root.join("sponsored-refused.json");
+    private(&refused_config, &serde_json::to_vec(&config).unwrap());
+    let (_, refused_reply) = run_payment(
+        &binary,
+        deployed.fixture.root.path(),
+        &refused_config,
+        "settle",
+    )
+    .await;
+    assert_eq!(
+        refused_reply["submission_delegated"], true,
+        "{refused_reply}"
+    );
+    assert_eq!(
+        refused_reply["relay_status"], "unavailable",
+        "{refused_reply}"
+    );
+    assert_eq!(deployed.sends.load(Ordering::SeqCst), 0);
+    refused_task.abort();
+    let _ = refused_task.await;
+
+    // 3. Missing relay credentials: the durable delegation exists before the token read.
+    config["relay"]["authentication_key_file"] =
+        json!(deployed.buyer_root.join("missing-relay-token"));
+    let missing_config = deployed.buyer_root.join("sponsored-missing-key.json");
+    private(&missing_config, &serde_json::to_vec(&config).unwrap());
+    let (ok, missing) = run_payment(
+        &binary,
+        deployed.fixture.root.path(),
+        &missing_config,
+        "settle",
+    )
+    .await;
+    assert!(!ok, "{missing}");
+    assert_eq!(missing["status"], "error", "{missing}");
+    assert!(!missing.to_string().contains("missing-relay-token"));
+    assert_eq!(deployed.sends.load(Ordering::SeqCst), 0);
+
+    // 4. Restart with the relay removed and the buyer key restored: the delegation fences
+    // direct signing, even though every sponsored attempt so far failed.
+    config.as_object_mut().unwrap().remove("relay");
+    config["transaction_key_file"] = deployed.config["transaction_key_file"].clone();
+    let direct_config = deployed
+        .buyer_root
+        .join("sponsored-failure-no-fallback.json");
+    private(&direct_config, &serde_json::to_vec(&config).unwrap());
+    let (_, fenced) = run_payment(
+        &binary,
+        deployed.fixture.root.path(),
+        &direct_config,
+        "settle",
+    )
+    .await;
+    assert_eq!(fenced["submitted_this_call"], false, "{fenced}");
+    assert_eq!(deployed.sends.load(Ordering::SeqCst), 0);
+
+    // 5. The honest service on the same delegated destination submits exactly once.
+    let honest = tokio::net::TcpListener::bind(("127.0.0.1", port))
+        .await
+        .unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(honest, transport.router()).await.unwrap();
+    });
+    config["relay"] = json!({
+        "url": endpoint, "identity": "01".repeat(32),
+        "authentication_key_file": token,
+        "sponsor_address": sponsor_hex, "timeout_seconds": 60,
+        "allow_loopback_http": true,
+    });
+    config["transaction_key_file"] = Value::Null;
+    let sponsored_config = deployed.buyer_root.join("sponsored-failure-recovery.json");
+    private(&sponsored_config, &serde_json::to_vec(&config).unwrap());
+    let (_, sent) = run_payment(
+        &binary,
+        deployed.fixture.root.path(),
+        &sponsored_config,
+        "settle",
+    )
+    .await;
+    assert_eq!(sent["submission_delegated"], true, "{sent}");
+    assert_eq!(sent["submitted_this_call"], false, "{sent}");
+    assert_eq!(deployed.sends.load(Ordering::SeqCst), 1, "{sent}");
+    let tx = sent["relay_transaction_hash"].as_str().unwrap();
+    rpc(
+        &deployed.client,
+        &deployed.url,
+        "anvil_mine",
+        json!(["0x4"]),
+    )
+    .await;
+    let receipt = rpc(
+        &deployed.client,
+        &deployed.url,
+        "eth_getTransactionReceipt",
+        json!([tx]),
+    )
+    .await;
+    assert_eq!(receipt["from"], sponsor_hex);
+    assert_eq!(receipt["status"], "0x1");
+    let (ok, recovered) = run_payment(
+        &binary,
+        deployed.fixture.root.path(),
+        &direct_config,
+        "observe",
+    )
+    .await;
+    assert!(ok, "{recovered}");
+    assert_eq!(recovered["payment_verified"], true);
+    assert_eq!(recovered["submitted_this_call"], false);
+    assert_eq!(deployed.sends.load(Ordering::SeqCst), 1);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Anvil, Node dependencies and existing M5 prototype proving artifacts"]
 async fn negotiated_shielded_payment_proves_locally_and_recovers_without_a_second_send() {
     let deployed = deploy(true, None).await;
     let Deployed {

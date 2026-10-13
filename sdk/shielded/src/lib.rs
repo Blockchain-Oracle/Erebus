@@ -14,6 +14,12 @@ pub mod observation;
 pub mod operations;
 pub mod preparation;
 pub mod recovery;
+pub mod relay_admission;
+pub mod relay_client;
+pub mod relay_http;
+pub mod relay_journal;
+pub mod relay_request;
+pub mod relay_service;
 pub mod rpc;
 pub mod wallet;
 

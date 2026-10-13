@@ -862,7 +862,7 @@ pub async fn prepare_deposit(
                 .find(|note| note.commitment() == operation.commitment())
                 .cloned()
                 .ok_or(OperationError::Conflict)?;
-            if note.asset() != asset || note.amount() != amount {
+            if note.asset() != asset || note.amount() != amount || note.owner() != owner {
                 return Err(OperationError::Conflict);
             }
             note
@@ -1015,16 +1015,44 @@ pub fn prepare_approve(
     amount: u128,
     now: u64,
 ) -> Result<PreparedWalletCall, OperationError> {
+    prepare_approve_request(operations, chain_id, pool, asset, amount, None, now)
+}
+
+/// Explicit caller references allow a new approval after an older allowance was consumed.
+/// Reusing a reference must also pass the caller's durable policy binding.
+pub fn prepare_approve_request(
+    operations: &OperationStore,
+    chain_id: u64,
+    pool: [u8; 20],
+    asset: [u8; 20],
+    amount: u128,
+    operation_ref: Option<[u8; 32]>,
+    now: u64,
+) -> Result<PreparedWalletCall, OperationError> {
     if chain_id == 0 || pool == [0; 20] || asset == [0; 20] || amount == 0 {
         return Err(OperationError::Shape("approval identity"));
     }
-    let identity = keccak256(&[
-        b"erebus/shielded/wallet-approve/v1",
-        &chain_id.to_be_bytes(),
-        &pool,
-        &asset,
-        &amount.to_be_bytes(),
-    ]);
+    if operation_ref == Some([0; 32]) {
+        return Err(OperationError::Shape("approval reference"));
+    }
+    let identity = if let Some(reference) = operation_ref {
+        keccak256(&[
+            b"erebus/shielded/wallet-approve/v2",
+            &chain_id.to_be_bytes(),
+            &pool,
+            &asset,
+            &amount.to_be_bytes(),
+            &reference,
+        ])
+    } else {
+        keccak256(&[
+            b"erebus/shielded/wallet-approve/v1",
+            &chain_id.to_be_bytes(),
+            &pool,
+            &asset,
+            &amount.to_be_bytes(),
+        ])
+    };
     operations.idempotent_begin(
         &OperationSpec {
             kind: WalletOperationKind::Approve,
@@ -1049,6 +1077,30 @@ pub fn prepare_approve(
         installation_ms: 0,
         proving_ms: 0,
     })
+}
+
+#[cfg(test)]
+mod approval_reference_tests {
+    use super::*;
+    #[test]
+    fn explicit_approval_reference_can_renew_the_same_amount_without_changing_a_retained_call() {
+        let root = tempfile::tempdir().unwrap();
+        let store = OperationStore::open(root.path()).unwrap();
+        let first = prepare_approve_request(&store, 31337, [1; 20], [2; 20], 100, Some([3; 32]), 1)
+            .unwrap();
+        let retry = prepare_approve_request(&store, 31337, [1; 20], [2; 20], 100, Some([3; 32]), 2)
+            .unwrap();
+        let renewed =
+            prepare_approve_request(&store, 31337, [1; 20], [2; 20], 100, Some([4; 32]), 3)
+                .unwrap();
+        assert_eq!(first.identity, retry.identity);
+        assert_ne!(first.identity, renewed.identity);
+        assert_eq!(first.calldata, renewed.calldata);
+        assert!(
+            prepare_approve_request(&store, 31337, [1; 20], [2; 20], 100, Some([0; 32]), 4)
+                .is_err()
+        );
+    }
 }
 
 /// The exact calldata of one native wrap: `deposit()` on the wrapper.

@@ -48,6 +48,7 @@ pub(crate) struct PoolSnapshot {
     pub finalized: PoolFinalizedBlock,
     pub head_number: u64,
     pub head_hash: [u8; 32],
+    pub head_timestamp: u64,
 }
 
 /// Explicit RPC-finalized pool-chain anchor. This is not proof that a payment occurred.
@@ -68,6 +69,20 @@ pub struct PoolIdentity {
     pub asset: [u8; 20],
     /// Deployment-specific verifier version.
     pub verifier_version: u32,
+}
+
+/// Public account words agreed at one rechecked provider-finalized pool anchor.
+/// This is diagnostic state, not spend authorization or payment evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PoolAccountState {
+    /// Common finalized block used for every balance and allowance read.
+    pub anchor: PoolFinalizedBlock,
+    /// Native gas balance, as an unsigned 256-bit big-endian word.
+    pub native_balance: [u8; 32],
+    /// Configured pool asset balance, not shielded note value.
+    pub asset_balance: [u8; 32],
+    /// Configured owner's allowance for this pool only.
+    pub allowance: [u8; 32],
 }
 
 /// Independently reviewed runtime hashes for the pool's four immutable dependencies.
@@ -404,6 +419,7 @@ impl PoolRpc {
                 | "eth_getLogs"
                 | "eth_call"
                 | "eth_getCode"
+                | "eth_getBalance"
         );
         for attempt in 0..4 {
             self.pacer.admit().await;
@@ -542,6 +558,7 @@ impl PoolRpc {
             finalized,
             head_number,
             head_hash: head.hash,
+            head_timestamp: head.timestamp,
         })
     }
 
@@ -572,7 +589,51 @@ impl PoolRpc {
             },
             head_number: number,
             head_hash: expected_hash,
+            head_timestamp: quantity(&first.timestamp)?,
         })
+    }
+
+    /// Simulates exactly one zero-value private transfer at a canonical hash.
+    /// This never broadcasts or changes state. Success is not a reservation or payment.
+    pub(crate) async fn simulate_transfer_at(
+        &self,
+        data: &[u8],
+        sponsor: [u8; 20],
+        gas_limit: u64,
+        block_hash: [u8; 32],
+    ) -> Result<(), RpcError> {
+        let selector =
+            Keccak256::digest(b"transferPrivate(uint256[2],uint256[2][2],uint256[2],uint256[11])");
+        if data.len() != 4 + 19 * 32
+            || data[..4] != selector[..4]
+            || sponsor == [0; 20]
+            || gas_limit == 0
+            || block_hash == [0; 32]
+        {
+            return Err(RpcError::Configuration);
+        }
+        self.check_chain().await?;
+        let value: String = self
+            .call(
+                "eth_call",
+                serde_json::json!([
+                    {
+                        "from": format!("0x{}", hex::encode(sponsor)),
+                        "to": format!("0x{}", hex::encode(self.pool)),
+                        "data": format!("0x{}", hex::encode(data)),
+                        "gas": format!("0x{gas_limit:x}"),
+                        "value": "0x0",
+                    },
+                    canonical_block(block_hash)
+                ]),
+            )
+            .await?;
+        if value != "0x" {
+            return Err(RpcError::Evidence(
+                "private transfer simulation returned data",
+            ));
+        }
+        self.check_chain().await
     }
 
     /// Reads the pool's one-time deal state at an explicitly pinned canonical block.
@@ -627,6 +688,94 @@ impl PoolRpc {
             asset: asset[12..].try_into().expect("fixed ABI address"),
             verifier_version: u32::from_be_bytes(version[28..].try_into().expect("fixed ABI word")),
         })
+    }
+
+    /// Reads only configured account/asset/pool diagnostics; never signs or scans history.
+    pub async fn account_state_agreed(
+        &self,
+        peer: &Self,
+        domain: crate::index_store::IndexDomain,
+        expected: PoolIdentity,
+        pins: PoolRuntimePins,
+        owner: [u8; 20],
+    ) -> Result<PoolAccountState, RpcError> {
+        if domain.chain_id != self.chain_id
+            || domain.pool != self.pool
+            || domain.first_hash == [0; 32]
+            || expected.asset == [0; 20]
+            || expected.verifier_version == 0
+            || owner == [0; 20]
+        {
+            return Err(RpcError::Configuration);
+        }
+        let snapshot = self.shared_snapshot(peer).await?;
+        let anchor = snapshot.finalized;
+        if anchor.number < domain.first_block {
+            return Err(RpcError::Evidence("account anchor predates deployment"));
+        }
+        let mut agreed = None;
+        for rpc in [self, peer] {
+            for hash in [domain.first_hash, anchor.hash] {
+                rpc.authenticate_runtime_at(hash, pins).await?;
+                if rpc.pool_identity_at(hash).await? != expected {
+                    return Err(RpcError::Evidence(
+                        "account diagnostic pool identity differs",
+                    ));
+                }
+            }
+            let native: String = rpc
+                .call(
+                    "eth_getBalance",
+                    serde_json::json!([
+                        format!("0x{}", hex::encode(owner)),
+                        canonical_block(anchor.hash)
+                    ]),
+                )
+                .await?;
+            let mut balance = Keccak256::digest(b"balanceOf(address)")[..4].to_vec();
+            let mut owner_word = [0u8; 32];
+            owner_word[12..].copy_from_slice(&owner);
+            balance.extend_from_slice(&owner_word);
+            let mut allowance = Keccak256::digest(b"allowance(address,address)")[..4].to_vec();
+            allowance.extend_from_slice(&owner_word);
+            let mut pool_word = [0u8; 32];
+            pool_word[12..].copy_from_slice(&self.pool);
+            allowance.extend_from_slice(&pool_word);
+            let word = |data: Vec<u8>| async move {
+                let result: String = rpc.call("eth_call", serde_json::json!([
+                    {"to":format!("0x{}",hex::encode(expected.asset)), "data":format!("0x{}",hex::encode(data))},
+                    canonical_block(anchor.hash)
+                ])).await?;
+                fixed_hex::<32>(&result)
+            };
+            let state = PoolAccountState {
+                anchor,
+                native_balance: quantity_word(&native)?,
+                asset_balance: word(balance).await?,
+                allowance: word(allowance).await?,
+            };
+            if agreed.is_some_and(|old| old != state) {
+                return Err(RpcError::Evidence(
+                    "RPC providers disagree on account diagnostics",
+                ));
+            }
+            agreed = Some(state);
+        }
+        for rpc in [self, peer] {
+            for (number, hash) in [
+                (domain.first_block, domain.first_hash),
+                (anchor.number, anchor.hash),
+            ] {
+                if rpc.canonical_block_hash(number).await? != hash {
+                    return Err(RpcError::Evidence("account diagnostic anchor changed"));
+                }
+            }
+            if rpc.finalized_head().await?.number < anchor.number {
+                return Err(RpcError::Evidence("account diagnostic finality regressed"));
+            }
+            rpc.check_chain().await?;
+        }
+        agreed.ok_or(RpcError::Evidence("account diagnostics unavailable"))
     }
 
     async fn pool_word_at_hash(
@@ -870,6 +1019,27 @@ fn canonical_block(block_hash: [u8; 32]) -> serde_json::Value {
     serde_json::json!({"blockHash":format!("0x{}", hex::encode(block_hash)),"requireCanonical":true})
 }
 
+fn quantity_word(value: &str) -> Result<[u8; 32], RpcError> {
+    let raw = value
+        .strip_prefix("0x")
+        .ok_or(RpcError::Evidence("invalid account quantity"))?;
+    if raw.is_empty()
+        || raw.len() > 64
+        || (raw.len() > 1 && raw.starts_with('0'))
+        || !raw
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err(RpcError::Evidence("invalid account quantity"));
+    }
+    let number = num_bigint::BigUint::parse_bytes(raw.as_bytes(), 16)
+        .ok_or(RpcError::Evidence("invalid account quantity"))?;
+    let bytes = number.to_bytes_be();
+    let mut word = [0; 32];
+    word[32 - bytes.len()..].copy_from_slice(&bytes);
+    Ok(word)
+}
+
 fn fixed_hex<const N: usize>(value: &str) -> Result<[u8; N], RpcError> {
     let raw = value
         .strip_prefix("0x")
@@ -952,6 +1122,19 @@ fn decode_log(log: &RpcLog, topics: &[[u8; 32]; 3]) -> Result<PoolEvent, RpcErro
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn account_quantities_are_canonical_and_preserve_all_256_bits() {
+        assert_eq!(super::quantity_word("0x0").unwrap(), [0; 32]);
+        assert_eq!(
+            super::quantity_word(&format!("0x{}", "f".repeat(64))).unwrap(),
+            [255; 32]
+        );
+        for value in ["0x", "0x00", "0X1", "0xgg", "0x-1", "0x 1", "0xA"] {
+            assert!(super::quantity_word(value).is_err());
+        }
+        assert!(super::quantity_word(&format!("0x1{}", "0".repeat(64))).is_err());
+    }
+
     async fn retry_rpc(
         failures: usize,
         status: u16,

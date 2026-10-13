@@ -23,6 +23,7 @@ use std::{
 use axum::{extract::State, Router};
 use erebus_core::shielded_auth::derive_key;
 use erebus_evm::chain::TransactionKey;
+use erebus_shielded_prover::rpc::PoolRpc;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
@@ -511,6 +512,16 @@ async fn installed_wallet_deposits_random_notes_and_withdraws_one() {
     let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
     std::fs::write(&manifest_path, &manifest_bytes).unwrap();
     let manifest_digest = hex::encode(Sha256::digest(&manifest_bytes));
+    let fixture_pins = PoolRpc::new(&url, 31337, pool_address)
+        .unwrap()
+        .runtime_pins_at(
+            hex::decode(first_hash.trim_start_matches("0x"))
+                .unwrap()
+                .try_into()
+                .unwrap(),
+        )
+        .await
+        .unwrap();
 
     let state_root = root.path().join("state");
     std::fs::create_dir(&state_root).unwrap();
@@ -544,6 +555,11 @@ async fn installed_wallet_deposits_random_notes_and_withdraws_one() {
             "artifact_manifest_file": manifest_path,
             "artifact_manifest_sha256": manifest_digest,
             "artifact_cache_root": state_root.join("artifacts"),
+            "runtime_pins": {
+                "pool": hex::encode(fixture_pins.pool), "poseidon": hex::encode(fixture_pins.poseidon),
+                "deposit": hex::encode(fixture_pins.deposit), "transfer": hex::encode(fixture_pins.transfer),
+                "withdraw": hex::encode(fixture_pins.withdraw),
+            },
             "allow_test_artifacts": true,
             "allow_loopback_artifact_http": true,
             "gas_limit": 2_000_000u64,
@@ -558,6 +574,9 @@ async fn installed_wallet_deposits_random_notes_and_withdraws_one() {
     );
 
     let wallet_bin = native_binary("erebus-wallet", env!("CARGO_BIN_EXE_erebus-wallet"));
+    let frozen_wallet = root.path().join("erebus-wallet");
+    fs::copy(&wallet_bin, &frozen_wallet).unwrap();
+    let wallet_bin = frozen_wallet;
     let request = |method: &str, extra: Value| {
         let mut value = json!({"method": method, "config_file": config_path});
         if let Some(object) = extra.as_object() {
@@ -569,6 +588,36 @@ async fn installed_wallet_deposits_random_notes_and_withdraws_one() {
     };
 
     // 1. Allowance onboarding through the installed wallet; wait until the chain reflects it.
+    // Diagnostics intentionally read finalized state, not the mint/funding at a newer head.
+    rpc(&client, &url, "anvil_mine", json!(["0x40"])).await;
+    let diagnostic = finish(spawn(
+        &wallet_bin,
+        root.path(),
+        request("status", json!({})),
+    ));
+    assert!(
+        diagnostic.0,
+        "paired account diagnostics failed: {diagnostic:?}"
+    );
+    assert_eq!(diagnostic.1["result"]["account"]["asset_balance"], "100");
+    assert_eq!(diagnostic.1["result"]["account"]["allowance"], "0");
+    assert_eq!(
+        diagnostic.1["result"]["account"]["native_balance"],
+        "100000000000000000000"
+    );
+    assert_eq!(
+        diagnostic.1["result"]["checkpoints"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(diagnostic.1["result"]["payment_verified"], false);
+    assert!(diagnostic.1["result"]["checkpoints"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|c| c["caught_up"] == false));
     let approved = finish(spawn(
         &wallet_bin,
         root.path(),
@@ -583,6 +632,17 @@ async fn installed_wallet_deposits_random_notes_and_withdraws_one() {
         wait_for_allowance(&client, &url, &token, &signer_hex, pool_address, 1000).await,
         1000
     );
+    rpc(&client, &url, "anvil_mine", json!(["0x40"])).await;
+    let diagnostic = finish(spawn(
+        &wallet_bin,
+        root.path(),
+        request("status", json!({})),
+    ));
+    assert!(
+        diagnostic.0,
+        "post-approval diagnostics failed: {diagnostic:?}"
+    );
+    assert_eq!(diagnostic.1["result"]["account"]["allowance"], "1000");
 
     // 2. A fee-on-transfer deposit proves, broadcasts, and reverts in the pool. Only a
     // finalized canonical receipt may reconcile it back to a retryable plan.
@@ -600,7 +660,10 @@ async fn installed_wallet_deposits_random_notes_and_withdraws_one() {
     let failed = finish(spawn(
         &wallet_bin,
         root.path(),
-        request("deposit", json!({"amount":"10"})),
+        request(
+            "deposit",
+            json!({"amount":"10", "operation_ref":"55".repeat(32)}),
+        ),
     ));
     assert!(
         failed.0,
@@ -650,7 +713,10 @@ async fn installed_wallet_deposits_random_notes_and_withdraws_one() {
     let retried = finish(spawn(
         &wallet_bin,
         root.path(),
-        request("deposit", json!({"amount":"10"})),
+        request(
+            "deposit",
+            json!({"amount":"10", "operation_ref":"55".repeat(32)}),
+        ),
     ));
     assert!(
         retried.0,
@@ -679,11 +745,62 @@ async fn installed_wallet_deposits_random_notes_and_withdraws_one() {
         "first deposit never finalized: {first_included:?}"
     );
 
+    let nonce_before = rpc(
+        &client,
+        &url,
+        "eth_getTransactionCount",
+        json!([signer_hex, "pending"]),
+    )
+    .await;
+    let repeated = finish(spawn(
+        &wallet_bin,
+        root.path(),
+        request(
+            "deposit",
+            json!({"amount":"10", "operation_ref":"55".repeat(32)}),
+        ),
+    ));
+    assert!(repeated.0, "completed deposit retry failed: {repeated:?}");
+    assert_eq!(repeated.1["result"]["already_completed"], true);
+    assert_eq!(repeated.1["result"]["identity"], first_commitment);
+    assert_eq!(
+        rpc(
+            &client,
+            &url,
+            "eth_getTransactionCount",
+            json!([signer_hex, "pending"])
+        )
+        .await,
+        nonce_before
+    );
+    let conflict = finish(spawn(
+        &wallet_bin,
+        root.path(),
+        request(
+            "deposit",
+            json!({"amount":"11", "operation_ref":"55".repeat(32)}),
+        ),
+    ));
+    assert!(!conflict.0, "changed amount reused a deposit reference");
+    assert_eq!(
+        rpc(
+            &client,
+            &url,
+            "eth_getTransactionCount",
+            json!([signer_hex, "pending"])
+        )
+        .await,
+        nonce_before
+    );
+
     // 4. A second deposit of the same amount produces different random material.
     let second = finish(spawn(
         &wallet_bin,
         root.path(),
-        request("deposit", json!({"amount":"10"})),
+        request(
+            "deposit",
+            json!({"amount":"10", "operation_ref":"66".repeat(32)}),
+        ),
     ));
     assert!(
         second.0,
@@ -1293,6 +1410,9 @@ async fn installed_wallet_wraps_deposits_withdraws_and_unwraps_native_funds() {
         "timeout_seconds": 30, "max_scan_blocks": 1000, "artifact_timeout_seconds": 120,
     })).unwrap());
     let wallet_bin = native_binary("erebus-wallet", env!("CARGO_BIN_EXE_erebus-wallet"));
+    let frozen_wallet = root.path().join("erebus-wallet");
+    fs::copy(&wallet_bin, &frozen_wallet).unwrap();
+    let wallet_bin = frozen_wallet;
     let request = |method: &str, extra: Value| {
         let mut value = json!({"method": method, "config_file": config_path});
         for (key, entry) in extra.as_object().unwrap() {

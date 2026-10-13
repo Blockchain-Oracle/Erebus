@@ -8,7 +8,10 @@
 #![forbid(unsafe_code)]
 
 mod broadcast;
+mod delegation;
 mod record;
+
+pub use delegation::SubmissionDelegation;
 
 pub use broadcast::{
     AttemptDiagnostic, AttemptToken, BroadcastAttempt, BroadcastOutcome, SignedTransaction,
@@ -56,6 +59,9 @@ pub enum Error {
     /// A local signer or prover failed. Its reservation remains held.
     #[error("local signer or preparation failed; reservation retained")]
     Backend,
+    /// Submission was durably delegated; direct local signing is prohibited.
+    #[error("submission is delegated; observe without direct signing or another payment")]
+    Delegated,
 }
 
 /// Redacted progress of a local revision. A stage is not proof of payment.
@@ -98,6 +104,8 @@ pub struct Diagnostic {
     pub last_broadcast_outcome: Option<BroadcastOutcome>,
     /// Retained replacement plans, including a fenced plan awaiting signed bytes.
     pub replacements: usize,
+    /// A delegate may have received the prepared call, even with zero local attempts.
+    pub submission_delegated: bool,
 }
 
 /// One fixed settlement session backed by an identity-wide durable state store.
@@ -375,6 +383,9 @@ impl Coordinator {
         let intent = &state.intents[index];
         let (terms, _) = intent.opening()?;
         self.check_terms(&terms)?;
+        if intent.delegation.is_some() {
+            return Err(Error::Delegated);
+        }
         if intent.accounting != record::Accounting::Reserved {
             return Err(Error::Stage);
         }

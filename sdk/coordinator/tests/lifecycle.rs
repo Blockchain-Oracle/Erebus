@@ -584,6 +584,276 @@ fn prepared_coordinator(root: &std::path::Path) -> (Coordinator, AgreementTerms)
     (coordinator, terms)
 }
 
+fn prepared_shielded_coordinator(
+    root: &std::path::Path,
+) -> (Coordinator, AgreementTerms, CommitmentBlinding) {
+    let (terms, blinding, buyer, seller) = shielded_fixture();
+    let coordinator = open(root, &terms, 100);
+    coordinator
+        .record_intent([1; 32], &terms, &blinding, 10)
+        .unwrap();
+    coordinator
+        .authorize_buyer([1; 32], 11, |_, _| Ok::<_, ()>(buyer))
+        .unwrap();
+    coordinator.accept_seller([1; 32], &seller).unwrap();
+    coordinator
+        .prepare([1; 32], 12, |_, _, _, _| {
+            Ok::<_, ()>(PreparedSettlement {
+                operation_ref: [1; 32],
+                deal_commitment: commit_agreement(&terms, &blinding).unwrap(),
+                deal_nullifier: deal_nullifier(&terms).unwrap(),
+                domain: terms.domain.clone(),
+                mode: terms.settlement_mode,
+                required_guarantees: terms.required_guarantees,
+                backend_evidence: vec![1, 2, 3],
+            })
+        })
+        .unwrap();
+    (coordinator, terms, blinding)
+}
+
+#[test]
+fn delegated_submission_survives_restart_and_never_runs_a_direct_signer() {
+    let dir = tempfile::tempdir().unwrap();
+    let (coordinator, terms, blinding) = prepared_shielded_coordinator(dir.path());
+    assert!(coordinator
+        .submission_delegation([1; 32])
+        .unwrap()
+        .is_none());
+    let delegation = coordinator
+        .delegate_submission([1; 32], [7; 32], 13)
+        .unwrap();
+    assert_eq!(
+        delegation.calldata_keccak256,
+        erebus_core::suite::keccak256(&[&[1, 2, 3]])
+    );
+    let restarted = open(dir.path(), &terms, 100);
+    assert_eq!(
+        restarted.submission_delegation([1; 32]).unwrap(),
+        Some(delegation)
+    );
+    assert_eq!(
+        restarted
+            .delegate_submission([1; 32], [7; 32], terms.expiry + 1)
+            .unwrap(),
+        delegation
+    );
+    assert!(matches!(
+        restarted.delegate_submission([1; 32], [8; 32], 14),
+        Err(Error::Conflict)
+    ));
+    let calls = AtomicUsize::new(0);
+    assert!(matches!(
+        restarted.sign_transaction(
+            [1; 32],
+            14,
+            b"plan",
+            |_, _| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, ()>(vec![1])
+            },
+            |_, _, _| Ok(())
+        ),
+        Err(Error::Delegated)
+    ));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(restarted.signed_transaction([1; 32]).unwrap().is_none());
+    assert!(restarted.transaction_plan([1; 32]).unwrap().is_none());
+    let diagnostic = restarted.diagnostics().unwrap()[0];
+    assert!(diagnostic.submission_delegated);
+    assert_eq!(diagnostic.broadcast_attempts, 0);
+    assert_eq!(
+        restarted
+            .ledger()
+            .unwrap()
+            .reserved_total(&terms.asset)
+            .unwrap(),
+        terms.amount
+    );
+    // A delegated payment can still finalize from independently verified backend evidence.
+    restarted
+        .reconcile([1; 32], &evidence(&terms, &blinding), 15)
+        .unwrap();
+    assert_eq!(restarted.diagnostics().unwrap()[0].stage, Stage::Finalized);
+    assert!(matches!(
+        restarted.sign_transaction(
+            [1; 32],
+            16,
+            b"plan",
+            |_, _| Ok::<_, ()>(vec![1]),
+            |_, _, _| Ok(())
+        ),
+        Err(Error::Delegated)
+    ));
+}
+
+#[test]
+fn concurrent_submission_delegations_keep_exactly_one_relay_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, terms, _) = prepared_shielded_coordinator(dir.path());
+    let barrier = Arc::new(Barrier::new(2));
+    let handles: Vec<_> = [7u8, 8]
+        .into_iter()
+        .map(|relay| {
+            let coordinator = open(dir.path(), &terms, 100);
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                coordinator.delegate_submission([1; 32], [relay; 32], 13)
+            })
+        })
+        .collect();
+    let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
+    assert_eq!(
+        results
+            .iter()
+            .filter(|r| matches!(r, Err(Error::Conflict)))
+            .count(),
+        1
+    );
+    let winner = results.into_iter().find_map(Result::ok).unwrap();
+    let restarted = open(dir.path(), &terms, 100);
+    assert_eq!(
+        restarted.submission_delegation([1; 32]).unwrap(),
+        Some(winner)
+    );
+    assert!(restarted.transaction_plan([1; 32]).unwrap().is_none());
+    assert_eq!(restarted.diagnostics().unwrap()[0].broadcast_attempts, 0);
+}
+
+#[test]
+fn submission_delegation_rejects_public_mode_expiry_and_started_direct_signing() {
+    let dir = tempfile::tempdir().unwrap();
+    let (public, _) = prepared_coordinator(dir.path());
+    assert!(matches!(
+        public.delegate_submission([1; 32], [7; 32], 13),
+        Err(Error::Context)
+    ));
+    let dir = tempfile::tempdir().unwrap();
+    let (coordinator, terms, _) = prepared_shielded_coordinator(dir.path());
+    assert!(matches!(
+        coordinator.delegate_submission([1; 32], [0; 32], 13),
+        Err(Error::Context)
+    ));
+    assert!(matches!(
+        coordinator.delegate_submission([1; 32], [7; 32], terms.expiry),
+        Err(Error::Expired)
+    ));
+    // Even a failed signing callback has a durable plan, so it cannot switch to delegation.
+    assert!(matches!(
+        coordinator.sign_transaction(
+            [1; 32],
+            13,
+            b"plan",
+            |_, _| Err::<Vec<u8>, ()>(()),
+            |_, _, _| Ok(())
+        ),
+        Err(Error::Backend)
+    ));
+    assert!(matches!(
+        coordinator.delegate_submission([1; 32], [7; 32], 14),
+        Err(Error::Stage)
+    ));
+    assert!(coordinator
+        .submission_delegation([1; 32])
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn delegation_write_faults_resume_the_same_fence_without_direct_fallback() {
+    let measured = tempfile::tempdir().unwrap();
+    let (_, terms, _) = prepared_shielded_coordinator(measured.path());
+    let (context, capabilities, policy) = config(&terms, 100);
+    let hook = Arc::new(FailAt {
+        count: AtomicUsize::new(0),
+        fail: usize::MAX,
+    });
+    let coordinator = Coordinator::open_with_faults(
+        measured.path(),
+        terms.buyer_authorization_key.clone(),
+        context.clone(),
+        &context,
+        &capabilities,
+        policy,
+        hook.clone(),
+    )
+    .unwrap();
+    hook.count.store(0, Ordering::SeqCst);
+    coordinator
+        .delegate_submission([1; 32], [7; 32], 13)
+        .unwrap();
+    let boundaries = hook.count.load(Ordering::SeqCst);
+    assert!(boundaries > 0);
+    for fail in 1..=boundaries {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, terms, _) = prepared_shielded_coordinator(dir.path());
+        let (context, capabilities, policy) = config(&terms, 100);
+        let hook = Arc::new(FailAt {
+            count: AtomicUsize::new(0),
+            fail: usize::MAX,
+        });
+        let coordinator = Coordinator::open_with_faults(
+            dir.path(),
+            terms.buyer_authorization_key.clone(),
+            context.clone(),
+            &context,
+            &capabilities,
+            policy,
+            hook.clone(),
+        )
+        .unwrap();
+        // Reopen with the failure enabled only after initialization is complete.
+        drop(coordinator);
+        let hook = Arc::new(FailAt {
+            count: AtomicUsize::new(0),
+            fail,
+        });
+        let (context, capabilities, policy) = config(&terms, 100);
+        let coordinator = Coordinator::open_with_faults(
+            dir.path(),
+            terms.buyer_authorization_key.clone(),
+            context.clone(),
+            &context,
+            &capabilities,
+            policy,
+            hook.clone(),
+        )
+        .unwrap();
+        hook.count.store(0, Ordering::SeqCst);
+        assert!(
+            matches!(
+                coordinator.delegate_submission([1; 32], [7; 32], 13),
+                Err(Error::Storage)
+            ),
+            "boundary {fail}"
+        );
+        drop(coordinator);
+        let restarted = open(dir.path(), &terms, 100);
+        restarted.delegate_submission([1; 32], [7; 32], 14).unwrap();
+        assert!(matches!(
+            restarted.sign_transaction(
+                [1; 32],
+                15,
+                b"plan",
+                |_, _| Ok::<_, ()>(vec![1]),
+                |_, _, _| Ok(())
+            ),
+            Err(Error::Delegated)
+        ));
+        assert_eq!(restarted.diagnostics().unwrap()[0].broadcast_attempts, 0);
+        assert_eq!(
+            restarted
+                .ledger()
+                .unwrap()
+                .reserved_total(&terms.asset)
+                .unwrap(),
+            terms.amount
+        );
+    }
+}
+
 fn signed_coordinator(root: &std::path::Path) -> (Coordinator, AgreementTerms) {
     let (coordinator, terms) = prepared_coordinator(root);
     coordinator

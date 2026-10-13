@@ -27,6 +27,7 @@ from erebus._disclosure import DisclosureError, DisclosureSeam
 from erebus._proving import LocalProvingError, LocalProvingSeam
 from erebus._access import AccessError, AccessSeam
 from erebus._metropolis import MetropolisError, MetropolisSeam
+from erebus._metropolis_wallet import MetropolisWallet, WalletPolicy
 from erebus._seam import PROTOCOL, ErebusError, Seam, SeamConfig, SeamUnavailable
 
 __all__ = [
@@ -34,6 +35,8 @@ __all__ = [
     "AccessSeam",
     "MetropolisError",
     "MetropolisSeam",
+    "MetropolisWallet",
+    "WalletPolicy",
     "DisclosureError",
     "DisclosureSeam",
     "LocalProvingError",

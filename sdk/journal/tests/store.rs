@@ -684,6 +684,28 @@ fn the_identity_lock_blocks_until_released_and_excludes_other_handles() {
 }
 
 #[test]
+fn nonblocking_identity_lock_reports_contention_and_recovers_after_release() {
+    let dir = TempDir::new("try-lock-identity");
+    let store = open(&dir);
+    let held = store
+        .try_lock_identity()
+        .expect("first attempt")
+        .expect("first lease");
+    let other = store.clone();
+    let start = std::time::Instant::now();
+    assert!(other
+        .try_lock_identity()
+        .expect("contended attempt")
+        .is_none());
+    assert!(start.elapsed() < Duration::from_secs(1));
+    drop(held);
+    assert!(other
+        .try_lock_identity()
+        .expect("released attempt")
+        .is_some());
+}
+
+#[test]
 fn different_records_do_not_contend() {
     let dir = TempDir::new("lock-independent");
     let store = open(&dir);

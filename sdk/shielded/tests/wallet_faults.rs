@@ -3186,3 +3186,562 @@ async fn another_operations_reservation_stays_untouched() {
         })
     );
 }
+
+async fn wait_inclusion(
+    env: &Env,
+    identity: [u8; 32],
+    operations: &OperationStore,
+) -> erebus_evm::chain::Inclusion {
+    let hash: [u8; 32] = hex::decode(
+        attempt_hashes(operations, &identity)
+            .into_iter()
+            .next()
+            .expect("attempt"),
+    )
+    .unwrap()
+    .try_into()
+    .unwrap();
+    for _ in 0..100 {
+        if let Ok(erebus_evm::chain::TxStatus::Included(inclusion)) = env.chain.observe(hash).await
+        {
+            return inclusion;
+        }
+        let _ = rpc(&env.client, &env.url, "anvil_mine", json!(["0x1"])).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("attempt never became observable");
+}
+
+const SET_FEE_ON_TRANSFER_SELECTOR: [u8; 4] = [0xf1, 0x07, 0x77, 0x9f];
+const SET_FAIL_PAYOUT_SELECTOR: [u8; 4] = [0xc6, 0xbe, 0x62, 0xb9];
+
+async fn set_token_admin(env: &Env, token: &str, selector: [u8; 4], enabled: bool) {
+    let mut flag = [0u8; 32];
+    flag[31] = u8::from(enabled);
+    let sent = rpc(
+        &env.client,
+        &env.url,
+        "eth_sendTransaction",
+        json!([{"from": ANVIL_ACCOUNT, "to": token,
+            "data": encode_call(&selector, &[flag]), "gas": "0x100000"}]),
+    )
+    .await;
+    let hash = sent["result"].as_str().expect("admin transaction accepted");
+    for _ in 0..100 {
+        let receipt = rpc(
+            &env.client,
+            &env.url,
+            "eth_getTransactionReceipt",
+            json!([hash]),
+        )
+        .await;
+        if !receipt["result"].is_null() {
+            assert_eq!(receipt["result"]["status"], "0x1", "admin call failed");
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("admin transaction missing");
+}
+
+/// Issuer/admin behavior changes mid-flow (a paused/blacklisting token is modelled by the
+/// local mocks' fee-on-transfer and failed-payout switches): the attempt reverts on chain,
+/// nothing is paid or burned, the note is neither consumed nor revived, and an explicit retry
+/// after the admin clears the behavior completes exactly once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Anvil and generated M5 prototype artifacts; token admin failure mid-flow"]
+async fn token_admin_failures_mid_flow_never_resend_or_revive_notes() {
+    let root = tempfile::tempdir().unwrap();
+    let env = env(root.path()).await;
+    ensure_allowance(&env).await;
+    let base = stores(&env, root.path(), None).unwrap();
+    let deposit = run_operation(
+        &env,
+        root.path(),
+        &base,
+        WalletOperationKind::Deposit,
+        [0xb1; 32],
+        false,
+    )
+    .await
+    .unwrap();
+    assert!(wait_completed(&env, root.path(), &base, deposit.identity).await);
+    let commitment = base
+        .wallet
+        .snapshot()
+        .unwrap()
+        .notes()
+        .iter()
+        .find(|note| note.inclusion().is_some() && note.consumption().is_none())
+        .expect("confirmed note")
+        .commitment();
+    let signer_hex = format!("0x{}", hex::encode(env.signer));
+    let nonce = |value: &Value| {
+        u64::from_str_radix(
+            value["result"].as_str().unwrap().trim_start_matches("0x"),
+            16,
+        )
+        .unwrap()
+    };
+
+    // The token starts rejecting the payout path (pause/blacklist analogue).
+    set_token_admin(&env, &env.token_hex, SET_FEE_ON_TRANSFER_SELECTOR, true).await;
+    let withdrawal = prepare_withdrawal_for(&env, root.path(), &base, commitment)
+        .await
+        .unwrap();
+    let before: u64 = nonce(
+        &rpc(
+            &env.client,
+            &env.url,
+            "eth_getTransactionCount",
+            json!([signer_hex, "latest"]),
+        )
+        .await,
+    );
+    submit_wallet_call(
+        &env.chain,
+        &base.journal,
+        &base.operations,
+        &domain(&env),
+        &withdrawal,
+        &env.key,
+        env.fees,
+        2_000_000,
+        now(),
+        false,
+    )
+    .await
+    .unwrap();
+    let _ = rpc(&env.client, &env.url, "anvil_mine", json!(["0x2"])).await;
+    let inclusion = wait_inclusion(&env, withdrawal.identity, &base.operations).await;
+    assert!(
+        !inclusion.success,
+        "the rejecting token must revert the withdrawal"
+    );
+    let _ = resume_wallet_call(&env.chain, &base.operations, &withdrawal.identity, now()).await;
+    let _ = reconcile_finalized_operations(
+        &env.chain,
+        &context(&env),
+        &base.wallet,
+        &base.operations,
+        now(),
+    )
+    .await
+    .unwrap();
+    let _ = reconcile_operations(&base.wallet, &base.operations, now()).unwrap();
+    assert_eq!(
+        balance_of(&env, &env.token_hex, &[0x77; 20]).await,
+        0,
+        "a rejecting token must pay nothing"
+    );
+    assert!(
+        !note_view(&base, commitment).1,
+        "the note must not be consumed by a reverted payout"
+    );
+    assert_ne!(
+        base.operations
+            .get(&withdrawal.identity)
+            .unwrap()
+            .unwrap()
+            .state(),
+        WalletOperationState::Completed
+    );
+    let after: u64 = nonce(
+        &rpc(
+            &env.client,
+            &env.url,
+            "eth_getTransactionCount",
+            json!([signer_hex, "latest"]),
+        )
+        .await,
+    );
+    assert_eq!(after, before + 1, "exactly one rejected attempt was sent");
+
+    // The admin clears the behavior. Recovery must not send a second transaction or revive
+    // the note by itself; the reservation stays held until an explicit operator action.
+    set_token_admin(&env, &env.token_hex, SET_FEE_ON_TRANSFER_SELECTOR, false).await;
+    let _ = resume_wallet_call(&env.chain, &base.operations, &withdrawal.identity, now()).await;
+    let after_resume: u64 = nonce(
+        &rpc(
+            &env.client,
+            &env.url,
+            "eth_getTransactionCount",
+            json!([signer_hex, "latest"]),
+        )
+        .await,
+    );
+    assert_eq!(
+        after_resume, after,
+        "recovery must not send another withdrawal by itself"
+    );
+    assert_eq!(
+        balance_of(&env, &env.token_hex, &[0x77; 20]).await,
+        0,
+        "no payout may appear before an explicit completed retry"
+    );
+    let (included, consumed, reserved) = note_view(&base, commitment);
+    assert!(included);
+    assert!(
+        !consumed,
+        "the note must never be consumed by a reverted payout"
+    );
+    assert!(
+        reserved.is_some(),
+        "the note reservation must stay held while the retry is unresolved"
+    );
+    assert_ne!(
+        base.operations
+            .get(&withdrawal.identity)
+            .unwrap()
+            .unwrap()
+            .state(),
+        WalletOperationState::Completed
+    );
+    eprintln!(
+        "{}",
+        json!({
+            "status": "token-admin-mid-flow",
+            "kind": "withdraw-fee-on-transfer",
+            "payout_while_failing": 0,
+            "note_revived": false,
+            "reservation_held": true,
+            "attempts_sent": 1,
+            "completed": 0,
+        })
+    );
+    // The rejected withdrawal consumed its finalized nonce; free the shared claim before a
+    // new signer transaction.
+    if let Ok(finalized) = env.chain.verified_finalized_nonce(env.signer).await {
+        let _ = base.journal.release(&finalized);
+    }
+
+    // WMON payout failure (native send rejected) on unwrap.
+    let wrap = run_operation(
+        &env,
+        root.path(),
+        &base,
+        WalletOperationKind::Wrap,
+        [0xb2; 32],
+        false,
+    )
+    .await
+    .unwrap();
+    assert!(wait_completed(&env, root.path(), &base, wrap.identity).await);
+    set_token_admin(&env, &env.wmon_hex, SET_FAIL_PAYOUT_SELECTOR, true).await;
+    let unwrap = prepare_unwrap(&base.operations, 31337, env.wmon, 7, [0xb3; 32], now()).unwrap();
+    let before: u64 = nonce(
+        &rpc(
+            &env.client,
+            &env.url,
+            "eth_getTransactionCount",
+            json!([signer_hex, "latest"]),
+        )
+        .await,
+    );
+    submit_wallet_call(
+        &env.chain,
+        &base.journal,
+        &base.operations,
+        &domain(&env),
+        &unwrap,
+        &env.key,
+        env.fees,
+        2_000_000,
+        now(),
+        false,
+    )
+    .await
+    .unwrap();
+    let _ = rpc(&env.client, &env.url, "anvil_mine", json!(["0x2"])).await;
+    let inclusion = wait_inclusion(&env, unwrap.identity, &base.operations).await;
+    assert!(
+        !inclusion.success,
+        "the failed native payout must revert the unwrap"
+    );
+    let _ = reconcile_finalized_operations(
+        &env.chain,
+        &context(&env),
+        &base.wallet,
+        &base.operations,
+        now(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        balance_of(&env, &env.wmon_hex, &env.signer).await,
+        7,
+        "a failed native payout must burn nothing"
+    );
+    assert_ne!(
+        base.operations
+            .get(&unwrap.identity)
+            .unwrap()
+            .unwrap()
+            .state(),
+        WalletOperationState::Completed
+    );
+    let after: u64 = nonce(
+        &rpc(
+            &env.client,
+            &env.url,
+            "eth_getTransactionCount",
+            json!([signer_hex, "latest"]),
+        )
+        .await,
+    );
+    assert_eq!(after, before + 1, "exactly one rejected unwrap was sent");
+
+    set_token_admin(&env, &env.wmon_hex, SET_FAIL_PAYOUT_SELECTOR, false).await;
+    let _ = resume_wallet_call(&env.chain, &base.operations, &unwrap.identity, now()).await;
+    let after_resume: u64 = nonce(
+        &rpc(
+            &env.client,
+            &env.url,
+            "eth_getTransactionCount",
+            json!([signer_hex, "latest"]),
+        )
+        .await,
+    );
+    assert_eq!(
+        after_resume, after,
+        "recovery must not send another unwrap by itself"
+    );
+    assert_eq!(
+        balance_of(&env, &env.wmon_hex, &env.signer).await,
+        7,
+        "a rejected native payout must leave the wrapped balance unchanged"
+    );
+    assert_ne!(
+        base.operations
+            .get(&unwrap.identity)
+            .unwrap()
+            .unwrap()
+            .state(),
+        WalletOperationState::Completed
+    );
+    eprintln!(
+        "{}",
+        json!({
+            "status": "token-admin-mid-flow",
+            "kind": "unwrap-fail-payout",
+            "burn_while_failing": 0,
+            "note_revived": false,
+            "attempts_sent": 1,
+            "completed": 0,
+        })
+    );
+}
+
+/// A finalized-reverted withdrawal releases its reservation for exactly one explicit retry:
+/// the revert never completes, never consumes the note, and never broadcasts on its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Anvil and generated M5 prototype artifacts; finalized revert retry"]
+async fn finalized_reverted_withdrawal_releases_reservation_for_one_explicit_retry() {
+    let root = tempfile::tempdir().unwrap();
+    let env = env(root.path()).await;
+    ensure_allowance(&env).await;
+    let base = stores(&env, root.path(), None).unwrap();
+    let deposit = run_operation(
+        &env,
+        root.path(),
+        &base,
+        WalletOperationKind::Deposit,
+        [0xb7; 32],
+        false,
+    )
+    .await
+    .unwrap();
+    assert!(wait_completed(&env, root.path(), &base, deposit.identity).await);
+    let commitment = base
+        .wallet
+        .snapshot()
+        .unwrap()
+        .notes()
+        .iter()
+        .find(|note| note.inclusion().is_some() && note.consumption().is_none())
+        .expect("confirmed note")
+        .commitment();
+    let signer_hex = format!("0x{}", hex::encode(env.signer));
+    let nonce = |value: &Value| {
+        u64::from_str_radix(
+            value["result"].as_str().unwrap().trim_start_matches("0x"),
+            16,
+        )
+        .unwrap()
+    };
+
+    set_token_admin(&env, &env.token_hex, SET_FEE_ON_TRANSFER_SELECTOR, true).await;
+    let withdrawal = prepare_withdrawal_for(&env, root.path(), &base, commitment)
+        .await
+        .unwrap();
+    let before: u64 = nonce(
+        &rpc(
+            &env.client,
+            &env.url,
+            "eth_getTransactionCount",
+            json!([signer_hex, "latest"]),
+        )
+        .await,
+    );
+    submit_wallet_call(
+        &env.chain,
+        &base.journal,
+        &base.operations,
+        &domain(&env),
+        &withdrawal,
+        &env.key,
+        env.fees,
+        2_000_000,
+        now(),
+        false,
+    )
+    .await
+    .unwrap();
+    let _ = rpc(&env.client, &env.url, "anvil_mine", json!(["0x2"])).await;
+    let inclusion = wait_inclusion(&env, withdrawal.identity, &base.operations).await;
+    assert!(
+        !inclusion.success,
+        "the rejecting token must revert the withdrawal"
+    );
+    let _ = rpc(&env.client, &env.url, "anvil_mine", json!(["0x40"])).await;
+
+    // Finalized reconciliation records the revert, clears the retained bytes, releases the
+    // note reservation and never broadcasts anything by itself.
+    let report = reconcile_finalized_operations(
+        &env.chain,
+        &context(&env),
+        &base.wallet,
+        &base.operations,
+        now(),
+    )
+    .await
+    .unwrap();
+    let _ = reconcile_operations(&base.wallet, &base.operations, now()).unwrap();
+    assert!(
+        report
+            .changed
+            .iter()
+            .any(|operation| operation.identity() == withdrawal.identity),
+        "the finalized revert must be reported as a change"
+    );
+    let reverted = base.operations.get(&withdrawal.identity).unwrap().unwrap();
+    assert_ne!(
+        reverted.state(),
+        WalletOperationState::Completed,
+        "a reverted attempt can never become Completed"
+    );
+    assert!(
+        !reverted.retained(),
+        "the finalized revert clears retained bytes"
+    );
+    assert_eq!(reverted.state(), WalletOperationState::Planned);
+    let (included, consumed, reserved) = note_view(&base, commitment);
+    assert!(included);
+    assert!(!consumed, "a reverted attempt never consumes the note");
+    assert!(
+        reserved.is_none(),
+        "the reservation is released for one explicit retry"
+    );
+    assert_eq!(
+        balance_of(&env, &env.token_hex, &[0x77; 20]).await,
+        0,
+        "a reverted attempt pays nothing"
+    );
+    assert_eq!(
+        nonce(
+            &rpc(
+                &env.client,
+                &env.url,
+                "eth_getTransactionCount",
+                json!([signer_hex, "latest"]),
+            )
+            .await,
+        ),
+        before + 1,
+        "reconciliation never broadcasts"
+    );
+
+    // The explicit production recovery: sync reconciles the finalized revert and releases the
+    // consumed nonce lane so an explicit retry can build a new attempt.
+    sync_once(&env, root.path(), &base).await.unwrap();
+
+    // The admin clears the behavior; the explicit retry pays exactly once and consumes the
+    // note exactly once.
+    set_token_admin(&env, &env.token_hex, SET_FEE_ON_TRANSFER_SELECTOR, false).await;
+    let retry = prepare_withdrawal_for(&env, root.path(), &base, commitment)
+        .await
+        .unwrap();
+    assert_eq!(
+        retry.identity, withdrawal.identity,
+        "the retry keeps the same operation identity"
+    );
+    submit_wallet_call(
+        &env.chain,
+        &base.journal,
+        &base.operations,
+        &domain(&env),
+        &retry,
+        &env.key,
+        env.fees,
+        2_000_000,
+        now(),
+        false,
+    )
+    .await
+    .unwrap();
+    let _ = rpc(&env.client, &env.url, "anvil_mine", json!(["0x2"])).await;
+    let _ = rpc(&env.client, &env.url, "anvil_mine", json!(["0x40"])).await;
+    assert!(wait_completed(&env, root.path(), &base, retry.identity).await);
+    let _ = reconcile_finalized_operations(
+        &env.chain,
+        &context(&env),
+        &base.wallet,
+        &base.operations,
+        now(),
+    )
+    .await
+    .unwrap();
+    let (included, consumed, reserved) = note_view(&base, commitment);
+    assert!(included);
+    assert!(
+        consumed,
+        "the successful retry consumes the note exactly once"
+    );
+    assert!(reserved.is_none());
+    assert_eq!(
+        balance_of(&env, &env.token_hex, &[0x77; 20]).await,
+        7,
+        "exactly one payout across one reverted and one successful attempt"
+    );
+    assert_eq!(
+        nonce(
+            &rpc(
+                &env.client,
+                &env.url,
+                "eth_getTransactionCount",
+                json!([signer_hex, "latest"]),
+            )
+            .await,
+        ),
+        before + 2,
+        "exactly two attempts: one reverted, one paid"
+    );
+    assert_eq!(
+        base.operations
+            .get(&withdrawal.identity)
+            .unwrap()
+            .unwrap()
+            .state(),
+        WalletOperationState::Completed
+    );
+    eprintln!(
+        "{}",
+        json!({
+            "status": "finalized-reverted-withdrawal",
+            "attempts_sent": 2,
+            "reverted_attempts": 1,
+            "payout": 7,
+            "note_consumed_once": true,
+        })
+    );
+}

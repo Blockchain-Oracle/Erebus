@@ -24,23 +24,27 @@ use erebus_shielded_prover::{
     artifacts::{ArtifactRelease, InstallOptions, ManifestAuthorization},
     index_store::{IndexDomain, IndexStore},
     operations::{
-        parse_address, parse_digest32, parse_field, prepare_approve, prepare_deposit,
+        parse_address, parse_digest32, parse_field, prepare_approve_request, prepare_deposit,
         prepare_unwrap, prepare_withdraw, prepare_wrap, reconcile_finalized_operations,
         reconcile_operations, replace_wallet_call, resume_wallet_call, submit_wallet_call,
         OperationContext, OperationStore, WalletOperationState, WalletSubmissionState,
     },
     recovery::{recover_finalized_wallet_agreed_bounded, RecoveryError},
-    rpc::{PoolDependencyPins, PoolRpc},
+    rpc::{PoolDependencyPins, PoolIdentity, PoolRpc, PoolRuntimePins, MAX_CONCURRENT_READS},
     wallet::{WalletDomain, WalletStore},
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
 use zeroize::Zeroizing;
 
+#[path = "wallet/deposit_requests.rs"]
+mod deposit_requests;
+
 const HELP: &str = "erebus-wallet: explicit installed shielded wallet operations.
 One bounded JSON request on stdin: {\"method\":\"...\", ...}.
-Methods: version, notes, sync, approve, wrap, unwrap, deposit, withdraw, resume, replace.
+Methods: version, notes, status, sync, approve, wrap, unwrap, deposit, withdraw, resume, replace.
 Requests use config_file; approve, wrap, unwrap, and deposit also amount; withdraw also commitment and recipient;
+agents must supply operation_ref for approve, wrap, unwrap and deposit and reuse it after interruption;
 resume also identity. Operator configuration pins the chain, pool, asset, artifact manifest
 digest, wallet, signer journal, and two RPC endpoints. Keys and witnesses stay local.
 sync replays verified finalized history and completes observed operations only.
@@ -55,12 +59,17 @@ enum Request {
     Notes {
         config_file: PathBuf,
     },
+    Status {
+        config_file: PathBuf,
+    },
     Sync {
         config_file: PathBuf,
     },
     Approve {
         config_file: PathBuf,
         amount: String,
+        #[serde(default)]
+        operation_ref: Option<String>,
     },
     Wrap {
         config_file: PathBuf,
@@ -75,6 +84,8 @@ enum Request {
     Deposit {
         config_file: PathBuf,
         amount: String,
+        #[serde(default)]
+        operation_ref: Option<String>,
     },
     Withdraw {
         config_file: PathBuf,
@@ -197,10 +208,17 @@ fn finish(result: Result<Value, Failure>) -> ! {
             std::process::exit(2);
         }
         Err(Failure::PendingResult(value)) => {
+            let message = if value.get("history_pending") == Some(&json!(true)) {
+                "verified pool history is not complete; resume sync"
+            } else if value.get("resume_required") == Some(&json!(true)) {
+                "deposit bytes retained; resume its original identity"
+            } else {
+                "legacy wallet operations require manual reconciliation"
+            };
             eprintln!(
                 "{}",
                 json!({"status": "pending", "result": value,
-                    "error": "legacy wallet operations require manual reconciliation"})
+                    "error": message})
             );
             std::process::exit(2);
         }
@@ -215,11 +233,9 @@ fn finish(result: Result<Value, Failure>) -> ! {
 async fn main() {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     if args.len() == 1 && args[0] == "--version" {
-        println!(
-            "{}",
-            json!({"status":"ok","protocol":1,
-                "methods":["notes","sync","approve","wrap","unwrap","deposit","withdraw","resume","replace"]})
-        );
+        let mut value = capabilities();
+        value["status"] = json!("ok");
+        println!("{value}");
         std::process::exit(0);
     }
     if args.len() == 1 && args[0] == "--help" {
@@ -245,16 +261,22 @@ async fn main() {
     finish(run(request).await);
 }
 
+fn capabilities() -> Value {
+    json!({"protocol":1, "deposit_operation_references":true,
+        "funding_operation_references":true, "paired_account_diagnostics":true,
+        "methods":["notes","status","sync","approve","wrap","unwrap","deposit","withdraw","resume","replace"]})
+}
+
 async fn run(request: Request) -> Result<Value, Failure> {
     match request {
-        Request::Version {} => Ok(json!({
-            "protocol": 1,
-            "methods": ["notes", "sync", "approve", "wrap", "unwrap", "deposit", "withdraw",
-                "resume", "replace"]
-        })),
+        Request::Version {} => Ok(capabilities()),
         Request::Notes { config_file } => {
             let prepared = load(&config_file)?;
             notes(&prepared)
+        }
+        Request::Status { config_file } => {
+            let prepared = load(&config_file)?;
+            status(&prepared).await
         }
         Request::Sync { config_file } => {
             let prepared = load(&config_file)?;
@@ -263,10 +285,16 @@ async fn run(request: Request) -> Result<Value, Failure> {
         Request::Approve {
             config_file,
             amount,
+            operation_ref,
         } => {
             let prepared = load(&config_file)?;
             let amount = decimal(&amount)?;
-            approve(&prepared, amount).await
+            let reference = operation_ref
+                .as_deref()
+                .map(parse_digest32)
+                .transpose()
+                .map_err(|_| Failure::Error("invalid approval reference"))?;
+            approve(&prepared, amount, reference).await
         }
         Request::Wrap {
             config_file,
@@ -293,10 +321,16 @@ async fn run(request: Request) -> Result<Value, Failure> {
         Request::Deposit {
             config_file,
             amount,
+            operation_ref,
         } => {
             let prepared = load(&config_file)?;
             let amount = decimal(&amount)?;
-            deposit(&prepared, amount).await
+            let reference = operation_ref
+                .as_deref()
+                .map(parse_digest32)
+                .transpose()
+                .map_err(|_| Failure::Error("invalid deposit reference"))?;
+            deposit(&prepared, amount, reference).await
         }
         Request::Withdraw {
             config_file,
@@ -648,6 +682,112 @@ fn notes(prepared: &Prepared) -> Result<Value, Failure> {
     }))
 }
 
+async fn status(prepared: &Prepared) -> Result<Value, Failure> {
+    let pins = prepared.config.runtime_pins.as_ref().ok_or(Failure::Error(
+        "wallet diagnostics require trusted runtime pins",
+    ))?;
+    let (pool, dependencies) = pins.parse()?;
+    let pins = PoolRuntimePins {
+        pool,
+        poseidon: dependencies.poseidon,
+        deposit: dependencies.deposit,
+        transfer: dependencies.transfer,
+        withdraw: dependencies.withdraw,
+    };
+    let rpc = PoolRpc::with_timeout(
+        &prepared.config.rpc_url,
+        prepared.chain_id,
+        prepared.pool,
+        Duration::from_secs(prepared.config.timeout_seconds),
+    )
+    .map_err(|_| Failure::Error("invalid RPC"))?;
+    let peer_rpc = PoolRpc::with_timeout(
+        &prepared.config.peer_rpc_url,
+        prepared.chain_id,
+        prepared.pool,
+        Duration::from_secs(prepared.config.timeout_seconds),
+    )
+    .map_err(|_| Failure::Error("invalid peer RPC"))?;
+    let primary = index_store(prepared, "primary.json")?;
+    let peer = index_store(prepared, "peer.json")?;
+    let account = rpc
+        .account_state_agreed(
+            &peer_rpc,
+            primary.domain(),
+            PoolIdentity {
+                asset: prepared.asset,
+                verifier_version: prepared.config.verifier_version,
+            },
+            pins,
+            prepared.signer,
+        )
+        .await
+        .map_err(|_| Failure::Error("paired wallet account diagnostics unavailable"))?;
+    let mut checkpoints = Vec::new();
+    for (source, store) in [("primary", primary), ("peer", peer)] {
+        let index = store
+            .load()
+            .map_err(|_| Failure::Error("wallet checkpoint unavailable"))?;
+        let tip = index.tip();
+        if let Some(tip) = tip {
+            if tip.number > account.anchor.number
+                || rpc
+                    .canonical_block_hash(tip.number)
+                    .await
+                    .map_err(|_| Failure::Error("wallet checkpoint unavailable"))?
+                    != tip.hash
+                || peer_rpc
+                    .canonical_block_hash(tip.number)
+                    .await
+                    .map_err(|_| Failure::Error("wallet checkpoint unavailable"))?
+                    != tip.hash
+            {
+                return Err(Failure::Error(
+                    "wallet checkpoint conflicts with finalized evidence",
+                ));
+            }
+        }
+        let next = tip.map_or(store.domain().first_block, |tip| {
+            tip.number.saturating_add(1)
+        });
+        checkpoints.push(
+            json!({"source":source, "checkpoint_block":tip.map(|tip|tip.number),
+            "checkpoint_hash":tip.map(|tip|hex::encode(tip.hash)), "next_log_block":next,
+            "blocks_behind":account.anchor.number.saturating_add(1).saturating_sub(next),
+            "caught_up":tip.is_some_and(|tip|tip.number == account.anchor.number)}),
+        );
+    }
+    let decimal = |word: [u8; 32]| num_bigint::BigUint::from_bytes_be(&word).to_string();
+    for source in [&rpc, &peer_rpc] {
+        if source
+            .canonical_block_hash(account.anchor.number)
+            .await
+            .map_err(|_| Failure::Error("wallet diagnostic anchor unavailable"))?
+            != account.anchor.hash
+            || source
+                .finalized_head()
+                .await
+                .map_err(|_| Failure::Error("wallet diagnostic finality unavailable"))?
+                .number
+                < account.anchor.number
+        {
+            return Err(Failure::Error("wallet diagnostic finality changed"));
+        }
+        source
+            .check_chain()
+            .await
+            .map_err(|_| Failure::Error("wallet diagnostic chain changed"))?;
+    }
+    let mut value = notes(prepared)?;
+    value["account"] = json!({"native_balance":decimal(account.native_balance),
+        "asset_balance":decimal(account.asset_balance), "allowance":decimal(account.allowance),
+        "anchor_block":account.anchor.number,"anchor_hash":hex::encode(account.anchor.hash),
+        "anchor_timestamp":account.anchor.timestamp});
+    value["checkpoints"] = json!(checkpoints);
+    value["payment_verified"] = json!(false);
+    Ok(value)
+}
+
 fn operation_view(operation: &erebus_shielded_prover::operations::WalletOperationView) -> Value {
     json!({
         "kind": match operation.kind() {
@@ -746,13 +886,22 @@ async fn sync(prepared: &Prepared) -> Result<Value, Failure> {
         prepared.config.timeout_seconds,
     )
     .await?;
-    let rpc = PoolRpc::new(&prepared.config.rpc_url, prepared.chain_id, prepared.pool)
-        .map_err(|_| Failure::Error("invalid RPC"))?;
-    let peer_rpc = PoolRpc::new(
+    // Keep every header check and the per-source rate cap; use the existing bounded read fanout.
+    let rpc = PoolRpc::with_timeout(
+        &prepared.config.rpc_url,
+        prepared.chain_id,
+        prepared.pool,
+        Duration::from_secs(prepared.config.timeout_seconds),
+    )
+    .and_then(|rpc| rpc.with_max_concurrent_reads(MAX_CONCURRENT_READS))
+    .map_err(|_| Failure::Error("invalid RPC"))?;
+    let peer_rpc = PoolRpc::with_timeout(
         &prepared.config.peer_rpc_url,
         prepared.chain_id,
         prepared.pool,
+        Duration::from_secs(prepared.config.timeout_seconds),
     )
+    .and_then(|rpc| rpc.with_max_concurrent_reads(MAX_CONCURRENT_READS))
     .map_err(|_| Failure::Error("invalid peer RPC"))?;
     let primary = index_store(prepared, "primary.json")?;
     let peer = index_store(prepared, "peer.json")?;
@@ -768,8 +917,13 @@ async fn sync(prepared: &Prepared) -> Result<Value, Failure> {
     .await
     {
         Ok(report) => report,
-        Err(RecoveryError::HistoryPending { .. }) => {
-            return Err(Failure::Pending("verified pool history is not complete"));
+        Err(RecoveryError::HistoryPending {
+            next_block,
+            through,
+        }) => {
+            return Err(Failure::PendingResult(json!({"history_pending":true,
+                "next_log_block":next_block, "through":through,
+                "retry_without_new_payment":true})));
         }
         Err(_) => return Err(Failure::Error("paired wallet recovery failed")),
     };
@@ -823,18 +977,56 @@ async fn sync(prepared: &Prepared) -> Result<Value, Failure> {
     Ok(value)
 }
 
-async fn approve(prepared: &Prepared, amount: u128) -> Result<Value, Failure> {
+fn retain_action(
+    prepared: &Prepared,
+    kind: &[u8],
+    amount: u128,
+    reference: [u8; 32],
+) -> Result<deposit_requests::DepositRequest, Failure> {
+    let binding = erebus_core::suite::keccak256(&[
+        b"erebus-wallet-action-request-v1",
+        kind,
+        &prepared.chain_id.to_be_bytes(),
+        &prepared.pool,
+        &prepared.asset,
+        &prepared.signer,
+        prepared.config.wrapper.as_deref().unwrap_or("").as_bytes(),
+        &amount.to_be_bytes(),
+    ]);
+    deposit_requests::DepositRequest::retain_if_new(
+        &prepared.config.state_root.join("wallet-action-requests"),
+        reference,
+        binding,
+        || Ok(()),
+    )
+    .map_err(Failure::Error)
+}
+
+async fn approve(
+    prepared: &Prepared,
+    amount: u128,
+    reference: Option<[u8; 32]>,
+) -> Result<Value, Failure> {
     sync(prepared).await?;
     let operations = operations(prepared)?;
-    let prepared_call = prepare_approve(
+    let mut request = reference
+        .map(|reference| retain_action(prepared, b"approve", amount, reference))
+        .transpose()?;
+    let prepared_call = prepare_approve_request(
         &operations,
         prepared.chain_id,
         prepared.pool,
         prepared.asset,
         amount,
+        reference,
         now()?,
     )
     .map_err(|_| Failure::Error("approval preparation failed; nothing was sent"))?;
+    if let Some(request) = &mut request {
+        request
+            .bind(prepared_call.identity)
+            .map_err(Failure::Error)?;
+    }
     let chain = connect_chain(
         prepared,
         &prepared.config.rpc_url,
@@ -911,8 +1103,14 @@ async fn wrap_or_unwrap(
     wrap: bool,
 ) -> Result<Value, Failure> {
     sync(prepared).await?;
-    let operations = operations(prepared)?;
     let wrapper = wrapper(prepared)?;
+    let mut request = retain_action(
+        prepared,
+        if wrap { b"wrap" } else { b"unwrap" },
+        amount,
+        operation_ref,
+    )?;
+    let operations = operations(prepared)?;
     let prepared_call = if wrap {
         prepare_wrap(
             &operations,
@@ -933,6 +1131,9 @@ async fn wrap_or_unwrap(
         )
     }
     .map_err(|_| Failure::Error("native wrapper preparation failed; nothing was sent"))?;
+    request
+        .bind(prepared_call.identity)
+        .map_err(Failure::Error)?;
     let chain = connect_chain(
         prepared,
         &prepared.config.rpc_url,
@@ -982,12 +1183,78 @@ async fn wrap_or_unwrap(
     }))
 }
 
-async fn deposit(prepared: &Prepared, amount: u128) -> Result<Value, Failure> {
+async fn deposit(
+    prepared: &Prepared,
+    amount: u128,
+    reference: Option<[u8; 32]>,
+) -> Result<Value, Failure> {
     // Refresh verified inclusion and release a finalized signer-lane claim from a prior
     // operation before preparing a new one. This never sends a transaction.
     sync(prepared).await?;
     let wallet = wallet(prepared)?;
     let operations = operations(prepared)?;
+    let owner = agreement_key(prepared)?;
+    let binding = erebus_core::suite::keccak256(&[
+        b"erebus-wallet-deposit-request-v1",
+        &prepared.chain_id.to_be_bytes(),
+        &prepared.pool,
+        &prepared.config.verifier_version.to_be_bytes(),
+        &prepared.asset,
+        &prepared.signer,
+        &owner,
+        &amount.to_be_bytes(),
+    ]);
+    let requests_root = prepared.config.state_root.join("deposit-requests");
+    let _legacy_lock = if reference.is_none() {
+        Some(
+            deposit_requests::DepositRequest::lock_legacy(&requests_root)
+                .map_err(Failure::Error)?,
+        )
+    } else {
+        None
+    };
+    let mut retained = reference
+        .map(|reference| {
+            deposit_requests::DepositRequest::retain_if_new(
+                &requests_root,
+                reference,
+                binding,
+                || {
+                    if operations
+                        .pending()
+                        .map_err(|_| "deposit operation journal unavailable")?
+                        .iter()
+                        .any(|operation| {
+                            operation.kind()
+                                == erebus_shielded_prover::operations::WalletOperationKind::Deposit
+                        })
+                    {
+                        Err("another deposit is retained; resume its original identity")
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+        })
+        .transpose()
+        .map_err(Failure::Error)?;
+    if let Some(identity) = retained.as_ref().and_then(|record| record.commitment()) {
+        let operation = operations
+            .get(&identity)
+            .map_err(|_| Failure::Error("retained deposit operation unavailable"))?
+            .ok_or(Failure::Error("retained deposit operation missing"))?;
+        if operation.state() == WalletOperationState::Completed {
+            return Ok(
+                json!({"kind":"deposit", "identity":hex::encode(identity), "already_completed":true}),
+            );
+        }
+        if operation.retained() {
+            return Err(Failure::PendingResult(
+                json!({"kind":"deposit", "identity":hex::encode(identity),
+                "retry_without_new_payment":true, "resume_required":true}),
+            ));
+        }
+    }
     let chain = connect_chain(
         prepared,
         &prepared.config.rpc_url,
@@ -1004,7 +1271,6 @@ async fn deposit(prepared: &Prepared, amount: u128) -> Result<Value, Failure> {
     }
     let release = release(prepared)?;
     let options = install_options(prepared)?;
-    let owner = agreement_key(prepared)?;
     let prepared_call = prepare_deposit(
         &release,
         &options,
@@ -1023,6 +1289,11 @@ async fn deposit(prepared: &Prepared, amount: u128) -> Result<Value, Failure> {
     )
     .await
     .map_err(|_| Failure::Error("deposit preparation failed; no funds were sent"))?;
+    if let Some(retained) = &mut retained {
+        retained
+            .bind(prepared_call.commitment)
+            .map_err(Failure::Error)?;
+    }
     let submission = submit_wallet_call(
         &chain,
         &journal,
@@ -1204,6 +1475,24 @@ fn private_read(path: &Path, limit: usize) -> Result<Zeroizing<Vec<u8>>, ()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diagnostic_capability_and_request_schema_are_read_only_and_fixed_config() {
+        assert_eq!(capabilities()["paired_account_diagnostics"], true);
+        assert!(capabilities()["methods"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|method| method == "status"));
+        assert!(serde_json::from_value::<Request>(
+            json!({"method":"status","config_file":"/operator/wallet.json"})
+        )
+        .is_ok());
+        assert!(serde_json::from_value::<Request>(
+            json!({"method":"status","config_file":"/operator/wallet.json","target":"0x01"})
+        )
+        .is_err());
+    }
 
     #[test]
     fn release_wallet_refuses_missing_runtime_pins_before_keys_or_rpc() {

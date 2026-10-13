@@ -169,6 +169,19 @@ impl<R: JournalRecord> Store<R> {
             .map(|file| IdentityLock { _file: file })
     }
 
+    /// Tries the identity lock without blocking an async runtime worker.
+    /// Contention returns None; filesystem errors still fail closed.
+    pub fn try_lock_identity(&self) -> Result<Option<IdentityLock>, StoreError<R::Id>> {
+        let path = self.root.join(IDENTITY_LOCK);
+        let lock = open_lock(&path).map_err(Self::io(&path))?;
+        set_file_mode(&lock, 0o600).map_err(Self::io(&path))?;
+        match lock.try_lock_exclusive() {
+            Ok(()) => Ok(Some(IdentityLock { _file: lock })),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+            Err(error) => Err(Self::io(&path)(error)),
+        }
+    }
+
     /// Takes the lock for `id`, waiting for any other holder.
     ///
     /// Re-locking an id this process already holds through another lease blocks; it does not

@@ -59,6 +59,71 @@ def test_configuration_must_be_owner_only(monkeypatch, tmp_path):
         MetropolisSettings.from_env()
 
 
+def test_sponsorship_is_explicit_and_cannot_keep_a_buyer_gas_key(monkeypatch, tmp_path):
+    configure(monkeypatch, tmp_path, payment={"mode": "shielded", "relay": {"url": "https://relay.example/v1/relay"}})
+    assert MetropolisSettings.from_env().submission_mode == "sponsored"
+    configure(monkeypatch, tmp_path, payment={"mode": "shielded", "relay": {}, "transaction_key_file": "/operator/gas.key"})
+    with pytest.raises(ConfigError, match="no buyer gas key"):
+        MetropolisSettings.from_env()
+    configure(monkeypatch, tmp_path, payment={"mode": "public-bound", "relay": {}})
+    with pytest.raises(ConfigError, match="shielded"):
+        MetropolisSettings.from_env()
+
+
+def test_wallet_tools_require_operator_policy_and_share_the_state_root(monkeypatch, tmp_path):
+    import erebus_mcp.metropolis as module
+    state = configure(monkeypatch, tmp_path, payment={"mode":"shielded"})
+    class Native:
+        def __init__(self, **kwargs):
+            pass
+        def version(self):
+            return {}
+    monkeypatch.setattr(module, "MetropolisSeam", Native)
+    monkeypatch.setattr(module.MetropolisWallet, "version", lambda self: {})
+    monkeypatch.setenv("EREBUS_WALLET_CLI", "wallet")
+    config = operator_file(tmp_path / "wallet.json", {"state_root":str(state)})
+    policy = operator_file(tmp_path / "wallet-policy.json", {"version":1, "maximum_amount":"100",
+        "allowed_methods":["notes", "sync", "status", "deposit"], "withdrawal_recipients":[]})
+    monkeypatch.setenv("EREBUS_WALLET_CONFIG", str(config))
+    monkeypatch.setenv("EREBUS_WALLET_POLICY", str(policy))
+    server = module.build_metropolis_server()
+    tools = asyncio.run(server.list_tools())
+    names = {tool.name for tool in tools}
+    assert {"wallet_notes", "wallet_status", "sync_wallet", "deposit_wallet"} <= names
+    assert not {"wrap_wallet", "withdraw_wallet", "replace_wallet"} & names
+    operator_file(config, {"state_root":"/another-operator"})
+    with pytest.raises(ConfigError, match="state root"):
+        module.build_metropolis_server()
+
+
+@pytest.mark.skipif(not (ROOT / "sdk/shielded/target/release/erebus-wallet").exists(), reason="build the release wallet binary")
+def test_stdio_wallet_mutations_are_explicit_and_over_limit_requests_are_refused(tmp_path):
+    state = tmp_path / "state"
+    negotiation = operator_file(tmp_path / "negotiation.json", {"role":"buyer", "state_root":str(state)})
+    payment = operator_file(tmp_path / "payment.json", {"mode":"shielded", "state_root":str(state)})
+    wallet = operator_file(tmp_path / "wallet.json", {"state_root":str(state)})
+    policy = operator_file(tmp_path / "wallet-policy.json", {"version":1, "maximum_amount":"100",
+        "allowed_methods":["notes", "sync", "deposit"], "withdrawal_recipients":[]})
+    release = ROOT / "sdk/shielded/target/release"
+    env = {"EREBUS_BACKEND":"metropolis", "EREBUS_NEGOTIATION_CONFIG":str(negotiation),
+        "EREBUS_PAYMENT_CONFIG":str(payment), "EREBUS_NEGOTIATION_CLI":str(release / "erebus-negotiate"),
+        "EREBUS_PAYMENT_CLI":str(release / "erebus-payment"), "EREBUS_WALLET_CONFIG":str(wallet),
+        "EREBUS_WALLET_POLICY":str(policy), "EREBUS_WALLET_CLI":str(release / "erebus-wallet")}
+    params = StdioServerParameters(command=sys.executable, args=["-m", "erebus_mcp.server"], cwd=str(ROOT), env=env)
+    async def run():
+        async with stdio_client(params) as (read, write):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                names = {tool.name for tool in (await session.list_tools()).tools}
+                assert {"wallet_notes", "sync_wallet", "deposit_wallet"} <= names
+                assert not {"approve_wallet", "wrap_wallet", "withdraw_wallet", "replace_wallet"} & names
+                response = await session.call_tool("deposit_wallet", {"amount":"101", "operation_ref":"ab" * 32})
+                result = response.structured_content or json.loads(response.content[0].text)
+                assert result["ok"] is False and result["error"]["code"] == "WALLET_UNAVAILABLE"
+                assert result["error"]["retry_without_new_payment"] is True
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize("value", ["0", "901", "1e2", "-5"])
 def test_native_timeout_is_bounded(monkeypatch, tmp_path, value):
     configure(monkeypatch, tmp_path, role="seller")

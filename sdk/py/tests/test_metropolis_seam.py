@@ -186,3 +186,26 @@ def test_chain_times_require_verified_payment(monkeypatch):
     fake(monkeypatch, pending, code=2)
     with pytest.raises(MetropolisError):
         seam().payment(OPERATION, method="settle")
+
+
+def test_relay_status_is_diagnostic_not_payment_verification(monkeypatch):
+    reply = {**settled(), "status": "pending", "payment_verified": False,
+             "submitted_this_call": False, "stage": "Prepared", "broadcast_attempts": 0,
+             "submission_delegated": True, "relay_status": "finalized",
+             "relay_operation_ref": "ab" * 32, "relay_transaction_hash": "0x" + "cd" * 32,
+             "measurements_ms": {"relay_submission": 10}}
+    reply.pop("winning_commitment", None)
+    fake(monkeypatch, reply, code=2)
+    assert seam().payment(OPERATION, method="settle")["payment_verified"] is False
+    fake(monkeypatch, {**reply, "submission_delegated": False}, code=2)
+    with pytest.raises(MetropolisError, match="delegation"):
+        seam().payment(OPERATION, method="settle")
+
+
+def test_sponsored_sdk_rejects_direct_broadcast_claim(monkeypatch):
+    client = MetropolisSeam(negotiation_config="/n.json", state_root="/s", role="buyer",
+                           payment_config="/p.json", mode="shielded", submission_mode="sponsored",
+                           negotiation_binary="negotiate", payment_binary="payment")
+    fake(monkeypatch, settled())
+    with pytest.raises(MetropolisError, match="direct buyer"):
+        client.payment(OPERATION, method="settle")

@@ -25,10 +25,10 @@ use std::sync::{
 struct ServiceProcess(Child);
 #[path = "agent_driver.rs"]
 mod agent_driver;
-#[path = "metered_driver.rs"]
-mod metered_driver;
 #[path = "controlled_paired.rs"]
 mod controlled_paired;
+#[path = "metered_driver.rs"]
+mod metered_driver;
 #[path = "native_product.rs"]
 mod native_product;
 #[path = "shielded_driver.rs"]

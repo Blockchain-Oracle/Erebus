@@ -1,6 +1,7 @@
 //! Native suite-2 driver. Private note openings remain in the encrypted wallet.
 
 use super::*;
+use erebus_core::settlement::PreparedSettlement;
 use erebus_shielded_prover::{
     artifacts::{ArtifactRelease, CircuitKind, InstallOptions, MAX_MANIFEST_BYTES},
     chain::ShieldedChain,
@@ -53,6 +54,8 @@ struct ShieldedConfig {
     max_priority_fee_per_gas: String,
     timeout_seconds: u64,
     max_scan_blocks: u64,
+    #[serde(default)]
+    relay: Option<erebus_shielded_prover::relay_client::RelayEndpoint>,
 }
 
 fn pending(response: &mut Value, error: &RecoveryError) -> bool {
@@ -81,6 +84,18 @@ pub(super) async fn run(
     let maximum = amount(&config.maximum_price)?;
     let pool = parse_lowercase_address(&config.pool).ok_or("invalid shielded deployment")?;
     let signer = parse_lowercase_address(&config.signer_address).ok_or("invalid gas payer")?;
+    let gas_sender = if let Some(relay) = &config.relay {
+        relay.validate()?;
+        digest(&relay.identity)?;
+        if config.transaction_key_file.is_some() {
+            return Err("relay mode cannot configure a buyer gas key");
+        }
+        parse_lowercase_address(&relay.sponsor_address)
+            .filter(|address| *address != [0; 20])
+            .ok_or("invalid relay sponsor")?
+    } else {
+        signer
+    };
     let buyer_key =
         hex::decode(&config.buyer_key_hex).map_err(|_| "invalid buyer agreement key")?;
     if buyer_key.len() != 64
@@ -280,6 +295,7 @@ pub(super) async fn run(
         .ok_or("missing operation")?;
     response["stage"] = json!(format!("{:?}", stage.stage));
     response["broadcast_attempts"] = json!(stage.broadcast_attempts);
+    response["submission_delegated"] = json!(stage.submission_delegated);
     let journal = SignerJournal::open(&config.signer_journal_root, chain_id, signer)
         .map_err(|_| "gas-payer nonce journal unavailable")?;
     match assessment.state {
@@ -308,6 +324,25 @@ pub(super) async fn run(
         DealState::Open => {}
         _ => return Ok(response),
     }
+    if stage.submission_delegated {
+        if submit {
+            if let Some(relay) = &config.relay {
+                let prepared = coordinator
+                    .prepared_settlement(operation)
+                    .map_err(|_| "delegated proof unavailable; retain reservations")?;
+                submit_relay(
+                    &coordinator,
+                    operation,
+                    relay,
+                    &context,
+                    &prepared,
+                    &mut response,
+                )
+                .await?;
+            }
+        }
+        return Ok(response);
+    }
     if stage.broadcast_attempts != 0 || (!submit && !funding_only) {
         return Ok(response);
     }
@@ -320,7 +355,7 @@ pub(super) async fn run(
     let started = Instant::now();
     let balance = chain
         .evm()
-        .gas_payer_balance(signer)
+        .gas_payer_balance(gas_sender)
         .await
         .map_err(|_| "gas funding check unavailable")?;
     let snapshot = wallet.snapshot().map_err(|_| "wallet unavailable")?;
@@ -429,6 +464,18 @@ pub(super) async fn run(
     };
     validate_prepared(&context, &prepared)
         .map_err(|_| "prepared proof differs from authorized agreement")?;
+    if let Some(relay) = &config.relay {
+        submit_relay(
+            &coordinator,
+            operation,
+            relay,
+            &context,
+            &prepared,
+            &mut response,
+        )
+        .await?;
+        return Ok(response);
+    }
     let gas = chain
         .evm()
         .estimate_call_gas(signer, pool, &prepared.backend_evidence)
@@ -524,4 +571,43 @@ pub(super) async fn run(
     response["stage"] = json!(format!("{:?}", submitted.stage));
     response["broadcast_attempts"] = json!(submitted.broadcast_attempts);
     Ok(response)
+}
+
+async fn submit_relay(
+    coordinator: &Coordinator,
+    operation: [u8; 32],
+    relay: &erebus_shielded_prover::relay_client::RelayEndpoint,
+    context: &SettlementContext,
+    prepared: &PreparedSettlement,
+    response: &mut Value,
+) -> Result<(), &'static str> {
+    // No outbound byte is authorized until the durable buyer fence has succeeded.
+    let relay_identity = erebus_core::suite::keccak256(&[
+        b"erebus-relay-destination-v1",
+        &digest(&relay.identity)?,
+        relay.url.as_bytes(),
+        relay.sponsor_address.as_bytes(),
+    ]);
+    coordinator
+        .delegate_submission(operation, relay_identity, clock()?)
+        .map_err(|_| "relay delegation unavailable; retain reservations")?;
+    response["submission_delegated"] = json!(true);
+    let bytes = read(&relay.authentication_key_file, 32)?;
+    let token: &[u8; 32] = bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| "relay key must be 32 raw bytes")?;
+    let started = Instant::now();
+    let reply = relay.submit(context, prepared, token).await?;
+    response["measurements_ms"]["relay_submission"] = json!(started.elapsed().as_millis());
+    response["relay_status"] = json!("unavailable");
+    if let Some(reply) = reply {
+        response["relay_operation_ref"] = json!(reply.operation_ref);
+        response["relay_status"] = json!(reply.status);
+        if let Some(hash) = reply.transaction_hash {
+            response["relay_transaction_hash"] = json!(hash);
+        }
+    }
+    // Remote finality is not buyer-verified payment evidence. Recovery observes locally.
+    Ok(())
 }
