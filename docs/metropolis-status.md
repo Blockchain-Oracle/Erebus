@@ -1,6 +1,6 @@
 # Metropolis Status
 
-Status date: 2026-10-12. Branch: `metropolis`.
+Status date: 2026-10-13. Branch: `metropolis`.
 
 This document consolidates the historical Metropolis milestone baselines, progress notes, decision
 records, the x402 record, the demo plan, and the submission gates into one status source.
@@ -9,6 +9,106 @@ records, the x402 record, the demo plan, and the submission gates into one statu
 [friction.md](friction.md) stays the separate friction log.
 
 ## Current status
+
+### Integrated rehearsal qualification (2026-10-13)
+
+This summary supersedes the readiness wording in the historical entries below.
+The published release remains `0.3.0.dev2026101202`; the new relayer/wallet candidate
+is not published. OpenCode handed off dirty source identity
+`f6ec6bcc27f39bc39155bf439301a80ec6e0e4361c5083c12fbe6f6db4efb6dd`
+based on `482d912`. Claude built local version `0.3.0.dev2026101305` with 16 binaries.
+Its release manifest SHA-256 is
+`96088431211dd1236a1d5255decd29354ad3ecb12bbb26a2d903f8f6b5f2d374`.
+
+Claude's recorded checks passed real HTTPS synthetic proving for both deployed pools,
+two local asset rehearsals, metered access and x402. Installed onboarding refused the
+candidate because its binaries do not match the existing published authorization.
+That refusal is correct but does not qualify onboarding for the new candidate.
+Installed relayer authentication, malformed-request and restart checks passed without
+sending; submit/status/receipt recovery remains untested through the installed binary.
+A loopback-only Anvil chain-10143 fixture is needed without weakening the relayer's
+chain restriction. Oversized requests currently close the connection rather than
+returning HTTP 413; this is an observed diagnostic limitation.
+
+Evidence: `.local/metropolis/candidate-20261010/claude-qualification-f6ec6bcc.md`.
+These are recorded team-run snapshot results, not independently rerun here, native CI,
+live settlement, a release qualification or an audit. The separate paired-recovery
+masking investigation found bounded delayed error reporting and no wallet mutation
+without complete paired evidence; its three local reproducers passed.
+
+Next: close installed onboarding and funded relayer-binary gates, qualify a clean
+authorized revision natively, then execute the approved installed live asset loops.
+Cold-history catch-up remains a separate blocker. Independent ceremony, audit and
+outside acceptance remain open. Preserve this snapshot while Claude qualifies it;
+storage improvements require a separate candidate.
+
+Installed-to-live preparation is recorded in
+`.local/metropolis/candidate-20261010/codex-installed-live-execution-handoff-20261013.md`.
+The sync reply, asset-unit and funding-intent helper tests passed as three Node
+test files with no RPC or keys. This preparation does not close a live gate.
+
+The [leakage review](metropolis-leakage-review.md) covers the candidate's native,
+SDK/MCP, relay and disclosure surfaces. Focused Python groups passed 66 and 60 tests;
+relay unit tests passed 20, and the observer and Debug redaction tests each passed one.
+A mocked native error was echoed by onboarding; Claude owns this defensive hardening.
+Wallet amounts/nullifiers are agent-visible, not public-transfer plaintext.
+Live observer evidence, gateway/model telemetry review and independent audit remain open.
+
+The [integrated release-readiness review](metropolis-release-readiness.md) is complete.
+Its decision is not ready: installed workflow/report gates and integrated relayer inventory
+are missing, and ongoing onboarding changes need a new qualified identity.
+Focused registry/publication/readiness tests passed 57; the inventory tripwire failed once.
+The current authorization covers only the already published version. No new release action was taken.
+
+Integration subsequently resolved the missing relayer inventory and added the new
+publication report guards. Focused onboarding/publication/registry tests passed 126.
+The loopback chain-10143 fixture was integrated with hashes matching OpenCode's handoff.
+Five funded tests passed against Claude's installed `0.3.0.dev2026101305` relayer in 91.73 seconds.
+Installed executable SHA-256:
+`84cc7e6bae232f4c5a852b98333873f7946a2e267490627b25f0da5001c80168`.
+Its package release manifest is `96088431211dd1236a1d5255decd29354ad3ecb12bbb26a2d903f8f6b5f2d374`.
+The fixture refusal test passed separately; Rust format checking passed.
+Buyer failure coverage here is transport-level, not complete installed payment-CLI delegation.
+Native workflow/report wiring, new onboarding qualification and live execution remain open.
+The 5 GiB disk guard was crossed as the run completed; further builds are held.
+No files were deleted, commits created or live transactions broadcast.
+
+The generated-agent harness still needs six deployment replay records. A new
+`circuits/m5/scripts/export-testnet-replay.mjs` reconstructs those already-public
+signed transactions from paired read-only RPCs, using the pinned deployment record.
+It checks chain 10143, canonical successful receipts, recovered sender/creation
+addresses, exact transaction hashes, runtime code and finality/anchor rechecks.
+Fourteen offline tests passed. A real paired read-only export verified all six
+creation transactions and wrote owner-only local replay files. No key was read,
+new signature created or transaction broadcast. Evidence manifest SHA-256:
+`244c1f2662e535568fe3a9e43a2dfb9bbeec761f96af1fee2e4f2cdaae926250`.
+The offline suite is included in M5 CI; native qualification still needs to invoke
+the exporter and pass its output as `--deployment-journal` to the workflow harness.
+
+Claude's installed two-pool workflow report was read back from
+`.local/metropolis/candidate-20261010/workflow-af7e69d8/report.json`.
+It records candidate `af7e69d864677f12b02b16d875b4d0a7bbbdafaac571a2d17fc24454c7ab9a53`,
+local version `0.3.0.dev2026101306` and release manifest
+`a479dc79c406008bdfd88c0140ff4bcc481b7568511b41295f88206a2bb6b773`.
+Both pools record payment recovery, one settlement broadcast, resource-hash verification
+and auditor payment verification. Total operator broadcasts: 12. These are local mocks
+with rehearsal pins, not canonical asset behavior or publication evidence.
+
+Hosted native CI now has a generated-agent workflow step using public replay inputs
+and exact-version prepublication authorization. Platform comparison requires the feature
+reports for hosted relayer packages. Seventy-seven focused workflow/publication/registry
+checks passed; workflow YAML parses and diff checking passed. No native run was dispatched.
+The installed-relayer report adapter and its CI invocation remain open before qualification.
+
+An integrated default Python workspace run (`uv run --frozen pytest -q`) passed
+830 tests with 13 skips in 67.68 seconds. This ran on the shared working tree;
+it is not frozen-candidate qualification, funded native CI or an installed live run.
+The immutable-resource access service deliberately permits late issuance without
+voiding payment (`access.rs:260,732`). The client checks that the seller's late flag
+matches the signed deadline, but its cached receipt drops issuance time/late metadata.
+The strict SDK consequently does not expose that detail to the agent. This is a
+remaining diagnostics/ergonomics task, not a demonstrated false delivery claim.
+The resource hash can verify while `delivery_verified` remains false.
 
 ### Authorized artifact release and qualification (2026-10-12)
 
@@ -22,10 +122,119 @@ It is not a fixture key, but it remains a team-controlled identity.
 
 The artifact prerelease `artifacts-268bf1abe34d` now contains 17 public assets:
 nine proving files, three verification keys, checksums, two manifests and two signatures.
-Real HTTPS verification and clean native qualification are in progress, not yet established here.
+Both pool verification checks and full artifact/key fetches passed over real HTTPS,
+with unchanged manifest pins and hash/size checks. Local fetches used curl's certificate
+validation and bounded connection fallback after Python stalled on a CDN connection.
+These are team-operated download checks, not installed proving or native qualification.
+Evidence: `.local/metropolis/candidate-20261010/https-fetch-{wmon,usdc}-20261012.json`.
+
+The integrated candidate was committed and pushed as
+`5ba05ee2999aecb390c2d8276f084af38dc4dda3`; the merge is closed and `main` is untouched.
+Python verification passed: 670 tests, 38 skipped. Staged secret scanning passed.
+Native hosted-input qualification `38221534481` failed: macOS Bash 3.2 lacks
+`mapfile`, so its registry build never ran. Claude reported the native Linux leg
+passed its hosted proving and installed rehearsal gates; that does not qualify both platforms.
+The four packaging-only fixes were verified (267 scripts tests passed, 9 skipped),
+committed and pushed as `07e6949c9a6593cc8c051ddbd096ea64c82e7ee1`.
+Relayer and historical M4 changes were excluded. Hosted re-qualification is running as
+[run 38227563253](https://github.com/PoulavBhowmick03/Erebus/actions/runs/38227563253),
+with the same publisher, pool manifests, version and `publish=false`.
+No private package publication or complete native qualification success is claimed yet.
+
+The broader CI run `38221213877` failed its M4 prototype because its historical
+note hash was compared against M5 v2's updated Rust payment-note vector.
+The local fix pins M4 to the unchanged Rust vector from `94aa059` under its own
+fixtures directory. Its SHA-256 is
+`ea554a298ccd1a1e7861e1f3c97b1a0d2fe21016b6687f749e5ccd97167c49a4`.
+`npm --prefix circuits/m4 run prototype` passed proof, local EVM settlement,
+replay and mutation checks. Current circuits, keys, deployed verifiers and
+packaged input-tree hash are unchanged. This fix is uncommitted; the CI result
+remains failed until a corrected revision runs successfully.
 The planned private package version is `0.3.0.dev2026101202`.
 Qualification uses `publish=false`; authorization does not permit bypassing a failed gate.
 This remains test-only, single-operator and unaudited. Independent acceptance is still open.
+
+### Shielded relayer admission boundary (2026-10-12, uncommitted)
+
+`sdk/shielded/src/relay_admission.rs` verifies externally supplied transfer calldata
+against a hash-pinned zkey's verification key, without witnesses or spending material.
+It reuses prepared deployment/identity checks, rejects noncanonical field encodings,
+checks curve/subgroup membership, handles Solidity's G2 coordinate order and enforces
+the supplied paired-observation timestamp against expiry.
+All 95 shielded library tests passed. The ignored external-proof test accepted a
+retained local transfer proof and rejected all eleven changed public inputs, damaged
+points, wrong/truncated keys, noncanonical fields, changed selector and exact expiry.
+Release all-targets clippy passed. These tests use local known-entropy artifacts.
+
+Paired admission authenticates the configured creation anchor and all five runtime pins
+at creation and the shared canonical head. It checks the pool asset/version, verifies
+expiry against that head's timestamp, and simulates exact transfer calldata with the
+configured sponsor, gas limit and zero native value through both providers.
+The pinned pool's simulation checks roots, consumption, output reuse and capacity.
+Creation, head and finalized anchors are rechecked, and regressed finality is refused.
+The two ignored admission tests passed with known-entropy local artifacts. Controlled
+RPC tests cover honest lag, conflicting headers, wrong runtimes/assets, reverted or
+malformed simulation results, changed anchors, regressed/missing finality and wrong chains.
+Invalid proofs are refused before RPC reads. No RPC write method is invoked.
+These providers simulate evidence; this is not funded contract or Monad admission evidence.
+
+The separate funded Anvil test now executes admission against the actual pool and
+verifiers. A valid proof is admitted without changing the sponsor nonce. A valid
+unknown-root proof is refused. The test submits one payment itself from a sponsor
+account; admission then refuses the consumed deal, a fresh deal spending that input,
+and a second unspent input reusing the first payment's change commitment.
+The pool's exact revert reasons are checked, both providers use pinned simulation,
+and refusals never advance the sponsor nonce. All three admission tests passed
+(17.18 seconds, release profile); all-targets clippy passed.
+The fixture uses existing known-entropy artifacts, creates no setup keys, and accepts
+only loopback Anvil chain 31337. This is funded local evidence, not a relayer service,
+Monad rehearsal, audit or independent acceptance. CI now includes the ignored suite;
+that new CI step has not yet run remotely.
+
+The buyer delegation fence is implemented in the working tree. It binds one
+operator-pinned relay identity to the digest of retained prepared calldata, under
+the coordinator's identity lock. The record is durable before returning to the
+caller. Repeated identical delegation is idempotent; another relay conflicts.
+Existing direct signing plans cannot delegate, and delegated operations cannot
+invoke the direct signer. The payment driver observes delegated operations without
+direct submission. Finalized evidence can still reconcile the payment.
+
+Coordinator release lifecycle tests passed (29 passed, one exhaustive test ignored), including
+restart, expiry, direct-signing exclusion and injected delegation-write failures.
+The shielded release library rerun passed 97 tests; coordinator and shielded clippy passed.
+These are local tests, not service or Monad sponsorship evidence. Delegation is an
+optional record field: unchanged records remain readable, while older strict readers
+reject delegated records instead of silently dropping the fence.
+
+No relayer service, sponsored service send or live relayed payment exists yet.
+The request codec accepts only a version and canonical transfer calldata, within a
+2048-byte JSON limit. Unknown or duplicate fields are refused. Metadata is derived
+against operator configuration; the service operation identity binds chain, pool
+and deal nullifier, not proof bytes or a client-selected identifier. A different
+proof for the same payment has the same identity and must conflict with changed
+retained calldata. Both codec tests passed; decoding is not proof admission.
+The concurrent delegation test also passed: exactly one relay wins and the loser
+conflicts. HTTP authentication, integrated service accounting and sponsored submission
+are still unimplemented.
+The sponsor journal now retains the canonical public request, validates decoded
+signed bytes against sender/chain/pool/value/gas/fee/calldata, persists a plan before
+the signer runs, and fences initial broadcast before returning outbound bytes.
+Changed proof bytes under the same identity conflict. Corrupt or deleted records
+with retained markers fail closed. Four local tests cover restart, competing callers,
+wrong signed targets and faults at each signing/broadcast write boundary.
+The complete release library rerun passed 101 tests, and production library/binary
+clippy passed. All-targets clippy found `too_many_arguments` in OpenCode's new
+`tests/relay_adversarial.rs:344`; that independent test file was not edited here.
+No nonce integration, HTTP service, fee replacement, finalized service status or
+live sponsorship is implied by these journal tests.
+Read-only admission is not a reservation, payment or authorization to submit.
+Funding checks, immediate pre-sign re-admission and durable service/buyer fences remain
+mandatory before allocating sponsored gas.
+The pinned native release run tests packaging commit `07e6949`, not this new working-tree module.
+Run `38227563253` completed successfully: native Linux, native macOS and platform
+comparison passed; publication was skipped as requested. This confirms workflow
+completion, not uploaded package hashes or a fresh public install. Claude owns those
+remaining release checks under the recorded authorization.
 
 ### USDC rehearsal amounts (2026-10-12)
 
@@ -52,13 +261,14 @@ Claude used later checksums and modification times to assess stability, not a su
 Funded rehearsals used Anvil; offline witnesses were synthetic; artifact fixtures used local transport.
 The candidate remains dirty, test-only, single-operator, unaudited and release-ineligible.
 No native CI, real HTTPS hosting, private package publication or outside acceptance is established by r7.
-The open merge has no unresolved index conflicts; review and a clean commit remain required.
+The merge was closed in `5ba05ee`; packaging fixes were committed in `07e6949`.
+New relayer work remains uncommitted and is excluded from that frozen release.
 
 ### Retained wallet recovery (2026-10-12, read-only continuation)
 
 Both retained wallets ran bounded syncs with the fixed withdrawal binary.
 Binary SHA-256: `91eac0cf76032daa46061c8d8150735b7dd41c4e3a9bcae01e93b6cb277bd924`.
-The latest seller prefixes are `69922652` and `69911652`.
+The latest seller prefixes are `69931652` and `69919652` after a further bounded continuation.
 The latest buyer prefixes are `69950934` and `69944934`.
 Three parallel steps advanced primary caches faster than peer caches.
 A subsequent serial seller step advanced both prefixes by another `1000` blocks.
@@ -2550,3 +2760,30 @@ threat model, and agreement limits stay in [metropolis-architecture.md](metropol
 [metropolis-agreement.md](metropolis-agreement.md). Record new stack friction in
 [friction.md](friction.md); existing Metropolis friction entries referenced by this document
 include F12, F38, F43-F46, F48-F50, and F57.
+
+## 2026-10-13 Product Integration In Progress
+
+The published `0.3.0.dev2026101202` remains separate from the moving candidate.
+These source additions are not an installed release, an audit or outside acceptance.
+
+- Sponsored shielded HTTP service and `erebus-shielded-relayer` binary implemented. Authentication, body limits, deadlines, persistent rate limits and lifetime gas-cap reservations are operator policy. Each instance has one configured authentication principal, not multi-tenant isolation.
+- Native buyer, SDK and MCP sponsorship implemented. The buyer persists a destination-bound delegation before HTTP; remote status is diagnostic only. Its own paired pool evidence determines payment verification.
+- Funded native buyer regression passed on local Anvil: unavailable service caused zero sends; retry used one sponsor transaction; removing relay configuration did not authorize direct signing; observation recovered finality without another send.
+- Relay-focused release unit suite: 20 passed, including bounded owner resume, fee-only replacement history and replacement write-fault boundaries. A full integrated product rerun is still required.
+- Wallet SDK and MCP action policy implemented. Agents cannot supply wallet paths, keys, arbitrary calldata or targets. Amounts and withdrawal recipients are bounded; replacement fee caps are operator-fixed. Deposit requires a caller reference and refuses older native commands without that capability.
+- Native deposit reference journal implemented, with policy/note binding and fail-closed corruption/deletion tests. Wallet binary suite: 6 passed. Pending sync reports bounded next-block progress. Both funded installed-wallet regressions passed on the final funding-reference implementation (2 passed, 180.92 seconds). Each gate copies its wallet executable once so concurrent builds cannot change it between commands.
+- Python SDK tests plus focused MCP/operator-generator suite: 205 passed. This does not replace installed two-agent qualification.
+- Targeted release clippy passed with warnings denied for the library, buyer payment CLI, wallet CLI, relayer CLI, negotiation driver and wallet operations tests.
+- Published wallet read-only seller catch-up advanced primary through 69933652 and peer through 69921652, then returned pending. The recipient note at the payment block is not yet recovered. No live write or new payment was made in that run.
+- Approval renewal now has an explicit caller reference, while legacy approval identities remain supported. SDK/MCP requires references for approval, wrap, unwrap and deposit. Native funding references bind the original action and amount; the approval identity test and integrated funded wallet reruns pass.
+
+- Explicit owner `--resume` resends only retained bytes, with at most 16 durable retries. Normal HTTP duplicates stay observation-only. `--replace` uses an optional owner-fixed fee ceiling configured before the first request; quotas reserve the ceiling in full. Changing the ceiling on retained storage fails closed. Replacement preserves sender, chain, nonce, native value, calldata and gas; old hashes remain observable and the actual successful winner is recorded.
+- Full relay admission/funded release rerun: 7 passed, 0 failed (191.33 seconds). It covers dropped-send owner resume, replacement winning, older attempt winning, own-receipt recovery after restart, paired admission negatives and external proof verification. Earlier new-test runs exposed an undersized fixture quota and replacement re-admission after a send; the fixture budget now includes the ceiling, and a repeated replacement is observation-only. This final rerun passed on the corrected source.
+- Focused wallet/SDK/MCP Python rerun: 65 passed. Release clippy with warnings denied passed for the relay library, binary and admission tests. Source binary version/help smoke checks passed without keys or RPC.
+- Both RPC providers report zero genuine testnet USDC for the retained buyer address. MON funding does not supply USDC. A live USDC lifecycle still needs that asset; no fixture mint is substituted.
+- Native wallet `status`, SDK and opt-in MCP `wallet_status` now report paired provider-finalized native/asset balances, pool allowance, retained operations and checkpoint block lag. All account reads use the same canonical block hash; deployment/runtime pins, pool identity, agreement between providers and post-read anchors are checked. These diagnostics do not authorize spending, reconcile state or verify a payment. Existing policies must explicitly allow `status`; older native capabilities are refused.
+- Diagnostic verification: 2 controlled RPC tests passed (honest lag, conflicting/malformed values, missing code/getters, anchor mutation and finality regression), 7 wallet binary tests passed, and 7 RPC unit tests passed. Focused Python SDK/MCP rerun: 66 passed. Release clippy for the library, wallet binary and diagnostic/funded wallet tests passed with warnings denied.
+- Funded installed-command wallet regressions passed together: 2 passed, 200.81 seconds (ERC-20 approval/deposit/retry/withdrawal plus WMON wrap/deposit/withdraw/unwrap). The diagnostic fixture waits for finalized mint/approval state; it does not substitute the newer head balance. An earlier test build raced the import edit, and the first finalized-balance assertion preceded mint finality; both were corrected before this rerun.
+- Live read-only source diagnostics passed at finalized block 70490161. The seller has 2 MON for gas, zero external WMON and zero pool allowance. Primary/peer wallet checkpoints are 556509/568509 blocks behind that anchor; the retained recipient note is still not included. This exposes a substantial cold-history catch-up bottleneck, not a completed seller lifecycle. No live transaction was sent.
+
+Open work includes installed service/operator recovery qualification, full live asset lifecycles, remaining wallet diagnostics/agent ergonomics, and a stable packaging handoff. Independent setup, audit and outside acceptance remain external gates.

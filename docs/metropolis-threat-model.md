@@ -49,13 +49,17 @@ These are Architecture C targets, conditional on the selected privacy rail and p
 | Public-bound relayer and RPC | Agreement opening, authorizations and public payment parameters | Spending keys and earlier encrypted negotiation history |
 | Counterparty | Its negotiation and agreed terms | Other deals and spending secrets |
 | Auditor with one grant | Selected transcript, opening, authorizations, payment evidence | Other deal keys and spending authority |
+| Authorized wallet agent / model provider | Note amounts, commitments/nullifiers, asset, reservation/consumption state and account diagnostics returned by enabled tools | Spending keys, note salt and proof witnesses are not returned by the reviewed tools |
 
 Token identity can remain public through pool selection. A small anonymity set can make amount and timing correlations strong.
 Removing public channel opening can reduce direct relationship disclosure. Relaying alone does not prove relationship privacy.
 An observer can correlate deposits, withdrawals, endpoints, and timing even when ciphertext remains secure.
-The current transaction relayer accepts public-bound evidence, not proof-only shielded requests.
-Do not pass a shielded agreement opening through that API. A separate local gas key does not
-hide an operator's network identity or prove that two payments are unrelated.
+The older public-bound relayer accepts agreement openings. The separate shielded
+candidate accepts only version and proof calldata, under Bearer authentication.
+Do not send shielded openings or witnesses through either service.
+A separate gas key does not hide network identity or prove that payments are unrelated.
+Wallet tool responses can expose private amounts and future spend identifiers to an agent's model provider.
+See the [source and test review](metropolis-leakage-review.md) for the tested boundary and remaining logging gaps.
 
 ### Diagnostic formatting boundary
 
@@ -232,10 +236,10 @@ artifacts, is unaudited, and is not deployed.
   buyer and seller authorization keys. Candidate v2 rejects equal keys in `ShieldedDeal::from_terms`
   as SDK policy; self-deals remain representable at the pool level and a disclosed or SDK-verified
   deal is not proof that two distinct parties exist.
-- **Gas-payer linkability (declared, not solved).** The circuit fixes fee = 0 and the buyer
-  self-submits, so the gas address links to its settlement. A sponsor/relayer is unfinished work:
-  do not send witnesses to one and do not invent an unconstrained fee. Any compensation change is
-  a signed-format and setup change.
+- **Gas-payer linkability (declared, not solved).** Direct submission exposes the buyer's gas account.
+  The sponsored candidate uses a sponsor account; installed live sponsorship remains unqualified.
+  The circuit fixes fee = 0. Do not send witnesses or invent an unconstrained fee.
+  An on-chain user-paid fee requires a reviewed agreement/circuit revision and new setup artifacts.
 - **Evidence boundary (unchanged).** The candidate still uses test-only artifacts with known
   entropy; no audit, ceremony, or independent review exists. Passing local suites, AI review, and
   scanners are not an audit.

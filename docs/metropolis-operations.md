@@ -1155,7 +1155,9 @@ Access authentication and delivery limits:
   buyer can retrieve the same issuance. The service has no transaction signing or payment
   submission path. Pending observations do not issue access and do not prove nonpayment.
 - The delivery deadline does not cancel a paid entitlement. Late issuance is reported
-  explicitly. The service response reports `delivery_verified: false`. A response from the seller
+  explicitly in the service's wire response. The current buyer retrieval receipt and
+  SDK/MCP omit issuance time and late status; they do not prove timely delivery.
+  The service response reports `delivery_verified: false`. A response from the seller
   is not an independent audit of delivery.
 - Recovery requires the seller to retain the agreed resource and private agreement evidence.
   The seller must restore issuance storage and continue serving the endpoint. The service cannot

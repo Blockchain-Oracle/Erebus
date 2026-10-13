@@ -16,11 +16,12 @@ Use the [Metropolis install guide](./docs/metropolis-install.md) and
 [operations guide](./docs/metropolis-operations.md). The stable `v0.3.0`
 package and the video below demonstrate the older Starknet product, not Monad.
 
-The verified live Monad path is **public-bound settlement**: accepted agreement,
-blinding, signatures, amount, and parties are public in transaction calldata.
-Offchain negotiation history stays encrypted. Shielded settlement and the complete
-two-agent MCP delivery loop have local Anvil evidence only; neither is a released
-private-payment product on Monad.
+Monad testnet evidence includes public-bound settlement and one team-operated
+shielded WMON payment. Public-bound calldata exposes the agreement opening,
+signatures, amount and parties. The shielded rail uses proofs and note commitments;
+the outer gas sender, funding and withdrawals remain public. Offchain negotiation
+history stays encrypted. Full installed live workflows for both assets and sponsored
+submission remain incomplete; the setup is test-only, single-operator and unaudited.
 
 The x402 `exact` rail (seller-facilitated Permit2) is implemented and locally verified end to
 end: real discovery and encrypted negotiation, one fenced payment, restart recovery, matching
@@ -32,11 +33,13 @@ rehearsal also completed on Monad testnet: one payment
 ([`0x1ba9ddb3…`](https://testnet.monadexplorer.com/tx/0x1ba9ddb363a0c916f8e41ca8eca7d4c524d1ba4722bf4ea37ed423547700ff73)),
 buyer-finalized observation, seller access across a restart, and independent auditor verification
 (`payment_verified: true`). These are team-operated native CLI runs, not MCP/LLM or third-party
-acceptance, and no shielded payment has run on Monad.
+acceptance. The shielded WMON payment
+([`0xe01666d8…`](https://testnet.monadexplorer.com/tx/0xe01666d8c4e16efe8195da8047674c71a325ee20ff250f02f4fdf570a04934fa))
+used source-built payment commands, not the complete published-release workflow.
 
 ### Install the published Metropolis packages
 
-`0.3.0.dev5` is published as a prerelease on a separate Metropolis index (the stable Starknet
+The recorded release `0.3.0.dev2026101202` is published as a prerelease on a separate Metropolis index (the stable Starknet
 index is unrelated). With [uv](https://docs.astral.sh/uv/) and Python 3.11+:
 
 ```sh
@@ -45,7 +48,7 @@ uv pip install --python erebus-metropolis/bin/python \
   --no-config \
   --index https://poulavbhowmick03.github.io/erebus-metropolis/simple/ \
   --default-index https://pypi.org/simple --index-strategy first-index \
-  "erebus-mcp-server==0.3.0.dev5"
+  "erebus-mcp-server==0.3.0.dev2026101202"
 ```
 
 Use uv with the index order above. Metropolis takes priority; PyPI supplies missing dependencies.
@@ -56,7 +59,7 @@ If downloads from GitHub release assets time out, set
 GitHub's `ubuntu-latest`; not a manylinux build, so older glibc may not run it). There are no
 Intel macOS, Linux arm64, or Windows wheels. The install puts the native commands, the
 `erebus-mcp-server` entry point, and `erebus-selfhost` in `erebus-metropolis/bin`. Verified
-2026-10-04 from a fresh environment outside any checkout (see the
+on native macOS and Linux from fresh environments outside the checkout (see the
 [install guide](./docs/metropolis-install.md)).
 
 Recorded Monad testnet payments: the earlier public-bound example
