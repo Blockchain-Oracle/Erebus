@@ -9,8 +9,17 @@ be steered to a wrong or unknown counterparty even while staying under its amoun
 So this module is the policy the agent applies on top: same per-token per-deal and daily
 amounts, plus an allowlist of counterparties. An empty allowlist means the operator has not
 restricted counterparties and every address is allowed; a non-empty allowlist means only those
-addresses are. The order is deliberate: counterparty first, then per-deal, then daily, so the
-most specific refusal is the one the agent sees.
+addresses are. A token with no configured limit is uncapped, as in `SpendGuard`. The order is
+deliberate: counterparty first, then per-deal, then daily, so the most specific refusal is the
+one the agent sees.
+
+Token and counterparty identities are compared case-insensitively, so a checksummed EVM address
+in the policy matches the lowercase form a client reports, and vice versa. Without that, a
+mixed-case token key would silently fall through to "uncapped".
+
+This module is not yet wired into the settlement path: nothing calls it except
+`firewall_demo.py`. An agent must call `guard` or `charge` itself before settling; until then,
+`SpendGuard` is the only limit actually enforced on a settlement.
 """
 
 from __future__ import annotations
@@ -23,6 +32,11 @@ ALLOWED = "allowed"
 COUNTERPARTY_NOT_ALLOWED = "counterparty_not_allowed"
 PER_DEAL_EXCEEDED = "per_deal_exceeded"
 DAILY_EXCEEDED = "daily_exceeded"
+
+
+def normalize_identity(value: str) -> str:
+    """Canonical form for comparing token and participant identities: trimmed, lowercase."""
+    return value.strip().lower()
 
 
 @dataclass(frozen=True)
@@ -43,8 +57,24 @@ class SpendingPolicy:
     by_token: dict[str, TokenLimit] = field(default_factory=dict)
     allowed_counterparties: frozenset[AgentId] = frozenset()
 
+    def __post_init__(self) -> None:
+        by_token: dict[str, TokenLimit] = {}
+        for token, limit in self.by_token.items():
+            key = normalize_identity(token)
+            if not key:
+                raise ValueError("token keys must not be empty")
+            if key in by_token and by_token[key] != limit:
+                raise ValueError(f"token {token!r} is configured twice with different limits")
+            by_token[key] = limit
+        object.__setattr__(self, "by_token", by_token)
+        object.__setattr__(self, "allowed_counterparties",
+                           frozenset(normalize_identity(party) for party in self.allowed_counterparties))
+
     def limit_for(self, token: str) -> TokenLimit:
-        return self.by_token.get(token.strip().lower(), TokenLimit())
+        return self.by_token.get(normalize_identity(token), TokenLimit())
+
+    def allows_counterparty(self, counterparty: AgentId) -> bool:
+        return not self.allowed_counterparties or normalize_identity(counterparty) in self.allowed_counterparties
 
 
 @dataclass(frozen=True)
@@ -66,10 +96,12 @@ class SpendLedger:
         self._spent: dict[tuple[str, str], int] = {}
 
     def spent(self, day: str, token: str) -> int:
-        return self._spent.get((day, token.strip().lower()), 0)
+        return self._spent.get((day, normalize_identity(token)), 0)
 
     def record(self, day: str, token: str, amount: int) -> None:
-        key = (day, token.strip().lower())
+        if amount <= 0:
+            raise ValueError("amount must be positive")
+        key = (day, normalize_identity(token))
         self._spent[key] = self._spent.get(key, 0) + amount
 
 
@@ -79,7 +111,7 @@ def evaluate(policy: SpendingPolicy, *, token: str, amount: int, counterparty: A
         raise ValueError("amount must be positive")
     if not token:
         raise ValueError("token must not be empty")
-    if policy.allowed_counterparties and counterparty not in policy.allowed_counterparties:
+    if not policy.allows_counterparty(counterparty):
         return FirewallDecision(False, COUNTERPARTY_NOT_ALLOWED,
                                 f"counterparty {counterparty!r} is not on the allowlist")
     limit = policy.limit_for(token)

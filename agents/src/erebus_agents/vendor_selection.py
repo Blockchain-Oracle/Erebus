@@ -5,33 +5,38 @@ each candidate and records the amount each would agree to, without settling. It 
 cheapest agreement at or below its ceiling and pays that seller once. Losing candidates learn
 nothing about each other, and only the winner's identity reaches the settlement path.
 
-`negotiate_amount` mirrors the buyer/seller loop in `agent.run_negotiation` but stops at
-agreement instead of calling `accept_and_settle`, so a losing candidate is never paid. The
-selection is a pure function of the outcomes.
+`negotiate_agreement` mirrors the buyer/seller loop in `agent.run_negotiation` but stops at
+agreement instead of calling `accept_and_settle`, so a losing candidate is never paid. It returns
+the exact seller-authored offer the buyer would accept. `settle_selected` then settles *that*
+offer on *that* channel: the winner is paid the amount the selection compared, with no second
+negotiation that could land on a different price. The selection is a pure function of the
+outcomes.
 """
 
 from __future__ import annotations
 
+import secrets
 from dataclasses import dataclass
 
-from erebus_mcp.interface import AgentId, ChannelState
-from erebus_mcp.mock_client import MockErebusClient
+from erebus_mcp.interface import AgentId, ChannelHandle, ChannelState, ErebusClient, OfferId
 
 from erebus_agents.policy import BuyerPolicy, NegotiationAction, SellerPolicy
 
 
 @dataclass(frozen=True)
 class VendorOutcome:
+    """What one candidate would agree to. `agreed` means terms were reached, not that anything settled."""
+
     service_id: str
     seller: AgentId
-    settled: bool
+    agreed: bool
     agreed_amount: int | None
 
     def __post_init__(self) -> None:
         if not self.service_id or not self.seller:
             raise ValueError("service_id and seller must not be empty")
-        if self.settled != (self.agreed_amount is not None):
-            raise ValueError("a settled outcome carries an agreed amount")
+        if self.agreed != (self.agreed_amount is not None):
+            raise ValueError("an agreed outcome carries an agreed amount, and only an agreed one")
 
 
 @dataclass(frozen=True)
@@ -45,11 +50,11 @@ class Selection:
 
 
 def select(outcomes: tuple[VendorOutcome, ...], *, ceiling: int) -> Selection:
-    """Cheapest settled agreement at or below the ceiling; ties break on seller identity."""
+    """Cheapest agreement at or below the ceiling; ties break on seller identity."""
     valid: list[VendorOutcome] = []
     rejected: list[tuple[str, str]] = []
     for outcome in outcomes:
-        if not outcome.settled or outcome.agreed_amount is None:
+        if not outcome.agreed or outcome.agreed_amount is None:
             rejected.append((outcome.service_id, "no agreement"))
         elif outcome.agreed_amount > ceiling:
             rejected.append((outcome.service_id, "above the buyer's ceiling"))
@@ -62,20 +67,33 @@ def select(outcomes: tuple[VendorOutcome, ...], *, ceiling: int) -> Selection:
     return Selection(winner, tuple(rejected) + losers)
 
 
-async def negotiate_amount(
+@dataclass(frozen=True)
+class PendingAgreement:
+    """A seller-authored offer the buyer would accept, left open on the buyer's channel."""
+
+    buyer_handle: ChannelHandle
+    offer_id: OfferId
+    amount: int
+
+
+def _operation_id() -> str:
+    return secrets.token_hex(32)
+
+
+async def negotiate_agreement(
     *,
-    buyer_client: MockErebusClient,
-    seller_client: MockErebusClient,
+    buyer_client: ErebusClient,
+    seller_client: ErebusClient,
     buyer_address: AgentId,
     seller_address: AgentId,
     token: str,
     buyer_policy: BuyerPolicy,
     seller_policy: SellerPolicy,
     max_rounds: int = 3,
-) -> int | None:
-    """Return the amount the buyer would accept, or None, without settling anything."""
-    buyer_handle = await buyer_client.open_channel(seller_address)
-    seller_handle = await seller_client.open_channel(buyer_address)
+) -> PendingAgreement | None:
+    """Return the offer the buyer would accept, or None, without settling anything."""
+    buyer_handle = await buyer_client.open_channel(_operation_id(), seller_address)
+    seller_handle = await seller_client.open_channel(_operation_id(), buyer_address)
     for round_index in range(max_rounds + 1):
         state: ChannelState = await buyer_client.read_channel_state(buyer_handle)
         balance = await buyer_client.note_balance()
@@ -84,16 +102,34 @@ async def negotiate_amount(
             return None
         if decision.action is NegotiationAction.ACCEPT:
             accepted = next(offer for offer in state.offers if offer.offer_id == decision.reply_to)
-            return accepted.terms.amount
+            return PendingAgreement(buyer_handle, accepted.offer_id, accepted.terms.amount)
         if decision.action is NegotiationAction.PROPOSE:
-            await buyer_client.propose_offer(buyer_handle, decision.terms)
+            await buyer_client.propose_offer(_operation_id(), buyer_handle, decision.terms)
         else:
-            await buyer_client.counter_offer(buyer_handle, decision.reply_to, decision.terms)
+            await buyer_client.counter_offer(_operation_id(), buyer_handle, decision.reply_to, decision.terms)
 
         seller_state = await seller_client.read_channel_state(seller_handle)
         seller_decision = seller_policy.decide(seller_state, round_index)
         if seller_decision.action is NegotiationAction.WALK:
             return None
         if seller_decision.action is NegotiationAction.COUNTER:
-            await seller_client.counter_offer(seller_handle, seller_decision.reply_to, seller_decision.terms)
+            await seller_client.counter_offer(_operation_id(), seller_handle, seller_decision.reply_to,
+                                              seller_decision.terms)
     return None
+
+
+class SelectionMismatch(RuntimeError):
+    """The settlement does not match the agreement the selection compared."""
+
+
+async def settle_selected(buyer_client: ErebusClient, agreement: PendingAgreement) -> ChannelState:
+    """Settle exactly the selected offer and confirm the payment equals the compared amount."""
+    await buyer_client.accept_and_settle(_operation_id(), agreement.buyer_handle, agreement.offer_id)
+    state = await buyer_client.read_channel_state(agreement.buyer_handle)
+    settlement = state.settlement
+    if settlement is None or settlement.acceptance != agreement.offer_id:
+        raise SelectionMismatch("the selected offer is not the one that settled")
+    if settlement.agreed_amount != agreement.amount or settlement.paid_amount != agreement.amount:
+        raise SelectionMismatch(
+            f"selected {agreement.amount} but agreed {settlement.agreed_amount} and paid {settlement.paid_amount}")
+    return state

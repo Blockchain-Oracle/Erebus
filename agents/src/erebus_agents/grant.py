@@ -17,10 +17,17 @@ from dataclasses import dataclass
 
 from erebus_mcp.interface import AgentId
 
-from erebus_agents.firewall import ALLOWED, COUNTERPARTY_NOT_ALLOWED, PER_DEAL_EXCEEDED, FirewallDecision
+from erebus_agents.firewall import (
+    ALLOWED,
+    COUNTERPARTY_NOT_ALLOWED,
+    PER_DEAL_EXCEEDED,
+    FirewallDecision,
+    normalize_identity,
+)
 
 GRANT_EXPIRED = "grant_expired"
 GRANT_EXHAUSTED = "grant_exhausted"
+TOKEN_NOT_GRANTED = "token_not_granted"
 
 
 @dataclass(frozen=True)
@@ -43,6 +50,9 @@ class BudgetGrant:
             raise ValueError("per_deal must be positive when present")
         if self.expires_at <= 0:
             raise ValueError("expires_at must be a positive unix time")
+        object.__setattr__(self, "token", normalize_identity(self.token))
+        object.__setattr__(self, "allowed_counterparties",
+                           frozenset(normalize_identity(party) for party in self.allowed_counterparties))
 
 
 class GrantLedger:
@@ -58,16 +68,28 @@ class GrantLedger:
         return grant.max_total - self.spent(grant.grant_id)
 
     def record(self, grant_id: str, amount: int) -> None:
+        if amount <= 0:
+            raise ValueError("amount must be positive")
         self._spent[grant_id] = self._spent.get(grant_id, 0) + amount
 
 
-def authorize(grant: BudgetGrant, ledger: GrantLedger, *, amount: int, counterparty: AgentId,
+def authorize(grant: BudgetGrant, ledger: GrantLedger, *, token: str, amount: int, counterparty: AgentId,
               at: int) -> FirewallDecision:
+    """Expiry, then token, then counterparty, then per-deal, then the remaining budget.
+
+    The budget is denominated in the grant's token, so a draw in any other token is refused
+    outright rather than counted against it.
+    """
     if amount <= 0:
         raise ValueError("amount must be positive")
+    if not token:
+        raise ValueError("token must not be empty")
     if at > grant.expires_at:
         return FirewallDecision(False, GRANT_EXPIRED, f"grant expired at {grant.expires_at}")
-    if grant.allowed_counterparties and counterparty not in grant.allowed_counterparties:
+    if normalize_identity(token) != grant.token:
+        return FirewallDecision(False, TOKEN_NOT_GRANTED,
+                                f"the grant funds {grant.token}, not {token}")
+    if grant.allowed_counterparties and normalize_identity(counterparty) not in grant.allowed_counterparties:
         return FirewallDecision(False, COUNTERPARTY_NOT_ALLOWED,
                                 f"counterparty {counterparty!r} is not on the grant's allowlist")
     if grant.per_deal is not None and amount > grant.per_deal:
@@ -79,9 +101,9 @@ def authorize(grant: BudgetGrant, ledger: GrantLedger, *, amount: int, counterpa
     return FirewallDecision(True, ALLOWED, "within the grant")
 
 
-def charge(grant: BudgetGrant, ledger: GrantLedger, *, amount: int, counterparty: AgentId,
+def charge(grant: BudgetGrant, ledger: GrantLedger, *, token: str, amount: int, counterparty: AgentId,
            at: int) -> FirewallDecision:
-    decision = authorize(grant, ledger, amount=amount, counterparty=counterparty, at=at)
+    decision = authorize(grant, ledger, token=token, amount=amount, counterparty=counterparty, at=at)
     if decision.allowed:
         ledger.record(grant.grant_id, amount)
     return decision

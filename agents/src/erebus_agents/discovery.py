@@ -16,12 +16,13 @@ caller has already decided to trust.
 from __future__ import annotations
 
 import json
-import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
 
 from erebus_mcp.interface import AgentId
+
+from erebus_agents.marketplace import write_private_json
 
 _SERVICE_ID = re.compile(r"[a-z0-9][a-z0-9._-]*")
 _SHA256_HEX = re.compile(r"[a-f0-9]{64}")
@@ -111,12 +112,7 @@ class DiscoveryDirectory:
         target = path or self._path
         if target is None:
             raise ValueError("no directory path configured")
-        payload = json.dumps({"records": [record.to_dict() for record in self.records()]}, indent=2)
-        tmp = target.with_suffix(target.suffix + ".tmp")
-        tmp.write_text(payload)
-        tmp.replace(target)
-        if os.name == "posix":
-            target.chmod(0o600)
+        write_private_json(target, {"records": [record.to_dict() for record in self.records()]})
         return target
 
     @classmethod

@@ -56,22 +56,30 @@ seller-authored offer.
   delivery verification, and exports text, JSON or a self-contained static HTML file. Also a CLI.
 - `rfq.py` / `rfq_demo.py`. A confidential request-for-quote desk: one buyer issues a
   `RequestForQuote` with a hidden ceiling, suppliers return sealed `Quote`s, and `award` picks the
-  cheapest valid quote (rejecting expired, over-ceiling and outbid ones) without revealing the
-  losers. The winner is then negotiated and settled through the ordinary loop.
+  cheapest valid quote (rejecting expired, over-ceiling and outbid ones, and everything once the
+  request deadline passes) without revealing the losers. The winner is then negotiated and
+  settled through the ordinary loop with the awarded quote as the buyer's budget, so it is paid
+  at most what it quoted (`award_honored`).
 - `vendor_selection.py` / `vendor_selection_demo.py`. `negotiate_amount` runs a private
   negotiation with each candidate seller *without settling*, and `select` picks the cheapest
-  agreement at or below the ceiling. The buyer pays exactly one seller; losing candidates are
-  never paid.
+  agreement at or below the ceiling. `settle_selected` then settles that exact offer and checks
+  the payment equals the compared amount. The buyer pays exactly one seller; losing candidates
+  are never paid.
 - `firewall.py` / `firewall_demo.py`. The agent-side spending policy: per-token per-deal and daily
   caps, a `SpendLedger`, and the counterparty allowlist the MCP `SpendGuard` does not have.
+  Token and counterparty identities match case-insensitively. It is not wired into the
+  settlement path: an agent must call `guard`/`charge` itself, and `SpendGuard` remains the only
+  limit enforced on a settlement.
 - `grant.py` / `grant_demo.py`. A sponsor's `BudgetGrant` (token, total budget, per-deal cap,
   counterparty allowlist, expiry) and a `GrantLedger`, so an agent's spending is attributable to a
-  sponsor's intent. Shares the firewall's refusal codes.
+  sponsor's intent. A draw in any token other than the grant's is refused. Shares the firewall's
+  refusal codes.
 - `discovery.py` / `discovery_demo.py`. A `DiscoveryDirectory` of `ServiceRecord`s: capability,
   asset, price band, endpoint and an optional signed-descriptor digest. It indexes; the Rust
   `ServiceDescriptor` verifies.
-- `metering.py` / `saas_metering_demo.py`. Prepaid `CreditBundle` accounting over the existing
-  metered-access profile: buy N calls in one settlement, spend them, refuse an overdraw.
+- `metering.py` / `saas_metering_demo.py`. Prepaid `CreditBundle` accounting: buy N calls in one
+  settlement, spend them, refuse an overdraw. The bundle is a local projection, not bound to the
+  Rust metered issuer, which stays authoritative on the installed rail.
 - `offchain_purchase_demo.py`. Compute, dataset or API purchases reusing the marketplace loop
   unchanged.
 - `demo.py` / `demo_mcp.py`, the two CLI entry points above.

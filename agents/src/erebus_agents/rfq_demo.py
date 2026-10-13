@@ -2,6 +2,8 @@
 
 The buyer publishes a request with a hidden ceiling, suppliers quote, the desk awards the
 cheapest valid quote, and the buyer negotiates and settles with the winner on the mock client.
+The buyer's budget for that negotiation is the awarded quote, not the hidden ceiling, so the
+settlement can never exceed what the winner quoted, and the audit checks exactly that.
 Only the winner's identity reaches the settlement path; losing quotes stay in the buyer's local
 record.
 """
@@ -23,7 +25,7 @@ from erebus_mcp.mock_client import MockErebusClient
 
 from erebus_agents.agent import run_negotiation
 from erebus_agents.procurement import Catalog, Requisition, buyer_policy, review_disclosure, supplier_policy
-from erebus_agents.rfq import AwardStatus, Quote, RequestForQuote, award
+from erebus_agents.rfq import AwardStatus, Quote, RequestForQuote, award, award_honored
 
 BUYER = "0xbuyer"
 ASSET = "0xusdc"
@@ -50,6 +52,7 @@ async def rehearse(rfq: RequestForQuote, quotes: tuple[Quote, ...], *, at: int, 
         "award": {"status": result.status.value,
                   "winner": result.winner.supplier if result.winner else None,
                   "unit_price": result.winner.unit_price if result.winner else None,
+                  "awarded_total": result.awarded_total,
                   "rejected": [{"supplier": supplier, "reason": reason}
                                for supplier, reason in result.rejected]},
     }
@@ -57,7 +60,9 @@ async def rehearse(rfq: RequestForQuote, quotes: tuple[Quote, ...], *, at: int, 
         record["settled"] = False
         return record
 
-    requisition = Requisition(rfq.item, rfq.quantity, rfq.max_unit_price)
+    # Bind the negotiation to the award: the buyer never offers above the winning quote, and the
+    # audit reviews the deal against that quote rather than the looser hidden ceiling.
+    requisition = Requisition(rfq.item, rfq.quantity, result.winner.unit_price)
     store = store_dir / "erebus-mock-store.json"
     buyer = MockErebusClient(identity=BUYER, store_path=store, latency_seconds=latency,
                              spendable_notes=[requisition.ceiling])
@@ -78,6 +83,7 @@ async def rehearse(rfq: RequestForQuote, quotes: tuple[Quote, ...], *, at: int, 
             requisition)
         record["agreed_amount"] = state.settlement.agreed_amount
         record["paid_amount"] = state.settlement.paid_amount
+        record["award_honored"] = award_honored(result, state.settlement.paid_amount)
         record["audit"] = {"compliant": review.compliant, "reasons": list(review.reasons)}
     return record
 

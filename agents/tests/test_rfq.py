@@ -4,7 +4,7 @@ import asyncio
 
 import pytest
 
-from erebus_agents.rfq import AwardStatus, Quote, RequestForQuote, award
+from erebus_agents.rfq import Award, AwardStatus, Quote, RequestForQuote, award, award_honored
 from erebus_agents.rfq_demo import default_quotes, rehearse
 
 AT = 1_000_000
@@ -20,6 +20,8 @@ def test_request_and_quote_validation():
         RequestForQuote("rfq", "item", 1, 1, 0)
     with pytest.raises(ValueError):
         Quote("0xa", "rfq", 0, AT + 1)
+    with pytest.raises(ValueError):
+        Quote("0xa", "rfq", 1, 0)
     assert RFQ.ceiling == 1200 and Quote("0xa", "rfq", 10, AT + 1).total(100) == 1000
 
 
@@ -33,6 +35,7 @@ def test_award_picks_the_cheapest_valid_quote_and_explains_the_rest():
     result = award(RFQ, quotes, at=AT)
     assert result.status is AwardStatus.AWARDED
     assert result.winner is not None and result.winner.supplier == "0xa"
+    assert result.awarded_total == 900
     reasons = dict(result.rejected)
     assert reasons == {"0xb": "outbid", "0xc": "unit price above the buyer's ceiling", "0xd": "quote expired"}
 
@@ -50,11 +53,27 @@ def test_award_reports_no_valid_quote():
     assert result.status is AwardStatus.NO_VALID_QUOTE and result.winner is None
 
 
-def test_rehearsal_settles_with_the_awarded_supplier(tmp_path):
+def test_nothing_is_awarded_after_the_request_deadline():
+    result = award(RFQ, (Quote("0xa", "rfq-1", 9, RFQ.deadline + 600),), at=RFQ.deadline + 1)
+    assert result.status is AwardStatus.REQUEST_CLOSED and result.winner is None
+    assert result.rejected == (("0xa", "request deadline passed"),)
+
+
+def test_award_honored_only_at_or_below_the_winning_quote():
+    result = award(RFQ, (Quote("0xa", "rfq-1", 9, AT + 60),), at=AT)
+    assert award_honored(result, 900) and award_honored(result, 850)
+    assert not award_honored(result, 901) and not award_honored(result, None)
+    assert not award_honored(Award(AwardStatus.NO_VALID_QUOTE, None), 1)
+
+
+def test_rehearsal_settles_with_the_awarded_supplier_at_the_quoted_price(tmp_path):
+    # Regression: the follow-up negotiation used to budget against the hidden ceiling and paid
+    # 960 on a winning quote of 9 x 100 = 900.
     record = asyncio.run(rehearse(RFQ, default_quotes(RFQ, AT), at=AT, store_dir=tmp_path))
     assert record["settled"] and record["award"]["winner"] == "0xatlas"
-    assert record["paid_amount"] == record["agreed_amount"] <= record["ceiling"]
-    assert record["audit"]["compliant"]
+    assert record["award"]["awarded_total"] == 900
+    assert record["paid_amount"] == record["agreed_amount"] == 900
+    assert record["award_honored"] and record["audit"]["compliant"]
 
 
 def test_rehearsal_stops_when_no_quote_is_valid(tmp_path):

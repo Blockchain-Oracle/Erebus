@@ -14,6 +14,7 @@ from erebus_agents.grant import BudgetGrant, GrantLedger, charge, summarize
 
 AT = 1_000_000
 ATLAS, AEGEAN, STRANGER = "0xatlas", "0xaegean", "0xstranger"
+OTHER_TOKEN = "0xweth"
 
 
 def default_grant() -> BudgetGrant:
@@ -24,16 +25,18 @@ def default_grant() -> BudgetGrant:
 
 def rehearse(grant: BudgetGrant, *, at: int = AT) -> dict[str, Any]:
     ledger = GrantLedger()
-    attempts = ((ATLAS, 300), (AEGEAN, 300), (ATLAS, 300), (ATLAS, 300), (ATLAS, 500), (STRANGER, 50))
+    attempts = ((ATLAS, grant.token, 300), (AEGEAN, grant.token, 300), (ATLAS, grant.token, 300),
+                (ATLAS, OTHER_TOKEN, 50), (ATLAS, grant.token, 300), (ATLAS, grant.token, 500),
+                (STRANGER, grant.token, 50))
     results = []
-    for counterparty, amount in attempts:
-        decision = charge(grant, ledger, amount=amount, counterparty=counterparty, at=at)
-        results.append({"counterparty": counterparty, "amount": amount, "allowed": decision.allowed,
-                        "code": decision.code, "message": decision.message})
-    expired = charge(grant, ledger, amount=10, counterparty=ATLAS, at=grant.expires_at + 1)
+    for counterparty, token, amount in attempts:
+        decision = charge(grant, ledger, token=token, amount=amount, counterparty=counterparty, at=at)
+        results.append({"counterparty": counterparty, "token": token, "amount": amount,
+                        "allowed": decision.allowed, "code": decision.code, "message": decision.message})
+    expired = charge(grant, ledger, token=grant.token, amount=10, counterparty=ATLAS, at=grant.expires_at + 1)
     summary = summarize(grant, ledger, draws=sum(1 for item in results if item["allowed"]))
     return {
-        "grant": {"grant_id": grant.grant_id, "sponsor": grant.sponsor, "agent": grant.agent,
+        "grant": {"grant_id": grant.grant_id, "sponsor": grant.sponsor, "agent": grant.agent, "token": grant.token,
                   "max_total": grant.max_total, "per_deal": grant.per_deal,
                   "allowed_counterparties": sorted(grant.allowed_counterparties)},
         "attempts": results,

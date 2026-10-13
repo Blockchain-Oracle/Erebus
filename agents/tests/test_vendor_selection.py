@@ -5,7 +5,14 @@ import asyncio
 import pytest
 
 from erebus_agents.procurement import Catalog, Requisition, buyer_policy, supplier_policy
-from erebus_agents.vendor_selection import VendorOutcome, negotiate_amount, select
+from erebus_agents.vendor_selection import (
+    PendingAgreement,
+    SelectionMismatch,
+    VendorOutcome,
+    negotiate_agreement,
+    select,
+    settle_selected,
+)
 from erebus_agents.vendor_selection_demo import CAPABILITY, rehearse
 
 AT = ("svc-atlas", "0xatlas", True, 64)
@@ -37,7 +44,7 @@ def test_select_reports_no_winner_when_nothing_qualifies():
     assert not selection.awarded and selection.winner is None
 
 
-def test_negotiate_amount_agrees_without_settling(tmp_path):
+def _agree(tmp_path):
     from erebus_mcp.mock_client import MockErebusClient
 
     requisition = Requisition(CAPABILITY, 10, 8)
@@ -45,17 +52,37 @@ def test_negotiate_amount_agrees_without_settling(tmp_path):
     buyer = MockErebusClient(identity="0xbuyer", store_path=store, latency_seconds=0.0,
                              spendable_notes=[requisition.ceiling])
     seller = MockErebusClient(identity="0xatlas", store_path=store, latency_seconds=0.0, spendable_notes=[])
-    amount = asyncio.run(negotiate_amount(
+    agreement = asyncio.run(negotiate_agreement(
         buyer_client=buyer, seller_client=seller, buyer_address="0xbuyer", seller_address="0xatlas",
         token="0xusdc", buyer_policy=buyer_policy("0xbuyer", requisition),
         seller_policy=supplier_policy("0xatlas", Catalog(CAPABILITY, 3), requisition)))
-    assert amount == 64
-    handle = asyncio.run(buyer.open_channel("0xatlas"))
-    assert asyncio.run(buyer.read_channel_state(handle)).settlement is None
+    return buyer, agreement
+
+
+def test_negotiate_agreement_agrees_without_settling(tmp_path):
+    buyer, agreement = _agree(tmp_path)
+    assert agreement is not None and agreement.amount == 64
+    assert asyncio.run(buyer.read_channel_state(agreement.buyer_handle)).settlement is None
+
+
+def test_settle_selected_pays_exactly_the_compared_offer(tmp_path):
+    buyer, agreement = _agree(tmp_path)
+    assert agreement is not None
+    state = asyncio.run(settle_selected(buyer, agreement))
+    assert state.settlement is not None and state.settlement.acceptance == agreement.offer_id
+    assert state.settlement.agreed_amount == state.settlement.paid_amount == agreement.amount
+
+
+def test_settle_selected_refuses_a_settlement_that_differs_from_the_selection(tmp_path):
+    buyer, agreement = _agree(tmp_path)
+    assert agreement is not None
+    inflated = PendingAgreement(agreement.buyer_handle, agreement.offer_id, agreement.amount - 1)
+    with pytest.raises(SelectionMismatch):
+        asyncio.run(settle_selected(buyer, inflated))
 
 
 def test_rehearsal_negotiates_with_all_and_pays_one(tmp_path):
     record = asyncio.run(rehearse(CAPABILITY, 10, 8, store_dir=tmp_path))
     assert [item["agreed_amount"] for item in record["negotiated"]] == [64, 70, None]
     assert record["selection"]["winner"] == "svc-atlas" and record["settled"]
-    assert record["paid_amount"] == 64 and record["audit"]["compliant"]
+    assert record["selected_amount"] == record["paid_amount"] == 64 and record["audit"]["compliant"]

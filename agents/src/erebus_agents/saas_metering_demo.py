@@ -4,6 +4,10 @@ The buyer negotiates and settles once for a bundle of N calls to a seller's reso
 consumes calls until the bundle is exhausted. Payment is the settlement; usage is the local
 credit accounting. The two are separate: an auditor verifies the payment from the disclosure
 grant, never the call count.
+
+The bundle here is created locally and is not bound to Rust's metered issuer or its
+entitlement records. On the installed rail, `erebus-access-service` serves the metered profile
+and its issuer is the authority on how many calls a settlement bought.
 """
 
 from __future__ import annotations

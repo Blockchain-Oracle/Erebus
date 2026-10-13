@@ -55,3 +55,27 @@ def test_ledger_accumulates_only_allowed_spends():
     assert ledger.spent("2026-10-14", TOKEN) == 0
     assert guard(POLICY, ledger, token=TOKEN, amount=300, counterparty=A, day=DAY).code == DAILY_EXCEEDED
     assert guard(POLICY, ledger, token=TOKEN, amount=100, counterparty=A, day="2026-10-14").code == ALLOWED
+
+
+def test_a_checksummed_token_key_still_caps_the_spend():
+    # Regression: an uncanonical key used to miss the lowercase lookup and fall through to uncapped.
+    checksummed = SpendingPolicy(by_token={"0xUSDC": TokenLimit(per_deal=10, daily=10)})
+    assert checksummed.limit_for("0xusdc") == TokenLimit(per_deal=10, daily=10)
+    assert evaluate(checksummed, token="0xUSDC", amount=10**9, counterparty=A).code == PER_DEAL_EXCEEDED
+    assert evaluate(checksummed, token="0xusdc", amount=10**9, counterparty=A).code == PER_DEAL_EXCEEDED
+
+
+def test_conflicting_limits_for_one_token_are_refused():
+    with pytest.raises(ValueError, match="twice"):
+        SpendingPolicy(by_token={"0xUSDC": TokenLimit(per_deal=10), "0xusdc": TokenLimit(per_deal=20)})
+
+
+def test_counterparty_allowlist_is_case_insensitive():
+    policy = SpendingPolicy(allowed_counterparties=frozenset({"0xAbC"}))
+    assert evaluate(policy, token=TOKEN, amount=1, counterparty="0xabc").allowed
+    assert evaluate(policy, token=TOKEN, amount=1, counterparty="0xabd").code == COUNTERPARTY_NOT_ALLOWED
+
+
+def test_ledger_refuses_a_nonpositive_record():
+    with pytest.raises(ValueError):
+        SpendLedger().record(DAY, TOKEN, -1)
