@@ -14,6 +14,7 @@ export function Snippet({
   label,
   highlight = false,
   accent = false,
+  glow = false,
 }: {
   command: string;
   label: string;
@@ -24,6 +25,9 @@ export function Snippet({
    *  treatment, which is reserved for the single most load-bearing command
    *  on the whole site. */
   accent?: boolean;
+  /** The accent rule with an ember glow spilling off its left edge, for the backend install
+   *  commands: louder than `accent`, quieter than the full `highlight` card. */
+  glow?: boolean;
 }) {
   const [copied, setCopied] = useState(false);
 
@@ -39,12 +43,14 @@ export function Snippet({
 
   const boxClass = highlight
     ? "install-card"
-    : accent
-      ? "border border-rule border-l-2"
-      : "border border-rule";
+    : glow
+      ? "border border-rule border-l-2 accent-glow"
+      : accent
+        ? "border border-rule border-l-2"
+        : "border border-rule";
 
   return (
-    <div className={boxClass} style={accent ? { borderLeftColor: "var(--color-ember)" } : undefined}>
+    <div className={boxClass} style={accent || glow ? { borderLeftColor: "var(--color-ember)" } : undefined}>
       <div
         className={`flex items-center justify-between px-4 py-2 ${
           highlight ? "border-b border-ember/40" : "border-b border-rule"

@@ -54,7 +54,7 @@ export function Backends() {
               ))}
             </ul>
 
-            <Snippet command={b.install} label={`install · ${b.chain.toLowerCase()}`} accent />
+            <Snippet command={b.install} label={`install · ${b.chain.toLowerCase()}`} glow />
 
             <div className="mt-auto flex flex-col gap-4">
               <p className="mono-xs m-0 max-w-[60ch] leading-relaxed text-fore-3">

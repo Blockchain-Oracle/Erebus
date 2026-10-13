@@ -440,6 +440,19 @@ input[type="range"]::-moz-range-thumb {
   box-shadow: 0 0 0 1px rgba(251, 64, 32, 0.18), 0 20px 60px -20px rgba(251, 64, 32, 0.45);
 }
 
+/* ── the accent glow. The install commands for each backend: an ember rule on
+   the left edge with light bleeding off it, so the two commands a reader came
+   for stand out without becoming a second install-card. ────────────────── */
+.accent-glow {
+  box-shadow: -1px 0 0 0 rgba(251, 64, 32, 0.45), -12px 0 28px -10px rgba(251, 64, 32, 0.8),
+    inset 14px 0 24px -18px rgba(251, 64, 32, 0.35);
+  transition: box-shadow 240ms;
+}
+.accent-glow:hover {
+  box-shadow: -1px 0 0 0 rgba(251, 64, 32, 0.6), -14px 0 34px -10px rgba(251, 64, 32, 0.95),
+    inset 16px 0 28px -18px rgba(251, 64, 32, 0.45);
+}
+
 /* ── the boundary mark. Same ember border language as install-card, sized
    down for one box in a call-path diagram instead of a whole card — this is
    the one edge in the chain that is enforced, not a convention. ──────────── */
