@@ -41,7 +41,32 @@ seller-authored offer.
   selects and exports one deal to the auditor's key, the auditor verifies the agreement and polls
   the payment check. It never reports delivery as verified. Evidence and grant files are
   create-new, so re-issuing takes fresh `--evidence-name`/`--grant-name` values. Also a CLI.
+- `marketplace.py` / `marketplace_demo.py`. A capability marketplace: a seller publishes a
+  `ServiceListing` into a file-backed `ServiceRegistry`, a buyer searches it, picks the cheapest
+  listing inside its ceiling, negotiates, pays once, and records the off-chain delivery. Delivery
+  state (`PENDING`/`DELIVERED`/`REFUNDED`/`DISPUTED`) is kept apart from settlement on purpose:
+  the protocol never proves delivery.
+- `paid_gateway.py` / `api_gateway_demo.py`. A runnable pay-per-call rehearsal. `LocalGateway`
+  models the `x402-exact` seller gateway; the demo drives the real production sequence
+  (`metropolis_loop.drive_x402_deal`) over it, so each call pays once and every retry reuses the
+  retained permit. For the installed rail, stand up `erebus-access-service` and drive it with
+  `metropolis_loop.py --profile x402-exact`. Standard x402 is public, never private.
+- `receipt_explorer.py`. Renders one disclosed deal as a private receipt, from an auditor report
+  or a rehearsal. It keeps agreement, payment and delivery distinct, refuses a receipt that claims
+  delivery verification, and exports text, JSON or a self-contained static HTML file. Also a CLI.
 - `demo.py` / `demo_mcp.py`, the two CLI entry points above.
+
+```bash
+# Marketplace: search, negotiate, settle, deliver, audit (mock rehearsal)
+uv run python agents/src/erebus_agents/marketplace_demo.py --latency 0
+
+# Paid API gateway: per-call private access over the x402-exact sequencing
+uv run python agents/src/erebus_agents/api_gateway_demo.py --calls 3
+
+# Receipt explorer: format a verification result an auditor already produced
+uv run python agents/src/erebus_agents/receipt_explorer.py --report audit.json \
+  --issuer <participant> --format text   # or --format html --out receipt.html
+```
 
 ## Where it sits
 
