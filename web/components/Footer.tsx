@@ -1,4 +1,4 @@
-import { SOURCE, X_HANDLE, doc } from "@/lib/content";
+import { SOURCE, X_HANDLE, doc, docMonad } from "@/lib/content";
 import { Section } from "./Chrome";
 import { FooterMark } from "./FooterMark";
 
@@ -10,8 +10,9 @@ export function Footer() {
           <div>
             <p className="label !text-fore mb-4 !tracking-[0.34em]">Erebus</p>
             <p className="prose m-0 max-w-[40ch]">
-              Private coordination and shielded settlement for AI agents on Starknet, built on
-              StarkWare&rsquo;s STRK20 pool. Apache-2.0.
+              Private coordination and shielded settlement for AI agents. Settles through
+              StarkWare&rsquo;s STRK20 pool on Starknet and Erebus&rsquo;s own shielded pools on
+              Monad. Apache-2.0.
             </p>
           </div>
 
@@ -19,11 +20,11 @@ export function Footer() {
             <p className="label mb-4">Read</p>
             <ul className="m-0 list-none space-y-2 p-0">
               {[
-                ["status.md", doc("docs/status.md")],
+                ["status.md · Starknet", doc("docs/status.md")],
                 ["privacy-model.md", doc("docs/privacy-model.md")],
-                ["threat-model.md", doc("docs/metropolis-threat-model.md")],
+                ["metropolis-status.md · Monad", docMonad("docs/metropolis-status.md")],
+                ["metropolis-threat-model.md", docMonad("docs/metropolis-threat-model.md")],
                 ["friction.md", doc("docs/friction.md")],
-                ["runbook.md", doc("docs/runbook.md")],
               ].map(([label, href]) => (
                 <li key={label}>
                   <a
@@ -66,7 +67,7 @@ export function Footer() {
 
         <div className="mono-xs mt-12 flex flex-wrap justify-between gap-4 border-t border-rule pt-5 text-fore-3">
           <span>Apache-2.0. Unaudited and experimental.</span>
-          <span>Built on Starknet and STRK20</span>
+          <span>Settles on Starknet (STRK20) and Monad</span>
         </div>
       </Section>
 

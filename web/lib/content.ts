@@ -8,12 +8,20 @@
  *   docs/runs/v0.2-mainnet-canary.json
  *   agents/src/erebus_agents/demo.py . the replay
  *   README.md ........................ install and the MCP tool surface
+ *   docs/metropolis-status.md ........ (metropolis branch) Monad release, qualification, live evidence
+ *   docs/metropolis-install.md ....... (metropolis branch) the published Monad install
+ *   scripts/metropolis-demo-readonly.py  Monad pool addresses, runtime pins, the WMON payment, limits
  */
 
 export const SOURCE = "https://github.com/PoulavBhowmick03/Erebus";
 export const X_HANDLE = "https://x.com/Erebus_pvt";
 export const doc = (p: string) => `${SOURCE}/blob/main/${p}`;
 export const starkscan = (h: string) => `https://starkscan.co/tx/${h}`;
+export const docMonad = (p: string) => `${SOURCE}/blob/metropolis/${p}`;
+export const monadTx = (h: string) => `https://testnet.monadexplorer.com/tx/${h}`;
+export const monadAddress = (a: string) => `https://testnet.monadexplorer.com/address/${a}`;
+export const MONAD_RELEASE = "https://github.com/PoulavBhowmick03/erebus-metropolis/releases/tag/v0.3.0.dev2026101307";
+export const MONAD_QUALIFICATION = "https://github.com/PoulavBhowmick03/Erebus/actions/runs/38431534413";
 
 /* ── System map · README.md, docs/assets/erebus-overview.excalidraw.svg ──── */
 
@@ -25,6 +33,94 @@ export const SYSTEM_MAP_ALT =
 export const INSTALL = `uv tool install --python 3.12 \\
   --extra-index-url https://poulavbhowmick03.github.io/Erebus/simple \\
   erebus-mcp-server`;
+
+/* ── Monad install · docs/metropolis-install.md §10 (metropolis branch) ──── */
+
+export const INSTALL_MONAD = `uv venv --python 3.11 erebus-metropolis
+uv pip install --python erebus-metropolis/bin/python \\
+  --index https://poulavbhowmick03.github.io/erebus-metropolis/simple/ \\
+  --default-index https://pypi.org/simple --index-strategy first-index \\
+  "erebus-mcp-server==0.3.0.dev2026101307"`;
+
+/* ── Two settlement backends · README.md, docs/metropolis-status.md ──────── */
+
+export type Backend = {
+  chain: string;
+  network: string;
+  pool: string;
+  summary: string;
+  facts: string[];
+  release: string;
+  install: string;
+  docs: string;
+  limits: string;
+};
+
+export const BACKENDS: Backend[] = [
+  {
+    chain: "Starknet",
+    network: "mainnet",
+    pool: "StarkWare's STRK20 privacy pool",
+    summary:
+      "Negotiation rides in the pool's own note salts, so Erebus deploys no contract. The accepted offer and the shielded payment land in one atomic pool transaction.",
+    facts: [
+      "Bounded mainnet workflows settled through MCP, including Claude Code buying from Codex",
+      "Deal-scoped viewing grants: one deal, one recipient",
+      "Rust write client with durable operation ids and reconciliation",
+    ],
+    release: "v0.3.0 · Protocol 5",
+    install: INSTALL,
+    docs: "https://docs.erebusagents.live/#install",
+    limits: "Unaudited. The counterparty address appears in public calldata at channel-open.",
+  },
+  {
+    chain: "Monad",
+    network: "testnet",
+    pool: "Erebus shielded pools for WMON and USDC",
+    summary:
+      "A canonical agreement separates negotiation from settlement. Agents pay through Erebus's own EVM shielded pools, with a public-bound mode and an x402 access rail alongside.",
+    facts: [
+      "Published release 0.3.0.dev2026101307, qualified on macOS and Linux",
+      "WMON and USDC shielded pools deployed on Monad testnet, code pinned to the release",
+      "Shielded WMON payment on testnet; payment recovery and scoped auditor verification",
+    ],
+    release: "0.3.0.dev2026101307",
+    install: INSTALL_MONAD,
+    docs: "https://docs.erebusagents.live/monad",
+    limits:
+      "Test-only, single operator, unaudited. The gas sender, funding and withdrawals are public, and fresh wallets must catch up on pool history first.",
+  },
+];
+
+/* ── Monad testnet evidence · scripts/metropolis-demo-readonly.py,
+   docs/metropolis-status.md ───────────────────────────────────────────────── */
+
+export const MONAD_EVIDENCE = [
+  {
+    action: "WMON shielded pool",
+    kind: "address" as const,
+    hash: "0x8868f35140f3602c80e2c76132740b6f0c0b409d",
+    detail: "runtime code matches the release pin",
+  },
+  {
+    action: "USDC shielded pool",
+    kind: "address" as const,
+    hash: "0x863f540471c0ad33c68d1218f31e8c9fe9cd50fb",
+    detail: "runtime code matches the release pin",
+  },
+  {
+    action: "Shielded WMON payment",
+    kind: "tx" as const,
+    hash: "0xe01666d8c4e16efe8195da8047674c71a325ee20ff250f02f4fdf570a04934fa",
+    detail: "2026-10-11 · block 69939428 · no amount in the receipt",
+  },
+  {
+    action: "x402 access payment",
+    kind: "tx" as const,
+    hash: "0x8a0272e69188ac3be52783ddfc4d4436496a58f2d5c63d808cd3320a1fa5df43",
+    detail: "2026-10-04 · public x402 rail · auditor verified",
+  },
+] as const;
 
 /* ── Evidence manifest · the 0.6/0.4 canary, all fees are receipt amounts ── */
 
@@ -100,7 +196,8 @@ export const DISCLOSURE = [
   { who: "Viewing-grant holder", terms: "Readable for one deal" },
 ] as const;
 
-/* ── Three measured lines · docs/metropolis-threat-model.md §4 ─────────────────────── */
+/* ── Three measured lines · docs/threat-model.md M1–M4 (Starknet wire; removed from
+   main in 24fcb06, last at 70e67c5) ───────────────────────────────────────── */
 
 export const OBSERVER = [
   {
@@ -110,9 +207,9 @@ export const OBSERVER = [
     bad: true,
   },
   {
-    k: "M2 · wire v3 classifier",
+    k: "M2 · exact-vs-change bit",
     v: "0.5008",
-    note: "chance, on the same 10,000 negatives",
+    note: "chance: wire v3 always creates seven notes on settlement",
     bad: false,
   },
   {
@@ -130,7 +227,11 @@ export type NonClaim = { title: string; body: string };
 export const NON_CLAIMS: NonClaim[] = [
   {
     title: "Not production ready",
-    body: "Two mainnet workflows passed. That is not capacity, uptime, or an independent security review.",
+    body: "Bounded Starknet mainnet workflows and Monad testnet payments passed. That is not capacity, uptime, or an independent security review.",
+  },
+  {
+    title: "Monad is test-only",
+    body: "The Monad pools are a single-operator testnet deployment. A fresh wallet must catch up on pool history before its first private operation.",
   },
   {
     title: "Disclosure cannot be undone",
@@ -138,7 +239,7 @@ export const NON_CLAIMS: NonClaim[] = [
   },
   {
     title: "No escrow or deferred delivery",
-    body: "Settlement is atomic, so there is no agree-now-deliver-later. The pool has no timelock and no conditional release.",
+    body: "Payment verification is not proof of delivery. Neither backend offers a timelock, escrow, or conditional release.",
   },
 ];
 

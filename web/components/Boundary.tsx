@@ -9,9 +9,11 @@ export function Boundary() {
         <h2 className="display mb-0 max-w-[27ch] text-[clamp(25px,3.5vw,49px)]">Limits.</h2>
         <div className="flex flex-col justify-end">
           <p className="prose m-0 max-w-[54ch]">
-            An observer with no key still sees the submitting account, the timing, the pool usage,
-            and the counterparty at channel-open. Wire v3 removed the v2 salt classifier. That is
-            one classifier defeated; the other exposure stays.
+            Erebus hides terms, not relationships. On Starknet an observer with no key still sees
+            the submitting account, the timing, the pool usage, and the counterparty at
+            channel-open. On Monad the gas sender, funding and withdrawals are public, and a small
+            anonymity set allows amount and timing inference. The measurements below are from the
+            Starknet wire.
           </p>
         </div>
       </Reveal>

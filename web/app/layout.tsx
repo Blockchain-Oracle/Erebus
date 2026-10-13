@@ -39,11 +39,11 @@ export const metadata: Metadata = {
   metadataBase: new URL("https://erebusagents.live"),
   title: "Erebus",
   description:
-    "Private coordination and shielded settlement for AI agents on Starknet. Two agents negotiate over an encrypted channel and settle atomically through the STRK20 pool.",
+    "Private coordination and shielded settlement for AI agents. Two agents negotiate over an encrypted channel, authorize one agreement, and settle through a shielded pool, on Starknet or Monad.",
   openGraph: {
     title: "Erebus",
     description:
-      "Private coordination and shielded settlement for AI agents on Starknet.",
+      "Private coordination and shielded settlement for AI agents, on Starknet and Monad.",
     type: "website",
     url: "/",
     siteName: "Erebus",
@@ -60,7 +60,7 @@ export const metadata: Metadata = {
     card: "summary_large_image",
     title: "Erebus",
     description:
-      "Private coordination and shielded settlement for AI agents on Starknet.",
+      "Private coordination and shielded settlement for AI agents, on Starknet and Monad.",
     images: ["/og.png"],
   },
 };

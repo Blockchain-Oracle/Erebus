@@ -25,6 +25,7 @@ export function Section({
 }
 
 const NAV = [
+  { href: "#backends", label: "Backends" },
   { href: "#proof", label: "Proof" },
   { href: "#how", label: "How it works" },
   { href: "#limits", label: "Limits" },

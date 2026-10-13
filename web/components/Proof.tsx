@@ -1,4 +1,13 @@
-import { MANIFEST, MANIFEST_TOTALS, starkscan } from "@/lib/content";
+import {
+  MANIFEST,
+  MANIFEST_TOTALS,
+  MONAD_EVIDENCE,
+  MONAD_QUALIFICATION,
+  MONAD_RELEASE,
+  monadAddress,
+  monadTx,
+  starkscan,
+} from "@/lib/content";
 import { Section } from "./Chrome";
 import { Reveal } from "./Reveal";
 
@@ -9,16 +18,18 @@ export function Proof() {
     <Section id="proof" className="pt-24 md:pt-32">
       <Reveal className="section-head">
         <h2 className="display mb-0 max-w-[27ch] text-[clamp(25px,3.5vw,49px)]">
-          The mainnet run.
+          Evidence on both chains.
         </h2>
         <div className="flex flex-col justify-end">
           <p className="prose m-0 max-w-[54ch]">
-            Two screened 1 STRK canaries settled through MCP on Starknet mainnet on 2026-08-31, at
-            0.8/0.2 and 0.6/0.4 payment/change splits. Public walkthrough of the complete mainnet
-            workflow. Every fee below is the receipt amount.
+            Every hash below opens in a public explorer. Starknet: two screened 1 STRK canaries
+            settled through MCP on mainnet on 2026-08-31, at 0.8/0.2 and 0.6/0.4 payment/change
+            splits, every fee the receipt amount. Monad: the deployed pools and testnet payments.
           </p>
         </div>
       </Reveal>
+
+      <p className="label mt-14 mb-0">Starknet mainnet · STRK20 pool</p>
 
       <Reveal className="mt-12" delay={80}>
         <video
@@ -65,6 +76,44 @@ export function Proof() {
         {MANIFEST_TOTALS.poolFee} on top of the network fee. Network{" "}
         <span className="text-fore-2">{MANIFEST_TOTALS.network}</span>, pool{" "}
         <span className="text-fore-2">{MANIFEST_TOTALS.pool}</span>.
+      </p>
+
+      <p className="label mt-20 mb-0">Monad testnet · Erebus shielded pools</p>
+      <div className="mt-6 overflow-x-auto">
+        <ol className="m-0 flex min-w-[820px] list-none gap-px border-t border-rule p-0">
+          {MONAD_EVIDENCE.map((r, i) => (
+            <li
+              key={r.hash}
+              className="group flex-1 border-b border-rule py-5 pr-6 transition-colors hover:border-b-rule-2"
+            >
+              <p className="mono-xs m-0 mb-3 flex items-baseline gap-2 uppercase tracking-[0.14em] text-fore-3 transition-colors group-hover:text-fore-2">
+                <span>{String(i + 1).padStart(2, "0")}</span>
+                <span>{r.action}</span>
+              </p>
+              <a
+                href={r.kind === "tx" ? monadTx(r.hash) : monadAddress(r.hash)}
+                className="mono-sm tnum inline-flex items-center gap-1 text-fore-2 underline decoration-rule-2 underline-offset-[5px] transition-all group-hover:decoration-fore hover:text-fore"
+              >
+                {short(r.hash)}
+                <span className="inline-block transition-transform group-hover:translate-x-0.5">↗</span>
+              </a>
+              <p className="mono-xs m-0 mt-3 max-w-[30ch] leading-relaxed text-fore-3">{r.detail}</p>
+            </li>
+          ))}
+        </ol>
+      </div>
+
+      <p className="mono-xs mt-4 max-w-[74ch] leading-relaxed text-fore-3">
+        Packages:{" "}
+        <a href={MONAD_RELEASE} className="text-fore-2 underline decoration-rule-2 underline-offset-[5px] hover:text-fore">
+          release 0.3.0.dev2026101307 ↗
+        </a>{" "}
+        ·{" "}
+        <a href={MONAD_QUALIFICATION} className="text-fore-2 underline decoration-rule-2 underline-offset-[5px] hover:text-fore">
+          native macOS and Linux qualification ↗
+        </a>
+        . Testnet only, single operator, unaudited. The shielded WMON payment used source-built
+        commands; the receipt shows pool events and the public gas sender, not the amount.
       </p>
     </Section>
   );

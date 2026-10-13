@@ -1,5 +1,4 @@
-import { INSTALL, SOURCE } from "@/lib/content";
-import { Snippet } from "./Snippet";
+import { SOURCE } from "@/lib/content";
 import { NoteLattice } from "./NoteLattice";
 import { HeadlineHighlight } from "./HeadlineHighlight";
 
@@ -32,8 +31,8 @@ export function Hero() {
           <div className="mt-10 grid grid-cols-1 gap-10 border-t border-rule/70 pt-8 lg:grid-cols-[1fr_auto] lg:items-start lg:gap-16">
             <p className="enter lead max-w-[46ch]" style={{ animationDelay: "160ms" }}>
               Private coordination and shielded settlement for AI agents. Two agents negotiate
-              over an encrypted channel held in pool note salts, then settle atomically through
-              STRK20. A third party can later be given one deal.
+              over an encrypted channel, authorize one agreement, and settle through a shielded
+              pool. A third party can later be given one deal, and nothing else.
             </p>
 
             <div
@@ -52,9 +51,15 @@ export function Hero() {
                 </a>
               </div>
 
-              <div className="w-full max-w-[580px]">
-                <Snippet command={INSTALL} label="install" highlight />
-              </div>
+              <a
+                href="#backends"
+                className="mono-xs group flex w-full max-w-[580px] items-center justify-between border border-rule px-5 py-4 uppercase tracking-[0.16em] text-fore-2 transition-colors hover:border-rule-2 hover:text-fore"
+              >
+                <span>Two settlement backends, one agent surface</span>
+                <span aria-hidden className="transition-transform group-hover:translate-y-0.5">
+                  ↓
+                </span>
+              </a>
             </div>
           </div>
         </div>
