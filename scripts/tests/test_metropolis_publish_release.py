@@ -70,6 +70,19 @@ def platform_dir(artifacts: Path, platform: str, binaries: set[str]) -> Path:
                            "deployment_coverage": {"complete": True, "pools": [{"pool": n, "proved": True} for n in PINS]}}}
     for gate, flag in publish.REHEARSALS.items():
         reports[gate] = {**base, flag: True}
+    bound = {**base, "source_commit": release["source_commit"]}
+    digests = {name: entry["sha256"] for name, entry in release["binaries"].items()}
+    deal = {"payment_verified_by_recovery": True, "settlement_broadcasts": 1, "delivery": {"resource_verified": True},
+            "auditor": {"payment_verified": True}}
+    reports["workflow"] = {**bound, "pins_mode": "prepublication",
+                           "installed_binaries_sha256": {n: digests[n] for n in ("erebus-negotiate", "erebus-payment", "erebus-wallet")
+                                                         if n in digests} or digests,
+                           "pools": {name: {"main": {"deal": deal}} for name in PINS}}
+    reports["relayer"] = {**bound, "service": "installed-binary", "in_process": False,
+                          "installed_binaries_sha256": {n: digests[n] for n in ("erebus-shielded-relayer",) if n in digests} or digests,
+                          "gate_complete": True, "coverage_gaps": [],
+                          "checks": {check: {"passed": True, "scope": f"{check} scope", "test": f"{check}_test"}
+                                     for check in publish.RELAYER_CHECKS}}
     for gate, report in reports.items():
         (root / "qualification" / f"{gate}.json").write_text(json.dumps(report))
     for name, pin in PINS.items():
@@ -102,7 +115,8 @@ def test_fully_qualified_artifacts_pass_and_keep_their_labels(artifacts):
 
 
 def test_binary_inventory_comes_from_the_builder_not_a_fixed_count(artifacts):
-    assert "erebus-shielded-disclosure" in publish.expected_binaries() and len(publish.expected_binaries()) == 15
+    assert {"erebus-shielded-disclosure", "erebus-shielded-relayer"} <= publish.expected_binaries()
+    assert len(publish.expected_binaries()) == 16
     edit(artifacts / "metropolis-registry-linux-x86_64/release.json", lambda r: r["binaries"].pop("erebus-relay"))
     assert "not the build inventory" in problems(artifacts)
 
@@ -119,6 +133,9 @@ def test_binary_inventory_comes_from_the_builder_not_a_fixed_count(artifacts):
     ("x402", lambda r: r.update(status="failed"), "x402 qualification did not verify"),
     ("assets", lambda r: r.update(release_json_sha256="0" * 64), "different release.json"),
     ("assets", lambda r: r["claims"].update(live_payment=True), "claims a live payment"),
+    ("assets", lambda r: r.update(publication_evidence=False), "never publication evidence"),
+    ("install", lambda r: r.update(rehearsal=True), "never publication evidence"),
+    ("x402", lambda r: r.update(labels=["test-only", "rehearsal-pins"]), "never publication evidence"),
 ])
 def test_each_missing_gate_blocks_publication(artifacts, gate, change, message):
     edit(artifacts / f"metropolis-registry-macos-arm64/qualification/{gate}.json", change)
@@ -166,3 +183,35 @@ def test_the_named_run_must_be_the_successful_qualification_of_this_commit():
     failed["jobs"][3]["conclusion"] = "success"
     found = " ".join(publish.check_run("1", "5" * 40, lambda: failed))
     assert "linux-x86_64 did not succeed" in found and "must not have published" in found
+
+
+@pytest.mark.parametrize("gate,change,message", [
+    ("workflow", None, "missing workflow report"),
+    ("relayer", None, "missing relayer report"),
+    ("workflow", lambda r: r.update(release_json_sha256="0" * 64), "stale or for other packages"),
+    ("relayer", lambda r: r.update(source_commit="6" * 40), "stale or for other packages"),
+    ("workflow", lambda r: r.update(pins_mode="rehearsal"), "not pinned to this authorized version"),
+    ("workflow", lambda r: r.update(rehearsal=True, publication_evidence=False), "never publication evidence"),
+    ("workflow", lambda r: r["claims"].update(native_platform_qualification=False), "native hosted runner"),
+    ("workflow", lambda r: r["pools"].pop("usdc"), "exactly the authorized pools"),
+    ("workflow", lambda r: r["pools"]["wmon"]["main"]["deal"].update(settlement_broadcasts=2), "payment, delivery and audit"),
+    ("workflow", lambda r: r["installed_binaries_sha256"].update({"erebus-wallet": "0" * 64}), "bind the installed binaries"),
+    ("relayer", lambda r: r.update(service="in-process", in_process=True), "did not drive the installed binary"),
+    ("relayer", lambda r: r["checks"]["no_direct_fallback"].update(passed=False), "missing no_direct_fallback"),
+    ("relayer", lambda r: r["checks"].update(no_direct_fallback=True), "missing no_direct_fallback"),
+    ("relayer", lambda r: r["checks"]["submit"].update(scope=""), "missing submit"),
+    ("relayer", lambda r: r["checks"].pop("installed_payment_delegation"), "missing installed_payment_delegation"),
+    ("relayer", lambda r: r["checks"]["installed_payment_delegation"].update(
+        test="buyer_transport_delegates_to_the_installed_binary_and_never_signs_directly"), "only at the transport level"),
+    ("relayer", lambda r: r.update(gate_complete=False, coverage_gaps=["installed_payment_delegation"]), "coverage gaps"),
+    ("relayer", lambda r: r.update(release_json_sha256="0" * 64), "stale or for other packages"),
+    ("relayer", lambda r: r["installed_binaries_sha256"].update({"erebus-shielded-relayer": "0" * 64}), "bind the installed binaries"),
+    ("relayer", lambda r: r.update(status="failed"), "relayer report did not verify"),
+])
+def test_feature_gates_must_be_present_native_and_bound_to_these_packages(artifacts, gate, change, message):
+    path = artifacts / f"metropolis-registry-linux-x86_64/qualification/{gate}.json"
+    if change is None:
+        path.unlink()
+    else:
+        edit(path, change)
+    assert message in problems(artifacts)

@@ -452,6 +452,52 @@ failure is reported separately from its network-check verdict.
 
 Native CI for this candidate and any release need `ab6dc3b` on the remote and a new authorization.
 
+### Candidate onboarding before publication (rehearsal pins)
+
+`pins --version` accepts only a published release, and `init` refuses installed binaries that differ from it.
+To qualify an unpublished candidate's installed onboarding, pin it offline:
+
+```sh
+"$B/erebus-init" --metropolis pins --directory ./rehearsal-pins \
+  --rehearsal-release <registry>/release.json --rehearsal-release-sha256 <its SHA-256> \
+  --authorized-pins ./pins          # an existing `pins --version` directory of the published release
+```
+
+- The candidate `release.json` must match the given digest, be unpublished, and record exactly the authorized
+  hosting manifests. Installed binaries are then checked against the candidate's own hashes.
+- The authorization, publisher, signed hosting manifests and deployment record are copied byte for byte from
+  `--authorized-pins`; nothing is substituted. A rehearsal directory is refused as `--authorized-pins`.
+- The pins directory holds `rehearsal.json` and `candidate-release.json`, never `release-manifest.json`.
+  Every `operator.json`, `doctor` report and auditor directory made from it carries `rehearsal`,
+  `publication_evidence: false` and the `rehearsal-pins` / `not-publication-evidence` labels.
+  `publish-metropolis-release.py` refuses any report marked this way.
+
+Native qualification of a version the owner has already authorized uses ordinary, non-rehearsal pins built
+offline: `pins --prepublication-release <release.json> --prepublication-release-sha256 <digest> --authorization
+packaging/metropolis/testnet-release.json --authorized-pins ./pins`. The authorization must name exactly the
+candidate's version, and the candidate must come from a clean, release-eligible tree and record exactly the
+authorized hosting manifests. Signed manifests are taken from `--authorized-pins` and checked by hash.
+
+Buyer retrieval through the MCP server is generated too. The seller's `connect` writes `share/service.json`
+(the access service identity). The buyer's `connect --service-url https://<host>/v1/access` pins that
+identity and adds the `EREBUS_ACCESS_*` settings and an owner-only `access-cache/` to `mcp.json`. Plain HTTP
+is accepted only to a loopback host and only with `--allow-loopback-access-http`.
+
+`scripts/rehearse-metropolis-workflow.py --registry DIR --version V --authorized-pins DIR --work NEW` is the
+installed two-agent workflow gate. It installs the candidate outside the checkout and runs under that
+environment's Python only. It then starts Anvil on 127.0.0.1 with chain id 10143 and replays the six signed
+production deployment transactions, so pools and verifiers have their production addresses and runtime hashes,
+and the signed manifests apply unchanged. The two asset addresses hold the repository's MockWMON and MockERC20
+code, not canonical WMON or Circle USDC. Operators come from installed `erebus-init` only; fixture keys stay in
+the work directory; every endpoint is loopback. It does not cover sponsored relaying.
+
+`publish-metropolis-release.py` now also requires, per platform, `qualification/workflow.json` from this
+script (prepublication or published pins, every authorized pool) and `qualification/relayer.json` from a funded
+installed-relayer run. Each must be verified, native, and bound to this `release.json`, its source commit and
+the installed binary hashes. A missing, stale, rehearsal, failed or in-process report blocks publication.
+Native CI does not produce either report yet: it needs the signed deployment transactions
+(`--deployment-journal`, today only in the local `.local` journal) and a CI job running both gates.
+
 ### Verify a public installation
 
 `scripts/check-metropolis-public-install.py --version V --authorization packaging/metropolis/testnet-release.json

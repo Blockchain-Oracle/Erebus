@@ -2,6 +2,9 @@
 """One-step operator setup for a published Metropolis release. Never broadcasts; never reads key contents.
 
     operator_init.py pins    --version V --directory NEW
+    operator_init.py pins    --directory NEW --rehearsal-release FILE --rehearsal-release-sha256 HEX --authorized-pins DIR
+    operator_init.py pins    --directory NEW --prepublication-release FILE --prepublication-release-sha256 HEX
+                             --authorization FILE --authorized-pins DIR
     operator_init.py init    --role buyer|seller --pool wmon|usdc --directory NEW --bin DIR --pins DIR
                              --deployment FILE --endpoint HOST:PORT --rpc-url URL --peer-rpc-url URL
                              --signer-address 0x.. [--transaction-key-file PATH] [--maximum-price N]
@@ -16,6 +19,10 @@
 `pins` downloads, over HTTPS only, the package release's `release-manifest.json`, the owner authorization and
 deployment record at that release's source commit, and every authorized pool's hosting manifest and signature,
 and checks the manifests against the authorization. Its output directory is the `--pins` input of `init`.
+Two offline forms never download anything. `--rehearsal-release` qualifies an unpublished candidate's onboarding
+against an existing published authorization; everything made from it is labelled as a rehearsal and is never
+publication evidence. `--prepublication-release` is for native qualification of a clean candidate whose version
+the committed owner authorization already names.
 
 `init` checks the installed commands against the release manifest's hashes for this platform and pins the
 publisher-signed hosting manifest of the chosen pool (from a `--pins` directory holding
@@ -111,9 +118,54 @@ def wheel_tag() -> str:
     raise ValueError("published releases support macOS arm64 and Linux x86_64 only")
 
 
+REHEARSAL_MARKER = "rehearsal.json"
+REHEARSAL_LABELS = ["rehearsal-pins", "not-publication-evidence"]
+
+
+def authorized_pool_files(pins: Path, authorization: dict) -> dict:
+    """Every authorized pool's hosting manifest and signature envelope in a pins directory, checked by hash."""
+    manifests = authorization.get("hosting_manifests") or {}
+    if not manifests or not ADDRESS.fullmatch(str(authorization.get("publisher", ""))):
+        raise ValueError("the release authorization must pin a publisher and every hosting manifest")
+    files = {}
+    for pool, pin in sorted(manifests.items()):
+        manifest, signature = pins / f"manifest-{pool}.json", pins / f"manifest-{pool}.signature.json"
+        if manifest.is_symlink() or signature.is_symlink() or sha256(manifest) != pin:
+            raise ValueError(f"{pool}: the hosting manifest does not match the release authorization")
+        envelope = json.loads(signature.read_text())
+        if not isinstance(envelope, dict) or str(envelope.get("manifest_sha256", "")).removeprefix("0x") != pin:
+            raise ValueError(f"{pool}: the signature envelope is not for its pinned hosting manifest")
+        files[manifest.name], files[signature.name] = manifest.read_bytes(), signature.read_bytes()
+    return files
+
+
+def rehearsal_release(pins: Path, authorization: dict) -> tuple[dict, dict]:
+    """A rehearsal pins directory's candidate release, checked against its marker and the authorization.
+
+    The candidate's `release.json` stays byte-exact; it is wrapped here in the published manifest's shape so the
+    same installed-binary check applies. The publisher, signatures and hosting manifests are the authorization's."""
+    marker = json.loads((pins / REHEARSAL_MARKER).read_text())
+    candidate_bytes = (pins / "candidate-release.json").read_bytes()
+    candidate = json.loads(candidate_bytes)
+    if (marker.get("rehearsal") is not True or marker.get("publication_evidence") is not False
+            or hashlib.sha256(candidate_bytes).hexdigest() != marker.get("candidate_release_sha256")
+            or candidate.get("version") != marker.get("candidate_version")
+            or authorization.get("package_version") != marker.get("authorization_package_version")):
+        raise ValueError("the rehearsal pins do not match their marker; create them again with `pins --rehearsal-release`")
+    domains = {str(domain.get("manifest_sha256")) for domain in candidate.get("proving_domains") or []}
+    if domains != set((authorization.get("hosting_manifests") or {}).values()):
+        raise ValueError("the candidate release does not record exactly the authorized hosting manifests")
+    release = {"version": candidate["version"], "source_commit": candidate.get("source_commit"),
+               "platforms": {candidate.get("platform", "candidate"): candidate}}
+    return release, marker
+
+
 def release_pins(pins: Path, pool: str) -> dict:
     """The authorized hosting manifest, signature and publisher for one pool, checked against each other."""
     authorization = json.loads((pins / "testnet-release.json").read_text())
+    rehearsal = (pins / REHEARSAL_MARKER).exists()
+    if rehearsal and (pins / "release-manifest.json").exists():
+        raise ValueError("a pins directory is either published or rehearsal, never both")
     manifest = pins / f"manifest-{pool}.json"
     signature = pins / f"manifest-{pool}.signature.json"
     expected = (authorization.get("hosting_manifests") or {}).get(pool)
@@ -127,11 +179,16 @@ def release_pins(pins: Path, pool: str) -> dict:
         # The installed erebus-artifacts verifies the signature itself before accepting any artifact byte; this only
         # catches a pins directory whose signature belongs to another manifest.
         raise ValueError("the pool's signature envelope is not for its pinned hosting manifest")
-    release = json.loads((pins / "release-manifest.json").read_text())
-    if release.get("version") != authorization.get("package_version"):
-        raise ValueError("the release manifest is not the authorized package version")
+    marker = None
+    if rehearsal:
+        release, marker = rehearsal_release(pins, authorization)
+    else:
+        release = json.loads((pins / "release-manifest.json").read_text())
+        if release.get("version") != authorization.get("package_version"):
+            raise ValueError("the release manifest is not the authorized package version")
     return {"manifest": manifest, "manifest_sha256": expected, "signature": json.loads(signature.read_text()),
-            "publisher": publisher, "release": release, "test_only": json.loads(manifest.read_text()).get("test_only")}
+            "publisher": publisher, "release": release, "test_only": json.loads(manifest.read_text()).get("test_only"),
+            "rehearsal": marker}
 
 
 def verify_installed(bins: Path, release: dict) -> dict:
@@ -150,6 +207,9 @@ def verify_installed(bins: Path, release: dict) -> dict:
     return checked
 
 
+NATIVE_STATUSES = ("ok", "error", "pending")
+
+
 def command(bins: Path, name: str, request: dict, cwd: Path) -> dict:
     result = subprocess.run([str(bins / name)], input=json.dumps(request), capture_output=True, text=True,
                             cwd=cwd, timeout=120, check=False,
@@ -159,7 +219,10 @@ def command(bins: Path, name: str, request: dict, cwd: Path) -> dict:
     except ValueError:
         reply = {}
     if result.returncode != 0 or reply.get("status") != "ok":
-        raise ValueError(f"{name} {request.get('method')} refused: {reply.get('error', 'no reply')}")
+        # Fixed text only: the native reply's own fields are never echoed (see docs/metropolis-leakage-review.md).
+        status = reply.get("status") if reply.get("status") in NATIVE_STATUSES else "unreadable"
+        raise ValueError(f"{name} {request.get('method')} refused (exit {result.returncode}, status {status}); "
+                         f"run the installed {name} directly to see its error")
     return reply
 
 
@@ -192,7 +255,127 @@ def https(url: str, opener=None) -> bytes:
     return data
 
 
+def rehearsal_pins(args) -> dict:
+    """Offline pins for qualifying an unpublished candidate's installed onboarding. Never publication evidence.
+
+    Requires the candidate's exact `release.json` (by SHA-256) and an existing published pins directory; the
+    authorization, publisher, signed hosting manifests and deployment record are copied from it unchanged, never
+    substituted. Every file written and every operator initialized from it is labelled as a rehearsal."""
+    directory = args.directory.resolve()
+    if directory.exists():
+        raise ValueError("use a new pins directory")
+    if args.rehearsal_release_sha256 is None or not HEX64.fullmatch(args.rehearsal_release_sha256):
+        raise ValueError("--rehearsal-release needs --rehearsal-release-sha256 (the candidate release.json digest)")
+    if args.authorized_pins is None:
+        raise ValueError("--rehearsal-release needs --authorized-pins: a directory from `pins --version` of a published release")
+    source = args.authorized_pins.resolve()
+    candidate_bytes = args.rehearsal_release.read_bytes()
+    if hashlib.sha256(candidate_bytes).hexdigest() != args.rehearsal_release_sha256:
+        raise ValueError("the candidate release.json does not have the given SHA-256")
+    candidate = json.loads(candidate_bytes)
+    authorization_bytes = (source / "testnet-release.json").read_bytes()
+    authorization = json.loads(authorization_bytes)
+    if (source / REHEARSAL_MARKER).exists():
+        raise ValueError("--authorized-pins must come from a published release, not a rehearsal")
+    published = json.loads((source / "release-manifest.json").read_text())
+    if published.get("version") != authorization.get("package_version"):
+        raise ValueError("the authorized pins' release manifest is not its authorization's package version")
+    files = authorized_pool_files(source, authorization)
+    if candidate.get("published") is not False or not isinstance(candidate.get("version"), str):
+        raise ValueError("the candidate must be an unpublished registry release.json")
+    if {str(domain.get("manifest_sha256")) for domain in candidate.get("proving_domains") or []} != set(
+            (authorization.get("hosting_manifests") or {}).values()):
+        raise ValueError("the candidate release does not record exactly the authorized hosting manifests")
+    marker = {"version": 1, "rehearsal": True, "publication_evidence": False,
+              "candidate_version": candidate["version"], "candidate_release_sha256": args.rehearsal_release_sha256,
+              "candidate_source_tree_sha256": (candidate.get("candidate") or {}).get("source_tree_sha256"),
+              "authorization_package_version": authorization.get("package_version"),
+              "authorization_sha256": hashlib.sha256(authorization_bytes).hexdigest(),
+              "publisher": authorization.get("publisher"),
+              "labels": ["test-only", "single-operator", "unaudited", *REHEARSAL_LABELS]}
+    files.update({"testnet-release.json": authorization_bytes, "candidate-release.json": candidate_bytes,
+                  "monad-testnet-shielded-v2.json": (source / "monad-testnet-shielded-v2.json").read_bytes(),
+                  REHEARSAL_MARKER: json.dumps(marker, indent=2).encode()})
+    directory.mkdir(mode=0o700)
+    try:
+        for name, data in files.items():
+            (directory / name).write_bytes(data)
+        # Re-read through the same check init uses, so a mismatched candidate fails here and not at init.
+        for pool in sorted(authorization.get("hosting_manifests") or {}):
+            release_pins(directory, pool)
+    except (OSError, ValueError, KeyError, TypeError):
+        shutil.rmtree(directory)
+        raise
+    return {"status": "pinned", "rehearsal": True, "publication_evidence": False, "directory": str(directory),
+            "candidate_version": candidate["version"], "authorization_package_version": authorization.get("package_version"),
+            "publisher": authorization.get("publisher"),
+            "files": {name: hashlib.sha256(data).hexdigest() for name, data in sorted(files.items())},
+            "note": "rehearsal pins qualify an unpublished candidate's onboarding only; they are not publication evidence"}
+
+
+def prepublication_pins(args) -> dict:
+    """Offline pins for the native qualification of a version the owner has already authorized, before upload.
+
+    The authorization file must name exactly the candidate's version (it is the one committed at the release commit),
+    the candidate must come from a clean, release-eligible tree, and it must record exactly the authorized hosting
+    manifests. Signed manifests are taken from --authorized-pins and checked against this authorization by hash.
+    These are ordinary pins: `init` checks installed binaries against the candidate exactly as against a published
+    release. Publication still requires its own authorization, native runs and every other gate."""
+    directory = args.directory.resolve()
+    if directory.exists():
+        raise ValueError("use a new pins directory")
+    if args.prepublication_release_sha256 is None or not HEX64.fullmatch(args.prepublication_release_sha256):
+        raise ValueError("--prepublication-release needs --prepublication-release-sha256")
+    if args.authorization is None or args.authorized_pins is None:
+        raise ValueError("--prepublication-release needs --authorization and --authorized-pins")
+    candidate_bytes = args.prepublication_release.read_bytes()
+    if hashlib.sha256(candidate_bytes).hexdigest() != args.prepublication_release_sha256:
+        raise ValueError("the candidate release.json does not have the given SHA-256")
+    candidate = json.loads(candidate_bytes)
+    authorization_bytes = args.authorization.read_bytes()
+    authorization = json.loads(authorization_bytes)
+    if authorization.get("package_version") != candidate.get("version"):
+        raise ValueError("the authorization does not name this candidate's version; use --rehearsal-release instead")
+    if candidate.get("published") is not False or (candidate.get("candidate") or {}).get("release_eligible") is not True:
+        raise ValueError("prepublication pins need an unpublished candidate from a clean, release-eligible tree")
+    if {str(domain.get("manifest_sha256")) for domain in candidate.get("proving_domains") or []} != set(
+            (authorization.get("hosting_manifests") or {}).values()):
+        raise ValueError("the candidate release does not record exactly the authorized hosting manifests")
+    files = authorized_pool_files(args.authorized_pins.resolve(), authorization)
+    release = {"version": candidate["version"], "source_commit": candidate.get("source_commit"),
+               "prepublication": True, "platforms": {candidate.get("platform", "candidate"): candidate}}
+    files.update({"testnet-release.json": authorization_bytes, "candidate-release.json": candidate_bytes,
+                  "release-manifest.json": json.dumps(release, indent=2).encode(),
+                  "monad-testnet-shielded-v2.json": (args.authorized_pins.resolve() / "monad-testnet-shielded-v2.json").read_bytes()})
+    directory.mkdir(mode=0o700)
+    try:
+        for name, data in files.items():
+            (directory / name).write_bytes(data)
+        for pool in sorted(authorization.get("hosting_manifests") or {}):
+            release_pins(directory, pool)
+    except (OSError, ValueError, KeyError, TypeError):
+        shutil.rmtree(directory)
+        raise
+    return {"status": "pinned", "prepublication": True, "rehearsal": False, "directory": str(directory),
+            "version": candidate["version"], "publisher": authorization.get("publisher"),
+            "files": {name: hashlib.sha256(data).hexdigest() for name, data in sorted(files.items())},
+            "note": "prepublication pins for the authorized version; publication still needs every gate"}
+
+
 def pins(args, opener=None) -> dict:
+    if getattr(args, "prepublication_release", None) is not None:
+        if args.version is not None or getattr(args, "rehearsal_release", None) is not None:
+            raise ValueError("--prepublication-release excludes --version and --rehearsal-release")
+        return prepublication_pins(args)
+    if getattr(args, "rehearsal_release", None) is not None:
+        if args.version is not None:
+            raise ValueError("--version and --rehearsal-release are exclusive")
+        return rehearsal_pins(args)
+    if args.version is None:
+        raise ValueError("pins needs --version (published) or --rehearsal-release (offline rehearsal)")
+    if any(getattr(args, name, None) for name in ("rehearsal_release_sha256", "authorized_pins", "authorization",
+                                                  "prepublication_release_sha256")):
+        raise ValueError("offline pin options apply only with --rehearsal-release or --prepublication-release")
     directory = args.directory.resolve()
     if directory.exists():
         raise ValueError("use a new pins directory")
@@ -302,6 +485,8 @@ def init(args) -> dict:
     artifacts = directory / "release"
     artifacts.mkdir(mode=0o700)
     shutil.copyfile(pins["manifest"], artifacts / "manifest.json")
+    # erebus-payment reads the manifest as a local input and refuses one others can read.
+    (artifacts / "manifest.json").chmod(0o600)
     namespace = f"eip155:{NAMESPACE_CHAIN}"
     asset = pool["asset"].lower()
     operator = command(bins, "erebus-negotiate", {
@@ -361,9 +546,21 @@ def init(args) -> dict:
                "hosting_manifest_sha256": pins["manifest_sha256"], "publisher": pins["publisher"],
                "deployment_sha256": sha256(args.deployment), "operator": {k: v for k, v in operator.items() if k.endswith("_file")},
                "labels": ["test-only", "single-operator", "unaudited"], "transactions_sent": 0}
+    if pins["release"].get("prepublication") is True:
+        summary["prepublication"] = True
+    if pins["rehearsal"] is not None:
+        summary["rehearsal"] = rehearsal_record(pins["rehearsal"])
+        summary["labels"] += REHEARSAL_LABELS
     private_json(directory / "operator.json", summary)
     return {"status": "initialized", "directory": str(directory), "written": written + ["operator.json", "share/"],
+            **({"rehearsal": True, "publication_evidence": False} if pins["rehearsal"] is not None else {}),
             "next": "fund the signer address with testnet MON, send share/ to the counterparty, then run connect"}
+
+
+def rehearsal_record(marker: dict) -> dict:
+    return {"publication_evidence": False, "candidate_version": marker["candidate_version"],
+            "candidate_release_sha256": marker["candidate_release_sha256"],
+            "authorization_package_version": marker["authorization_package_version"]}
 
 
 def connect(args) -> dict:
@@ -376,6 +573,9 @@ def connect(args) -> dict:
     if len(descriptors) != 1 or not (peer / "identity.binding").is_file():
         raise ValueError("the peer share must hold exactly one descriptor and identity.binding")
     role, other = operator["role"], ("seller" if operator["role"] == "buyer" else "buyer")
+    args.role_checked = role
+    if role == "seller" and (args.service_url is not None or args.allow_loopback_access_http):
+        raise ValueError("--service-url and --allow-loopback-access-http apply to a buyer")
     require_unsigned(args.amount, "--amount")
     namespace = f"eip155:{NAMESPACE_CHAIN}"
     offer_file = peer / "offer.json"
@@ -394,6 +594,11 @@ def connect(args) -> dict:
             raise ValueError("the seller's offer names a different resource")
         digest, deadline = offer["fulfillment_digest"], offer["delivery_deadline"]
     files = operator["operator"]
+    # Validated before anything is written.
+    access = access_environment(args, directory, bins, peer, files) if args.service_url is not None else None
+    # The buyer dials the seller: erebus-negotiate requires the buyer's endpoint to be one the seller's signed
+    # descriptor advertises, and the seller's to be its own.
+    endpoint = peer_endpoint(descriptors[0]) if role == "buyer" else operator["endpoint"]
     terms = directory / "keys" / "service.terms"
     command(bins, "erebus-negotiate", {
         "method": "prepare_terms", "suite_id": 2, "output": str(terms), "role": role,
@@ -408,7 +613,7 @@ def connect(args) -> dict:
         "version": 1, "role": role, "state_root": str(directory / "state"),
         "transport_key_file": files["transport_key_file"], "agreement_key_file": files["agreement_key_file"],
         "discovery_key_file": files["discovery_key_file"], "local_descriptor_file": files["descriptor_file"],
-        "peer_descriptor_file": str(descriptors[0]), "terms_template_file": str(terms), "endpoint": operator["endpoint"],
+        "peer_descriptor_file": str(descriptors[0]), "terms_template_file": str(terms), "endpoint": endpoint,
         "maximum_price": maximum, "minimum_price": require_unsigned(args.minimum_price or args.amount, "--minimum-price"),
         "max_deal_lifetime_seconds": args.delivery_seconds, "timeout_seconds": 30}
     written = ["negotiate.json", "mcp.json"]
@@ -426,8 +631,9 @@ def connect(args) -> dict:
         payload = directory / "payload"
         shutil.copyfile(args.payload_file, payload)
         payload.chmod(0o600)
+        service_id = os.urandom(32)
         private_json(directory / "access.json", {
-            "service_id": list(os.urandom(32)), "seller_key": list(public.read_bytes()), "suite_id": 2,
+            "service_id": list(service_id), "seller_key": list(public.read_bytes()), "suite_id": 2,
             "resource": args.resource, "payload_file": str(payload), "evidence_root": str(evidence),
             "state_root": str(directory / "access-state"), "port": args.port,
             "backend": {"mode": "shielded", "chain_id": NAMESPACE_CHAIN, "pool": operator["settlement_contract"],
@@ -439,15 +645,62 @@ def connect(args) -> dict:
         written.append("access.json")
         offer_out = directory / "share" / "offer.json"
         private_json(offer_out, offer)
+        # Public: the buyer pins this service identity; the URL is the buyer's own choice (`--service-url`).
+        private_json(directory / "share" / "service.json", {"version": 1, "service_id": service_id.hex(),
+                                                             "resource": args.resource, "port": args.port})
     else:
         environment.update({"EREBUS_PAYMENT_CONFIG": str(directory / "payment.json"),
                             "EREBUS_PAYMENT_CLI": str(bins / "erebus-payment")})
+        if access is not None:
+            (directory / "access-cache").mkdir(mode=0o700)
+            environment.update(access)
+            written.append("access-cache/")
     private_json(directory / "negotiate.json", negotiate)
     private_json(directory / "mcp.json", {"mcpServers": {f"erebus-{role}": {"command": str(bins / "erebus-mcp-server"),
                                                                           "env": environment}}})
     return {"status": "connected", "role": role, "peer": other, "written": written,
             "next": ("start erebus-access-service with access.json, then the MCP server" if role == "seller"
                      else "add mcp.json to the agent, fund the wallet (wrap/approve/deposit with erebus-wallet), then negotiate")}
+
+
+def peer_endpoint(descriptor: Path) -> str:
+    """The single TCP endpoint a peer's descriptor advertises, as host:port (the descriptor's signature is
+    verified by erebus-negotiate itself)."""
+    endpoints = json.loads(descriptor.read_text()).get("endpoints")
+    if not isinstance(endpoints, list) or len(endpoints) != 1 or not str(endpoints[0]).startswith("tcp://"):
+        raise ValueError("the peer descriptor must advertise exactly one tcp:// endpoint")
+    return str(endpoints[0]).removeprefix("tcp://")
+
+
+LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
+
+
+def access_environment(args, directory: Path, bins: Path, peer: Path, files: dict) -> dict:
+    """Buyer retrieval settings for the MCP server: the seller's shared service identity and the buyer's own URL.
+
+    HTTPS only; cleartext HTTP is accepted only for a loopback host and only with --allow-loopback-access-http."""
+    if args.role_checked != "buyer":
+        raise ValueError("--service-url applies to a buyer")
+    service = json.loads((peer / "service.json").read_text())
+    if service.get("version") != 1 or not HEX64.fullmatch(str(service.get("service_id", ""))) or service["service_id"] == "0" * 64:
+        raise ValueError("the seller's share/service.json is missing or invalid; reconnect the seller first")
+    if service.get("resource") != args.resource:
+        raise ValueError("the seller's service names a different resource")
+    url = urllib.parse.urlsplit(args.service_url)
+    if url.path != "/v1/access" or url.username or url.password or url.query or url.fragment or not url.hostname:
+        raise ValueError("--service-url must be <scheme>://<host>[:port]/v1/access without credentials, query or fragment")
+    loopback = url.hostname in LOOPBACK_HOSTS
+    if url.scheme == "http" and not (loopback and args.allow_loopback_access_http):
+        raise ValueError("--service-url must use https; plain http is allowed only to loopback with --allow-loopback-access-http")
+    if url.scheme not in {"https", "http"}:
+        raise ValueError("--service-url must use https")
+    if args.allow_loopback_access_http and not (loopback and url.scheme == "http"):
+        raise ValueError("--allow-loopback-access-http applies only to an http loopback --service-url")
+    cache = directory / "access-cache"
+    return {"EREBUS_ACCESS_SERVICE_URL": args.service_url, "EREBUS_ACCESS_SERVICE_ID": service["service_id"],
+            "EREBUS_ACCESS_BUYER_KEY_FILE": files["agreement_key_file"], "EREBUS_ACCESS_CACHE": str(cache),
+            "EREBUS_ACCESS_CLI": str(bins / "erebus-access"),
+            **({"EREBUS_ALLOW_LOOPBACK_ACCESS_HTTP": "1"} if url.scheme == "http" else {})}
 
 
 def release_pins_from(operator: dict) -> dict:
@@ -775,7 +1028,9 @@ def doctor(args) -> dict:
             entry = {}
             try:
                 check = network_check(bins, url, directory)
-                entry.update(passed=check.get("passed") is True, finalized=(check.get("finalized") or {}).get("number"))
+                finalized = (check.get("finalized") or {}).get("number")
+                entry.update(passed=check.get("passed") is True,
+                             finalized=finalized if type(finalized) is int else None)
                 if not entry["passed"]:
                     problems.append(f"{label} failed the installed network check")
             except (OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
@@ -792,6 +1047,7 @@ def doctor(args) -> dict:
             problems.append("the gas signer has no testnet MON yet")
     return {"status": "healthy" if not problems else "attention", "role": operator["role"], "pool": operator["pool"],
             "release_version": operator["release_version"], "signer_address": operator["signer_address"],
+            **({"rehearsal": operator["rehearsal"]} if "rehearsal" in operator else {}),
             "checks": checks, "problems": problems, "secrets_printed": False}
 
 
@@ -878,7 +1134,8 @@ def wallet_policy(args) -> dict:
 
 def auditor(args) -> dict:
     bins = args.bin.resolve()
-    verify_installed(bins, release_pins(args.pins.resolve(), args.pool)["release"])
+    pinned = release_pins(args.pins.resolve(), args.pool)
+    verify_installed(bins, pinned["release"])
     directory = args.directory.resolve()
     if directory.exists():
         raise ValueError("use a new auditor directory")
@@ -888,15 +1145,32 @@ def auditor(args) -> dict:
     (directory / "cache").mkdir(mode=0o700)
     private_json(directory / "disclosure.json", disclosure.render(args.deployment, args.pool, args.rpc_url,
                                                                   args.peer_rpc_url, str(directory / "cache")))
-    return {"status": "auditor-ready", "directory": str(directory), "written": ["auditor.key (Rust)", "disclosure.json"]}
+    written = ["auditor.key (Rust)", "disclosure.json"]
+    rehearsal = pinned["rehearsal"]
+    if rehearsal is not None:
+        private_json(directory / REHEARSAL_MARKER, {**rehearsal_record(rehearsal),
+                                                    "labels": ["test-only", "single-operator", "unaudited", *REHEARSAL_LABELS]})
+        written.append(REHEARSAL_MARKER)
+    return {"status": "auditor-ready", "directory": str(directory), "written": written,
+            **({"rehearsal": rehearsal_record(rehearsal)} if rehearsal is not None else {})}
 
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     commands = parser.add_subparsers(dest="command", required=True)
     pinning = commands.add_parser("pins")
-    pinning.add_argument("--version", required=True)
+    pinning.add_argument("--version", help="published package version (HTTPS download)")
     pinning.add_argument("--directory", type=Path, required=True)
+    pinning.add_argument("--rehearsal-release", type=Path,
+                         help="offline rehearsal: an unpublished candidate's release.json (never publication evidence)")
+    pinning.add_argument("--rehearsal-release-sha256", help="rehearsal: the exact SHA-256 of --rehearsal-release")
+    pinning.add_argument("--authorized-pins", type=Path,
+                         help="offline pins: an existing `pins --version` directory supplying the signed pool manifests")
+    pinning.add_argument("--prepublication-release", type=Path,
+                         help="native qualification: a clean candidate's release.json for the version --authorization names")
+    pinning.add_argument("--prepublication-release-sha256", help="prepublication: the exact SHA-256 of the release.json")
+    pinning.add_argument("--authorization", type=Path,
+                         help="prepublication: the owner authorization committed at the candidate's source commit")
     first = commands.add_parser("init")
     first.add_argument("--role", choices=("buyer", "seller"), required=True)
     first.add_argument("--pool", choices=("wmon", "usdc"), required=True)
@@ -928,6 +1202,9 @@ def main(argv=None) -> int:
     second.add_argument("--payload-file", type=Path)
     second.add_argument("--port", type=int)
     second.add_argument("--delivery-seconds", type=int, default=21600)
+    second.add_argument("--service-url", help="buyer: the seller's access URL, https://<host>/v1/access; adds retrieval to mcp.json")
+    second.add_argument("--allow-loopback-access-http", action="store_true",
+                        help="buyer: accept a plain-http --service-url on a loopback host (local rehearsal only)")
     checkup = commands.add_parser("doctor")
     checkup.add_argument("--directory", type=Path, required=True)
     checkup.add_argument("--offline", action="store_true", help="skip RPC endpoint and balance checks")

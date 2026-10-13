@@ -17,7 +17,10 @@ Publication also requires, for both platforms:
   covered every pool of the deployment record;
 - installed qualification reports for install, assets, metered and x402 that verified against this
   `release.json`, ran on a native GitHub-hosted runner, proved every pool over real HTTPS with the
-  pinned publisher, and passed every refusal; and a verified HTTPS fetch report per pool.
+  pinned publisher, and passed every refusal; and a verified HTTPS fetch report per pool;
+- a generated separate-agent `workflow.json` (prepublication or published pins, every authorized pool) and a
+  funded installed-relayer `relayer.json`, each verified, native, bound to this `release.json`, its source
+  commit and the installed binary hashes. Rehearsal-pin reports and in-process relayer runs never qualify.
 The binary inventory comes from the registry builder, not a hardcoded count.
 """
 
@@ -127,6 +130,8 @@ def check_reports(platform: str, root: Path, manifest: dict, release_sha256: str
             continue
         reports[gate] = report
         claims = report.get("claims") or {}
+        if report.get("publication_evidence") is False or report.get("rehearsal") or "rehearsal-pins" in (report.get("labels") or []):
+            problems.append(f"{platform}: {gate} is a rehearsal report, which is never publication evidence")
         if report.get("status") != "verified" or report.get("source_imports") is not False:
             problems.append(f"{platform}: {gate} qualification did not verify")
         if report.get("release_json_sha256") != release_sha256:
@@ -155,6 +160,7 @@ def check_reports(platform: str, root: Path, manifest: dict, release_sha256: str
             problems.append(f"{platform}: {name} was authorized by a different publisher")
         if not refusals or not all(refusals.values()) or report.get("cache_tamper") not in {"redownloaded", "refused"}:
             problems.append(f"{platform}: {name} refusals incomplete")
+    problems += check_feature_gates(platform, root, manifest, release_sha256, authorization)
     fetched = set()
     for path in sorted((root / "qualification").glob("fetch-*.json")):
         try:
@@ -167,6 +173,76 @@ def check_reports(platform: str, root: Path, manifest: dict, release_sha256: str
     if fetched != pins:
         problems.append(f"{platform}: HTTPS fetch reports do not cover every authorized manifest")
     return problems
+
+
+def bound_report(platform: str, root: Path, gate: str, manifest: dict, release_sha256: str) -> tuple[dict, list[str]]:
+    """A feature-gate report that must be verified, native, non-rehearsal and bound to these exact packages."""
+    path = root / "qualification" / f"{gate}.json"
+    try:
+        report = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {}, [f"{platform}: missing {gate} report"]
+    problems = []
+    claims = report.get("claims") or {}
+    if report.get("status") != "verified" or report.get("source_imports") is not False:
+        problems.append(f"{platform}: {gate} report did not verify")
+    if report.get("publication_evidence") is False or report.get("rehearsal") or "rehearsal-pins" in (report.get("labels") or []):
+        problems.append(f"{platform}: {gate} is a rehearsal report, which is never publication evidence")
+    if report.get("release_json_sha256") != release_sha256 or report.get("source_commit") != manifest.get("source_commit"):
+        problems.append(f"{platform}: {gate} report is stale or for other packages")
+    if claims.get("native_platform_qualification") is not True:
+        problems.append(f"{platform}: {gate} did not run on a native hosted runner from a clean tree")
+    if claims.get("live_payment") is not False:
+        problems.append(f"{platform}: {gate} claims a live payment")
+    installed = report.get("installed_binaries_sha256") or {}
+    if not installed or any(manifest["binaries"].get(name, {}).get("sha256") != digest for name, digest in installed.items()):
+        problems.append(f"{platform}: {gate} report does not bind the installed binaries to these packages")
+    return report, problems
+
+
+def check_feature_gates(platform: str, root: Path, manifest: dict, release_sha256: str, authorization: dict) -> list[str]:
+    """The generated separate-agent workflow and the funded installed-relayer gate, both bound to these packages."""
+    pools = set(authorization.get("hosting_manifests") or {})
+    workflow, problems = bound_report(platform, root, "workflow", manifest, release_sha256)
+    if workflow:
+        if workflow.get("pins_mode") not in {"prepublication", "published"}:
+            problems.append(f"{platform}: workflow operators were not pinned to this authorized version")
+        if not {"erebus-negotiate", "erebus-payment", "erebus-wallet"} <= set(workflow.get("installed_binaries_sha256") or {}):
+            problems.append(f"{platform}: workflow report does not bind the agent binaries")
+        ran = workflow.get("pools") or {}
+        if set(ran) != pools:
+            problems.append(f"{platform}: workflow did not cover exactly the authorized pools")
+        for name, pool in ran.items():
+            deal = (pool.get("main") or {}).get("deal") or {}
+            if not (deal.get("payment_verified_by_recovery") is True and deal.get("settlement_broadcasts") == 1
+                    and (deal.get("delivery") or {}).get("resource_verified") is True
+                    and (deal.get("auditor") or {}).get("payment_verified") is True):
+                problems.append(f"{platform}: {name} workflow did not verify payment, delivery and audit separately")
+    relayer, found = bound_report(platform, root, "relayer", manifest, release_sha256)
+    problems += found
+    if relayer:
+        if "erebus-shielded-relayer" not in (relayer.get("installed_binaries_sha256") or {}):
+            problems.append(f"{platform}: relayer report does not bind the installed relayer binary")
+        if relayer.get("service") != "installed-binary" or relayer.get("in_process") is not False:
+            problems.append(f"{platform}: relayer gate did not drive the installed binary")
+        checks = relayer.get("checks") or {}
+        for check in RELAYER_CHECKS:
+            entry = checks.get(check)
+            if not isinstance(entry, dict) or entry.get("passed") is not True or not entry.get("scope") or not entry.get("test"):
+                problems.append(f"{platform}: relayer gate missing {check}")
+        # Transport-only evidence never stands in for the installed payment CLI or MCP delegating to the relayer.
+        delegation = checks.get("installed_payment_delegation") or {}
+        if delegation.get("test") in TRANSPORT_ONLY_TESTS:
+            problems.append(f"{platform}: relayer delegation is covered only at the transport level")
+        if relayer.get("gate_complete") is not True or relayer.get("coverage_gaps"):
+            problems.append(f"{platform}: relayer gate reports coverage gaps {relayer.get('coverage_gaps')}")
+    return problems
+
+
+RELAYER_CHECKS = ("submit", "status", "restart_recovery", "sponsor_sender", "dropped_broadcast_resumed",
+                  "duplicate_one_broadcast", "no_direct_fallback", "installed_payment_delegation")
+# Tests that drive only the library RelayEndpoint transport, not the installed erebus-payment CLI or MCP tool.
+TRANSPORT_ONLY_TESTS = {"buyer_transport_delegates_to_the_installed_binary_and_never_signs_directly"}
 
 
 def qualify(artifacts: Path, authorization: dict | None = None) -> tuple[dict, dict[str, Path], list[str]]:

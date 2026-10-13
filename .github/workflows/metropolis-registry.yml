@@ -200,6 +200,47 @@ jobs:
             python3 scripts/check-metropolis-install.py --registry registry --rehearse-$gate \
               | tail -1 > "registry/qualification/$gate.json"
           done
+      - name: Native generated two-agent workflow from public replay inputs
+        if: ${{ steps.proving.outputs.mode == 'hosted' }}
+        env:
+          DEPLOYMENT_RECORD: ${{ inputs.deployment_record || 'contracts/evm/deployments/monad-testnet-shielded-v2.json' }}
+        run: |
+          # Qualification uses the committed authorization for this exact version, never old rehearsal pins.
+          node --input-type=module -e '
+            import { readFileSync } from "node:fs";
+            const authorization = JSON.parse(readFileSync("packaging/metropolis/testnet-release.json"));
+            if (authorization.package_version !== process.env.METROPOLIS_VERSION) {
+              throw new Error("native generated workflow needs owner authorization for this exact version");
+            }
+          '
+          deployment_sha256=$(node --input-type=module -e '
+            import { readFileSync } from "node:fs";
+            import { createHash } from "node:crypto";
+            console.log(createHash("sha256").update(readFileSync(process.env.DEPLOYMENT_RECORD)).digest("hex"));
+          ')
+          node circuits/m5/scripts/export-testnet-replay.mjs \
+            --deployment "$DEPLOYMENT_RECORD" --deployment-sha256 "$deployment_sha256" \
+            --rpc-url https://testnet-rpc.monad.xyz --peer-rpc-url https://rpc-testnet.monadinfra.com \
+            --output "$RUNNER_TEMP/public-deployment-replay" \
+            > registry/qualification/public-replay.json
+          mkdir "$RUNNER_TEMP/workflow-authorized-pins"
+          cp "$RUNNER_TEMP"/proving/manifest-*.json "$RUNNER_TEMP/workflow-authorized-pins/"
+          cp packaging/metropolis/testnet-release.json "$RUNNER_TEMP/workflow-authorized-pins/testnet-release.json"
+          cp "$DEPLOYMENT_RECORD" "$RUNNER_TEMP/workflow-authorized-pins/monad-testnet-shielded-v2.json"
+          python3 scripts/rehearse-metropolis-workflow.py \
+            --registry registry --version "$METROPOLIS_VERSION" \
+            --authorized-pins "$RUNNER_TEMP/workflow-authorized-pins" \
+            --deployment-journal "$RUNNER_TEMP/public-deployment-replay" \
+            --prepublication-authorization packaging/metropolis/testnet-release.json \
+            --work "$RUNNER_TEMP/generated-workflow" --pools wmon,usdc \
+            > registry/qualification/workflow.json
+      - name: Native installed relayer fixture (packaged binary, loopback chain 10143)
+        if: ${{ steps.proving.outputs.mode == 'hosted' }}
+        run: |
+          # The fixture tests drive the relayer installed from these packages, never a cargo-built copy. The report
+          # records each check's scope; installed payment-CLI delegation stays a gap until a fixture covers it.
+          python3 scripts/qualify-metropolis-relayer.py --registry registry --version "$METROPOLIS_VERSION" \
+            --work "$RUNNER_TEMP/relayer-qualification" > registry/qualification/relayer.json
       - uses: actions/upload-artifact@v4
         with:
           name: metropolis-registry-${{ matrix.platform }}
@@ -212,6 +253,10 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      # The feature-gate checker and the committed authorization come from the same commit the legs built.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
       - uses: actions/download-artifact@v4
         with:
           pattern: metropolis-registry-*
@@ -277,6 +322,17 @@ jobs:
               for gate, flag in (("assets", "installed_asset_rehearsal"), ("metered", "installed_metered_rehearsal"), ("x402", "installed_x402_rehearsal")):
                   if reports[gate].get(flag) is not True:
                       sys.exit(f"{directory.name}: {gate} rehearsal did not run")
+              manifest = json.loads((directory / "release.json").read_text())
+              if modes == {"hosted"} and "erebus-shielded-relayer" in manifest.get("binaries", {}):
+                  import hashlib, importlib.util
+                  spec = importlib.util.spec_from_file_location("feature_publish", "scripts/publish-metropolis-release.py")
+                  checker = importlib.util.module_from_spec(spec)
+                  spec.loader.exec_module(checker)
+                  authorization = json.loads(pathlib.Path("packaging/metropolis/testnet-release.json").read_text())
+                  release_pin = hashlib.sha256((directory / "release.json").read_bytes()).hexdigest()
+                  failures = checker.check_feature_gates(directory.name, directory, manifest, release_pin, authorization)
+                  if failures:
+                      sys.exit("; ".join(failures))
               print(f"{directory.name}: native gates verified ({(directory / 'proving-mode').read_text().strip()} proving manifest)")
           pure = {}
           for platform, manifest in manifests.items():

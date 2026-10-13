@@ -764,6 +764,14 @@ def check(registry: Path, rehearse_x402: bool = False, prover_request: Path | No
                 raise ValueError("installed native protocol mismatch")
             if name == "erebus-payment" and response.get("modes") != ["public-bound", "shielded"]:
                 raise ValueError("installed payment modes are incomplete")
+        # The sponsored relayer must identify itself without reading a config, keys, or the network.
+        for flag in ("--version", "--help"):
+            result = subprocess.run([str(bins / "erebus-shielded-relayer"), flag], text=True, capture_output=True,
+                                    cwd=root, env={"PATH": environment["PATH"], "HOME": str(root)}, timeout=20, check=False)
+            if result.returncode != 0 or "erebus-shielded-relayer" not in result.stdout:
+                raise ValueError(f"installed relayer {flag} failed")
+            if flag == "--help" and "Testnet only" not in result.stdout:
+                raise ValueError("installed relayer help omits its testnet-only boundary")
         private = root / "operator"
         private.mkdir(mode=0o700)
         key = private / "buyer.key"

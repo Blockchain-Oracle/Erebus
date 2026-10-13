@@ -32,7 +32,7 @@ if method == "prepare_operator":
     for name in ("agreement", "wallet", "discovery", "transport") + (("spend",) if request["role"] == "seller" else ()):
         private(d / f"{name}.key", os.urandom(32))
     private(d / "agreement.public", os.urandom(64))
-    (d / f"{request['role']}.descriptor.json").write_text(json.dumps({"role": request["role"], "endpoint": request["endpoint"]}))
+    (d / f"{request['role']}.descriptor.json").write_text(json.dumps({"role": request["role"], "endpoints": ["tcp://" + request["endpoint"]]}))
     reply.update(agreement_key_file=str(d / "agreement.key"), wallet_agreement_key_file=str(d / "agreement.key"),
                  wallet_key_file=str(d / "wallet.key"), discovery_key_file=str(d / "discovery.key"),
                  transport_key_file=str(d / "transport.key"), descriptor_file=str(d / f"{request['role']}.descriptor.json"))
@@ -126,7 +126,8 @@ def connect_args(world, role, **changes):
     values = dict(directory=world.root / role, peer_share=world.root / ("seller" if role == "buyer" else "buyer") / "share",
                   resource="dataset.snapshot.v1", amount="700" if role == "seller" else "600", minimum_price=None,
                   unit="snapshot", quantity="1", payload_file=payload if role == "seller" else None,
-                  port=18732 if role == "seller" else None, delivery_seconds=21600)
+                  port=18732 if role == "seller" else None, delivery_seconds=21600, service_url=None,
+                  allow_loopback_access_http=False)
     values.update(changes)
     return SimpleNamespace(**values)
 
@@ -171,7 +172,8 @@ def test_full_setup_writes_exactly_the_strict_rust_schemas(world):
     assert len(payment["buyer_key_hex"]) == 128
     environment = json.loads((buyer / "mcp.json").read_text())["mcpServers"]["erebus-buyer"]["env"]
     assert environment["EREBUS_BACKEND"] == "metropolis" and environment["EREBUS_PAYMENT_CONFIG"].endswith("payment.json")
-    assert sorted(p.name for p in (seller / "share").iterdir()) == ["identity.binding", "offer.json", "seller.descriptor.json"]
+    assert sorted(p.name for p in (seller / "share").iterdir()) == ["identity.binding", "offer.json", "seller.descriptor.json",
+                                                                    "service.json"]
     assert not list((buyer / "share").glob("*.key"))
 
 
@@ -749,3 +751,222 @@ def test_no_command_output_contains_key_material_and_the_relay_key_is_never_read
     assert secrets and not any(secret.hex() in rendered or secret.decode("latin-1") in rendered for secret in secrets)
     configs = "".join(p.read_text() for p in world.root.rglob("*.json") if "share" not in p.parts)
     assert "RELAY-SECRET" not in configs and all(secret.hex() not in configs for secret in secrets)
+
+
+def candidate_release(world, tmp_path, **changes):
+    """An unpublished single-platform registry release.json recording the authorized hosting manifests."""
+    authorization = json.loads((world.pins / "testnet-release.json").read_text())
+    if not (world.pins / "monad-testnet-shielded-v2.json").exists():
+        (world.pins / "monad-testnet-shielded-v2.json").write_bytes(world.deployment.read_bytes())
+    binaries = {name: {"sha256": hashlib.sha256((world.bins / name).read_bytes()).hexdigest()} for name in init.COMMANDS}
+    release = {"version": "0.3.0.dev2026101399", "source_commit": "482d912", "published": False,
+               "platform": "macosx-11.0-arm64", "platform_qualification": {"wheel_tag": "macosx_11_0_arm64"},
+               "binaries": binaries, "candidate": {"source_tree_sha256": "ab" * 32, "release_eligible": False},
+               "proving_domains": [{"manifest_sha256": pin} for pin in authorization["hosting_manifests"].values()]}
+    release.update(changes)
+    path = tmp_path / "candidate-release.json"
+    path.write_text(json.dumps(release))
+    return path, hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def rehearsal_args(world, path, digest, directory=None, **changes):
+    values = dict(version=None, directory=directory or world.root / "rehearsal-pins", rehearsal_release=path,
+                  rehearsal_release_sha256=digest, authorized_pins=world.pins)
+    values.update(changes)
+    return SimpleNamespace(**values)
+
+
+def test_rehearsal_pins_bind_the_exact_candidate_to_the_published_authorization(world, tmp_path):
+    path, digest = candidate_release(world, tmp_path)
+    result = init.pins(rehearsal_args(world, path, digest))
+    pins = world.root / "rehearsal-pins"
+    assert result["rehearsal"] is True and result["publication_evidence"] is False
+    assert not (pins / "release-manifest.json").exists(), "a rehearsal must not look like published pins"
+    for name in ("testnet-release.json", "manifest-wmon.json", "manifest-wmon.signature.json", "manifest-usdc.json"):
+        assert (pins / name).read_bytes() == (world.pins / name).read_bytes(), "authorizations are copied, never substituted"
+    assert (pins / "candidate-release.json").read_bytes() == path.read_bytes()
+    marker = json.loads((pins / "rehearsal.json").read_text())
+    assert marker["publication_evidence"] is False and "not-publication-evidence" in marker["labels"]
+    # Installed candidate binaries differ from the published ones: the candidate's own hashes are checked.
+    (world.bins / "erebus-wallet").write_text("#!/bin/sh\n# candidate build\n")
+    path, digest = candidate_release(world, tmp_path)
+    init.pins(rehearsal_args(world, path, digest, directory=world.root / "candidate-pins"))
+    with pytest.raises(ValueError, match="erebus-wallet is not the published binary"):
+        init.init(init_args(world, "buyer"))
+    init.init(init_args(world, "buyer", pins=world.root / "candidate-pins"))
+    operator = json.loads((world.root / "buyer/operator.json").read_text())
+    assert operator["rehearsal"]["publication_evidence"] is False and operator["release_version"] == "0.3.0.dev2026101399"
+    assert {"rehearsal-pins", "not-publication-evidence"} <= set(operator["labels"])
+    assert init.doctor(SimpleNamespace(directory=world.root / "buyer", offline=True))["rehearsal"]["publication_evidence"] is False
+    auditor = init.auditor(SimpleNamespace(pool="wmon", directory=world.root / "auditor", bin=world.bins,
+                                           pins=world.root / "candidate-pins", deployment=world.deployment,
+                                           rpc_url="https://a.example.net/", peer_rpc_url="https://b.example.net/"))
+    assert auditor["rehearsal"]["publication_evidence"] is False and (world.root / "auditor/rehearsal.json").is_file()
+
+
+@pytest.mark.parametrize("change,message", [
+    (lambda world, path, digest: {"rehearsal_release_sha256": "0" * 64}, "does not have the given SHA-256"),
+    (lambda world, path, digest: {"rehearsal_release_sha256": None}, "--rehearsal-release-sha256"),
+    (lambda world, path, digest: {"authorized_pins": None}, "--authorized-pins"),
+    (lambda world, path, digest: {"version": "0.3.0.dev2026101202"}, "exclusive"),
+])
+def test_rehearsal_pins_refuse_incomplete_or_mismatched_inputs(world, tmp_path, change, message):
+    path, digest = candidate_release(world, tmp_path)
+    with pytest.raises(ValueError, match=message):
+        init.pins(rehearsal_args(world, path, digest, **change(world, path, digest)))
+    assert not (world.root / "rehearsal-pins").exists()
+
+
+def test_rehearsal_pins_never_substitute_an_authorization_or_a_publisher(world, tmp_path):
+    path, digest = candidate_release(world, tmp_path, proving_domains=[{"manifest_sha256": "f" * 64}])
+    with pytest.raises(ValueError, match="exactly the authorized hosting manifests"):
+        init.pins(rehearsal_args(world, path, digest))
+    path, digest = candidate_release(world, tmp_path, published=True)
+    with pytest.raises(ValueError, match="unpublished"):
+        init.pins(rehearsal_args(world, path, digest, directory=world.root / "p2"))
+    path, digest = candidate_release(world, tmp_path)
+    init.pins(rehearsal_args(world, path, digest))
+    with pytest.raises(ValueError, match="not a rehearsal"):
+        init.pins(rehearsal_args(world, path, digest, directory=world.root / "p3", authorized_pins=world.root / "rehearsal-pins"))
+    (world.pins / "manifest-usdc.json").write_text("{}")
+    with pytest.raises(ValueError, match="does not match the release authorization"):
+        init.pins(rehearsal_args(world, path, digest, directory=world.root / "p4"))
+    for name in ("p2", "p3", "p4"):
+        assert not (world.root / name).exists()
+
+
+def test_a_tampered_rehearsal_marker_or_mixed_pins_are_refused_at_init(world, tmp_path):
+    path, digest = candidate_release(world, tmp_path)
+    init.pins(rehearsal_args(world, path, digest))
+    pins = world.root / "rehearsal-pins"
+    marker = json.loads((pins / "rehearsal.json").read_text())
+    (pins / "rehearsal.json").write_text(json.dumps({**marker, "publication_evidence": True}))
+    with pytest.raises(ValueError, match="do not match their marker"):
+        init.init(init_args(world, "buyer", pins=pins))
+    (pins / "rehearsal.json").write_text(json.dumps(marker))
+    (pins / "release-manifest.json").write_bytes((world.pins / "release-manifest.json").read_bytes())
+    with pytest.raises(ValueError, match="published or rehearsal, never both"):
+        init.init(init_args(world, "buyer", pins=pins))
+    assert not (world.root / "buyer").exists()
+
+
+def test_buyer_retrieval_settings_come_from_the_sellers_share_and_require_tls_or_explicit_loopback(world):
+    for role in ("buyer", "seller"):
+        init.init(init_args(world, role))
+    init.connect(connect_args(world, "seller"))
+    service = json.loads((world.root / "seller/share/service.json").read_text())
+    access = json.loads((world.root / "seller/access.json").read_text())
+    assert bytes(access["service_id"]).hex() == service["service_id"] and service["port"] == 18732
+    for changes, message in ((dict(service_url="http://seller.example.net/v1/access"), "must use https"),
+                             (dict(service_url="http://127.0.0.1:18732/v1/access"), "must use https"),
+                             (dict(service_url="https://seller.example.net/v1/other"), "/v1/access"),
+                             (dict(service_url="https://u:p@seller.example.net/v1/access"), "without credentials"),
+                             (dict(service_url="https://seller.example.net/v1/access", allow_loopback_access_http=True), "applies only"),
+                             (dict(service_url="https://seller.example.net/v1/access", resource="other"), "different resource")):
+        with pytest.raises(ValueError, match=message):
+            init.connect(connect_args(world, "buyer", **changes))
+        assert not (world.root / "buyer/mcp.json").exists() and not (world.root / "buyer/access-cache").exists()
+    with pytest.raises(ValueError, match="apply to a buyer"):
+        init.connect(connect_args(world, "seller", service_url="https://x.example.net/v1/access"))
+    init.connect(connect_args(world, "buyer", service_url="http://127.0.0.1:18732/v1/access", allow_loopback_access_http=True))
+    environment = json.loads((world.root / "buyer/mcp.json").read_text())["mcpServers"]["erebus-buyer"]["env"]
+    buyer = json.loads((world.root / "buyer/operator.json").read_text())
+    assert environment["EREBUS_ACCESS_SERVICE_ID"] == service["service_id"]
+    assert environment["EREBUS_ACCESS_BUYER_KEY_FILE"] == buyer["operator"]["agreement_key_file"]
+    assert environment["EREBUS_ALLOW_LOOPBACK_ACCESS_HTTP"] == "1" and owner_only(world.root / "buyer/access-cache")
+    assert environment["EREBUS_ACCESS_CLI"] == str(world.bins / "erebus-access")
+
+
+def test_the_buyer_dials_the_endpoint_the_sellers_descriptor_advertises(world):
+    connected_buyer_and_seller(world)
+    buyer = json.loads((world.root / "buyer/negotiate.json").read_text())
+    seller = json.loads((world.root / "seller/negotiate.json").read_text())
+    assert seller["endpoint"] == "127.0.0.1:9102" and buyer["endpoint"] == "127.0.0.1:9102"
+
+
+def test_a_peer_descriptor_without_exactly_one_tcp_endpoint_is_refused(world):
+    for role in ("buyer", "seller"):
+        init.init(init_args(world, role))
+    init.connect(connect_args(world, "seller"))
+    (world.root / "seller/share/seller.descriptor.json").write_text(json.dumps({"endpoints": ["tcp://a:1", "tcp://b:2"]}))
+    with pytest.raises(ValueError, match="exactly one tcp:// endpoint"):
+        init.connect(connect_args(world, "buyer"))
+    assert not (world.root / "buyer/negotiate.json").exists()
+
+
+SENTINEL = "LEAKAGE_REVIEW_SENTINEL"
+
+
+def test_native_replies_are_never_echoed_through_any_wrapper_channel(world, monkeypatch, capsys):
+    """Every error and report channel prints fixed text, whatever a native command puts in its reply."""
+    real = init.subprocess.run
+
+    def hostile(command, **kwargs):
+        name = Path(command[0]).name
+        if name in {"erebus-negotiate", "erebus-shielded-disclosure", "erebus-wallet", "erebus-payment"}:
+            return SimpleNamespace(returncode=1, stdout=json.dumps({"status": "error", "error": SENTINEL, "detail": SENTINEL}),
+                                   stderr=SENTINEL)
+        if name == "erebus-network-check":
+            return SimpleNamespace(returncode=0, stdout=json.dumps({"passed": True, "finalized": {"number": SENTINEL},
+                                                                   "chain_id": 10143, "error": SENTINEL}), stderr=SENTINEL)
+        return real(command, **kwargs)
+
+    connected_buyer_and_seller(world)
+    monkeypatch.setattr(init.subprocess, "run", hostile)
+    monkeypatch.setattr(init, "rpc_balance", lambda url, address, opener=None: 1)
+    calls = [["init", "--role", "buyer", "--pool", "wmon", "--directory", str(world.root / "b2"), "--bin", str(world.bins),
+              "--pins", str(world.pins), "--deployment", str(world.deployment), "--endpoint", "127.0.0.1:1",
+              "--rpc-url", "https://a.example.net/", "--peer-rpc-url", "https://b.example.net/",
+              "--signer-address", "0x" + "12" * 20, "--maximum-price", "5"],
+             ["auditor", "--pool", "wmon", "--directory", str(world.root / "a2"), "--bin", str(world.bins),
+              "--pins", str(world.pins), "--deployment", str(world.deployment), "--rpc-url", "https://a.example.net/",
+              "--peer-rpc-url", "https://b.example.net/"],
+             ["wallet-policy", "--directory", str(world.root / "buyer"), "--maximum-amount", "5"],
+             ["doctor", "--directory", str(world.root / "buyer")]]
+    for arguments in calls:
+        init.main(arguments)
+        printed = capsys.readouterr()
+        assert SENTINEL not in printed.out + printed.err, arguments[0]
+
+
+def prepublication_args(world, path, digest, authorization, directory=None, **changes):
+    values = dict(version=None, rehearsal_release=None, directory=directory or world.root / "pre-pins",
+                  prepublication_release=path, prepublication_release_sha256=digest, authorization=authorization,
+                  authorized_pins=world.pins)
+    values.update(changes)
+    return SimpleNamespace(**values)
+
+
+def test_prepublication_pins_need_an_authorization_naming_the_clean_candidate(world, tmp_path):
+    authorization = json.loads((world.pins / "testnet-release.json").read_text())
+    named = tmp_path / "authorization-v.json"
+    named.write_text(json.dumps({**authorization, "package_version": "0.3.0.dev2026101399"}))
+    clean = {"candidate": {"source_tree_sha256": "ab" * 32, "release_eligible": True}}
+    path, digest = candidate_release(world, tmp_path, **clean)
+    result = init.pins(prepublication_args(world, path, digest, named))
+    assert result["prepublication"] is True and result["rehearsal"] is False
+    pins = world.root / "pre-pins"
+    assert not (pins / "rehearsal.json").exists() and (pins / "testnet-release.json").read_bytes() == named.read_bytes()
+    init.init(init_args(world, "buyer", pins=pins))
+    operator = json.loads((world.root / "buyer/operator.json").read_text())
+    assert operator["prepublication"] is True and "rehearsal" not in operator and "rehearsal-pins" not in operator["labels"]
+    # The old authorization (another version), a dirty tree or other manifests are refused, and nothing is written.
+    for changes, authorization_file, message in (
+            ({}, world.pins / "testnet-release.json", "does not name this candidate's version"),
+            ({"candidate": {"release_eligible": False}}, named, "clean, release-eligible"),
+            ({**clean, "proving_domains": [{"manifest_sha256": "f" * 64}]}, named, "exactly the authorized hosting manifests")):
+        path, digest = candidate_release(world, tmp_path, **changes)
+        with pytest.raises(ValueError, match=message):
+            init.pins(prepublication_args(world, path, digest, authorization_file, directory=world.root / "refused"))
+        assert not (world.root / "refused").exists()
+    with pytest.raises(ValueError, match="excludes"):
+        init.pins(prepublication_args(world, path, digest, named, directory=world.root / "x", version="1"))
+
+
+def test_every_file_a_native_command_reads_as_a_local_input_is_owner_only(world):
+    """erebus-payment refuses a hosting-manifest copy that others can read, so settlement would fail after funding."""
+    connected_buyer_and_seller(world)
+    for role in ("buyer", "seller"):
+        config = json.loads((world.root / role / "wallet.json").read_text())
+        assert owner_only(Path(config["artifact_manifest_file"])), role
+    assert owner_only(Path(json.loads((world.root / "buyer/payment.json").read_text())["manifest_file"]))

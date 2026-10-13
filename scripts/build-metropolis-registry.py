@@ -29,7 +29,7 @@ BINARY_GROUPS = {
     "sdk/shielded": [
         "erebus-negotiate", "erebus-payment", "erebus-wallet", "erebus-local-prove",
         "erebus-artifacts", "erebus-access", "erebus-access-service", "erebus-shielded-disclosure",
-        "erebus_pool_indexer",
+        "erebus_pool_indexer", "erebus-shielded-relayer",
     ],
 }
 PACKAGE_PATHS = ["packaging/erebus-cli", "sdk/py", "mcp-server"]
