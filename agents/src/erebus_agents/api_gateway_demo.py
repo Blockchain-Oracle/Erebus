@@ -1,4 +1,4 @@
-"""Runnable rehearsal of a pay-per-call private API gateway.
+"""Runnable rehearsal of a pay-per-call API gateway over the public `x402-exact` rail.
 
 Each call negotiates a price, retrieves the resource once, and pays for it exactly once. The
 loops run through the real production sequencing in `drive_x402_deal`, against a deterministic
@@ -8,7 +8,7 @@ rail, an independent auditor verifies payment from the disclosure grant.
 
 This is a rehearsal, not chain evidence. For the installed rail, stand up
 `erebus-access-service` and drive it with `metropolis_loop.py --profile x402-exact`. Standard
-x402 is public and is not a privacy rail.
+x402 is public and is not a privacy rail: accepted terms and identities are visible.
 """
 
 from __future__ import annotations
@@ -24,6 +24,10 @@ from erebus_agents.metropolis_loop import drive_x402_deal
 from erebus_agents.paid_gateway import GatewayEndpoint, LocalGateway
 
 
+async def _no_wait(_seconds: float) -> None:
+    """The offline gateway answers immediately, so a retry needs no real back-off."""
+
+
 async def rehearse(endpoint: GatewayEndpoint, calls: int, *, resource: bytes = b"paid resource body") -> dict[str, Any]:
     if calls <= 0:
         raise ValueError("calls must be positive")
@@ -31,7 +35,8 @@ async def rehearse(endpoint: GatewayEndpoint, calls: int, *, resource: bytes = b
     results = []
     for _ in range(calls):
         operation_ref = secrets.token_hex(32)
-        record = await drive_x402_deal(gateway.buyer_session(), gateway.seller_session(), operation_ref)
+        record = await drive_x402_deal(gateway.buyer_session(), gateway.seller_session(), operation_ref,
+                                      sleep=_no_wait)
         results.append({
             "operation_ref": operation_ref,
             "deal_commitment": record["deal_commitment"],
@@ -47,6 +52,7 @@ async def rehearse(endpoint: GatewayEndpoint, calls: int, *, resource: bytes = b
         "price_per_call": endpoint.price,
         "asset": endpoint.asset,
         "calls": results,
+        "negotiate_calls": gateway.negotiate_calls,
         "permits_signed": gateway.permits_signed,
         "payments_collected": gateway.payments_collected,
         "total_billed": gateway.payments_collected * endpoint.price,
