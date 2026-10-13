@@ -48,11 +48,12 @@ def world(tmp_path):
 
 
 def passing(checkout, binaries, arguments, log):
-    names = [adapter.GATES] if "--exact" in arguments else [*adapter.FUNDED, *adapter.DELEGATION_TESTS]
+    names = ([name for name in (*adapter.DELEGATION_TESTS, *adapter.MCP_TESTS) if name in arguments] or [adapter.GATES]) if "--exact" in arguments else adapter.FUNDED
     return {name: "ok" for name in names}
 
 
-def test_a_passing_fixture_run_is_bound_and_scoped_but_not_a_complete_gate(world):
+def test_a_passing_fixture_run_is_bound_and_scoped_but_not_a_complete_gate(world, monkeypatch):
+    monkeypatch.setattr(adapter, "DELEGATION_TESTS", ())
     root, registry, checkout, install = world
     seen = []
 
@@ -78,6 +79,7 @@ def test_a_passing_fixture_run_is_bound_and_scoped_but_not_a_complete_gate(world
 
 
 def test_publication_refuses_the_adapter_report_until_installed_delegation_is_covered(world, monkeypatch):
+    monkeypatch.setattr(adapter, "DELEGATION_TESTS", ())
     root, registry, checkout, install = world
     monkeypatch.setenv("GITHUB_ACTIONS", "true")
     monkeypatch.setenv("RUNNER_ENVIRONMENT", "github-hosted")
@@ -197,3 +199,58 @@ def test_fixture_evidence_lines_are_kept_verbatim(tmp_path):
     log = tmp_path / "log"
     log.write_text('noise\nEREBUS_EVIDENCE {"test": "t", "buyer_sends": 0, "sponsor_sends": 1}\nEREBUS_EVIDENCE {bad\n')
     assert adapter.evidence_lines(log) == [{"test": "t", "buyer_sends": 0, "sponsor_sends": 1}]
+
+
+def test_registered_installed_cli_delegation_is_not_a_transport_substitute(world):
+    root, registry, checkout, install = world
+    assert adapter.DELEGATION_TESTS == (
+        "payment_driver::shielded_driver::installed_payment_delegation",
+    )
+    report = adapter.qualify(registry, "v", root / "work", checkout, run=passing, install=install)
+    assert report["gate_complete"] is True
+    assert report["checks"]["installed_payment_delegation"]["test"] not in publish.TRANSPORT_ONLY_TESTS
+    assert "CLI scope, not MCP" in report["checks"]["installed_payment_delegation"]["scope"]
+
+    def missing(checkout_dir, binaries, arguments, log):
+        return {name: result for name, result in passing(checkout_dir, binaries, arguments, log).items()
+                if name not in adapter.DELEGATION_TESTS}
+
+    report = adapter.qualify(registry, "v", root / "missing", checkout, run=missing, install=install)
+    assert report["gate_complete"] is False
+    assert "installed_payment_delegation" in report["coverage_gaps"]
+
+
+@pytest.mark.parametrize("changed", ["manifest", "binary", "fixture"])
+def test_identity_drift_during_qualification_is_refused(world, changed):
+    root, registry, checkout, install = world
+
+    def drifting(checkout_dir, binaries, arguments, log):
+        path = {"manifest": registry / "release.json",
+                "binary": binaries["erebus-payment"],
+                "fixture": checkout_dir / adapter.FIXTURES[0]}[changed]
+        path.write_bytes(path.read_bytes() + b" ")
+        return passing(checkout_dir, binaries, arguments, log)
+
+    with pytest.raises(ValueError, match="changed during qualification"):
+        adapter.qualify(registry, "v", root / "work", checkout, run=drifting, install=install)
+
+
+def test_mcp_qualification_requires_its_own_test_and_rejects_cli_substitution(world):
+    root, registry, checkout, install = world
+
+    def missing(checkout_dir, binaries, arguments, log):
+        return {name: result for name, result in passing(checkout_dir, binaries, arguments, log).items()
+                if name not in adapter.MCP_TESTS}
+
+    report = adapter.qualify(registry, "v", root / "missing", checkout, run=missing, install=install)
+    assert report["gate_complete"] is False
+    assert report["coverage_gaps"] == ["installed_mcp_delegation"]
+
+    report = adapter.qualify(registry, "v", root / "passing", checkout, run=passing, install=install)
+    report["checks"]["installed_mcp_delegation"]["test"] = report["checks"]["installed_payment_delegation"]["test"]
+    platform = root / "metropolis-registry-macos-arm64"
+    (platform / "qualification").mkdir(parents=True)
+    (platform / "qualification/relayer.json").write_text(json.dumps(report))
+    manifest = json.loads((registry / "release.json").read_text())
+    problems = publish.check_feature_gates("macos-arm64", platform, manifest, report["release_json_sha256"], {})
+    assert any("MCP sponsorship lacks its own installed tool test" in problem for problem in problems)

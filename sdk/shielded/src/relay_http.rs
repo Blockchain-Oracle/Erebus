@@ -9,14 +9,17 @@ use std::{
 };
 
 use axum::{
-    body::Bytes,
-    extract::{DefaultBodyLimit, State},
+    body::{Body, Bytes},
+    extract::{Request, State},
     http::{HeaderMap, StatusCode},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
 use erebus_core::suite::keccak256;
 use erebus_journal::{JournalRecord, RecordId, Store};
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::Semaphore;
@@ -271,8 +274,48 @@ impl RelayHttpService {
             )
             .route("/v1/relay", post(submit))
             .route("/v1/observe", post(observe))
-            .layer(DefaultBodyLimit::max(MAX_RELAY_REQUEST_BYTES))
+            .layer(middleware::from_fn(bounded_request_body))
             .with_state(Arc::new(self))
+    }
+}
+
+async fn bounded_request_body(request: Request, next: Next) -> Response {
+    let (parts, body) = request.into_parts();
+    match tokio::time::timeout(Duration::from_secs(2), read_request_body(body)).await {
+        Ok(Ok(bytes)) => {
+            next.run(Request::from_parts(parts, Body::from(bytes)))
+                .await
+        }
+        Ok(Err(status)) => failure(status, "invalid shielded relay request").into_response(),
+        Err(_) => failure(
+            StatusCode::REQUEST_TIMEOUT,
+            "relay request deadline reached",
+        )
+        .into_response(),
+    }
+}
+
+async fn read_request_body(body: Body) -> Result<Bytes, StatusCode> {
+    let mut stream = body.into_data_stream();
+    let mut retained = Vec::with_capacity(MAX_RELAY_REQUEST_BYTES);
+    let mut received = 0usize;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| StatusCode::BAD_REQUEST)?;
+        received = received.saturating_add(chunk.len());
+        if received <= MAX_RELAY_REQUEST_BYTES {
+            retained.extend_from_slice(&chunk);
+        } else {
+            retained.clear();
+        }
+        // Drain a bounded upload so the 413 response does not race unread TCP data.
+        if received > 2 * 1024 * 1024 {
+            return Err(StatusCode::PAYLOAD_TOO_LARGE);
+        }
+    }
+    if received > MAX_RELAY_REQUEST_BYTES {
+        Err(StatusCode::PAYLOAD_TOO_LARGE)
+    } else {
+        Ok(Bytes::from(retained))
     }
 }
 
@@ -400,6 +443,95 @@ async fn handle(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn bounded_body_accepts_the_exact_limit_and_rejects_streamed_excess() {
+        let exact = vec![b'a'; MAX_RELAY_REQUEST_BYTES];
+        assert_eq!(
+            read_request_body(Body::from(exact.clone())).await.unwrap(),
+            exact
+        );
+        let chunks = futures_util::stream::iter([
+            Ok::<_, std::io::Error>(Bytes::from(vec![b'a'; MAX_RELAY_REQUEST_BYTES])),
+            Ok(Bytes::from_static(b"b")),
+        ]);
+        assert_eq!(
+            read_request_body(Body::from_stream(chunks))
+                .await
+                .unwrap_err(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+        assert_eq!(
+            read_request_body(Body::from(vec![0; 2 * 1024 * 1024 + 1]))
+                .await
+                .unwrap_err(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_uploads_return_413_without_invoking_the_handler() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let router = Router::new()
+            .route(
+                "/v1/relay",
+                post(move || {
+                    let observed = observed.clone();
+                    async move {
+                        observed.fetch_add(1, Ordering::SeqCst);
+                        StatusCode::OK
+                    }
+                }),
+            )
+            .layer(middleware::from_fn(bounded_request_body));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let url = format!("http://{address}/v1/relay");
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+        for _ in 0..3 {
+            let response = client
+                .post(&url)
+                .body(vec![0; 2 * 1024 * 1024])
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+        }
+        assert_eq!(
+            client
+                .post(&url)
+                .body(vec![0; MAX_RELAY_REQUEST_BYTES])
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stalled = tokio::net::TcpStream::connect(address).await.unwrap();
+        stalled
+            .write_all(
+                b"POST /v1/relay HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2048\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let mut reply = [0u8; 1024];
+        let count = tokio::time::timeout(Duration::from_secs(3), stalled.read(&mut reply))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(std::str::from_utf8(&reply[..count])
+            .unwrap()
+            .starts_with("HTTP/1.1 408"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
     fn policy() -> RelayHttpPolicy {
         RelayHttpPolicy {
             requests_per_window: 10,

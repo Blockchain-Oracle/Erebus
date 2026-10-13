@@ -10,6 +10,27 @@ records, the x402 record, the demo plan, and the submission gates into one statu
 
 ## Current status
 
+### Shipping candidate 1307 (2026-10-13)
+
+This entry supersedes older qualification summaries below. Local rebuilt version
+`0.3.0.dev2026101307` passed fresh installation, both-pool real HTTPS proving and
+the full installed-relayer adapter: eight tests, no coverage gaps. The new HTTP
+body handling returned 413 in the unchanged oversized-request test. Installed
+payment delegation recorded buyer sends 0, sponsor sends 1 and verified recovery.
+The installed MCP sponsor/recovery tools passed the same funded failure matrix,
+with their own named test and installed-package import checks.
+
+The [bound report](metropolis-evidence/installed-relayer-1307-20261013.json) names
+release manifest `af8ecc13fa4b937ccc9f6aaffebc257c25b7308ca1cbb4ad98e4e93d610e3a34`.
+These are dirty-tree macOS team rehearsals with local test keys and synthetic
+proving witnesses, not native CI or live Monad qualification. The authorization
+names `1307`, conditional on every native publication gate passing.
+
+Next: commit/push the staged candidate, run native macOS/Linux qualification,
+publish only after all gates pass, then verify the public install and live loops.
+Native MCP qualification, cold-history measurements and live asset/relayer loops remain
+open. The currently published version remains `0.3.0.dev2026101202`.
+
 ### Integrated rehearsal qualification (2026-10-13)
 
 This summary supersedes the readiness wording in the historical entries below.
@@ -69,6 +90,18 @@ Installed executable SHA-256:
 Its package release manifest is `96088431211dd1236a1d5255decd29354ad3ecb12bbb26a2d903f8f6b5f2d374`.
 The fixture refusal test passed separately; Rust format checking passed.
 Buyer failure coverage here is transport-level, not complete installed payment-CLI delegation.
+
+Subsequent installed payment-CLI delegation passed three times against local package
+`0.3.0.dev2026101306`, including timeout after forwarding, durable delegation,
+missing auth, restart, unavailable relay, no direct fallback and finalized
+observation recovery. Every run recorded buyer sends 0 and sponsor sends 1.
+Release manifest: `a479dc79c406008bdfd88c0140ff4bcc481b7568511b41295f88206a2bb6b773`.
+The [bound report](metropolis-evidence/installed-delegation-20261013.json) came
+from the second full adapter run with a fresh installation outside the checkout.
+Its overall gate remains false: the oversized-body test received a transport reset
+instead of 413. No assertion was weakened. This is loopback Anvil CLI evidence,
+not native CI, MCP sponsorship or live Monad evidence.
+
 Native workflow/report wiring, new onboarding qualification and live execution remain open.
 The 5 GiB disk guard was crossed as the run completed; further builds are held.
 No files were deleted, commits created or live transactions broadcast.

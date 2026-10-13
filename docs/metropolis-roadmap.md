@@ -134,6 +134,27 @@ Subsequent integration resolved the inventory gap and added publication report g
 Focused onboarding/publication/registry tests passed 126. The installed relayer passed
 five funded local chain-10143 tests; generated-agent/native report execution remains open.
 
+Installed payment-CLI delegation now passes against the local `0.3.0.dev2026101306`
+packages: durable delegation before transport, withheld acknowledgement, restart,
+unavailable relay and no direct fallback; buyer sends 0, sponsor sends 1, payment
+verified. The identity-bound adapter reproduced it in two fresh installs. Both
+combined runs failed only the oversized-body 413 check with a transport reset.
+The [bound report](metropolis-evidence/installed-delegation-20261013.json) keeps
+the overall gate false. Native qualification,
+MCP sponsorship qualification and live relayed settlement remain open.
+
+Shipping target: `0.3.0.dev2026101307`, authorized by the owner's 2026-10-13
+autonomous-shipping request. The bounded HTTP drain fixes the oversized-request
+reset in source: six relayer-binary regressions and six HTTP unit tests passed.
+New installed/native package qualification and publication remain unchecked.
+
+The subsequent rebuilt local `1307` package passed the full installed-relayer
+adapter (8/8, no gaps), fresh installation and both-pool real HTTPS proving.
+This closes local installed relayer qualification, not native CI or publication.
+The eight tests include separate installed CLI and MCP sponsorship lifecycles;
+both verify recovery with buyer sends 0 and sponsor sends 1. Native and live
+qualification remain open.
+
 ### Product Completion Batches
 
 These batches summarize the full checklists below. Local implementation is not

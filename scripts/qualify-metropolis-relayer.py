@@ -11,9 +11,8 @@ so the tests drive the packaged binaries, never an in-process service or a cargo
 - the fixture files' hashes and each test's result;
 - every gate check with its exact scope and the test that covers it.
 
-What these tests do not cover is reported as such. In particular the buyer test drives the `RelayEndpoint`
-transport, not the installed `erebus-payment` CLI or the MCP `sponsor_shielded_deal` tool, so
-`installed_payment_delegation` stays false until a fixture drives those. Publication refuses that.
+What these tests do not cover is reported as such. The transport test does not substitute for installed
+payment delegation. Separate installed-payment CLI and installed MCP tool tests must pass.
 Loopback Anvil and test keys only: never live Monad evidence.
 """
 
@@ -33,13 +32,18 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 LABELS = ["test-only", "single-operator", "unaudited", "local-anvil", "installed-relayer"]
 FIXTURES = ("sdk/shielded/tests/relayer_binary.rs", "circuits/m5/scripts/native-fixture.mjs",
-            "circuits/m5/scripts/relay-admission-fixture.mjs")
+            "circuits/m5/scripts/relay-admission-fixture.mjs",
+            "sdk/shielded/tests/support/shielded_driver.rs",
+            "sdk/shielded/tests/support/installed_mcp_payment.py",
+            "sdk/shielded/tests/support/payment_driver.rs",
+            "sdk/shielded/tests/negotiation_cli.rs")
 SUBMIT = "installed_relayer_binary_submits_observes_restarts_and_recovers_finalized_receipt"
 RESUME = "installed_relayer_binary_recovers_a_dropped_broadcast_with_explicit_resume"
 DUPLICATE = "installed_relayer_binary_serves_duplicate_requests_with_one_broadcast"
 TRANSPORT = "buyer_transport_delegates_to_the_installed_binary_and_never_signs_directly"
 OVERSIZED = "installed_relayer_binary_answers_an_oversized_body_without_a_reset"
 GATES = "fixture_scripts_refuse_non_loopback_endpoints_and_foreign_chains"
+MCP_TESTS = ("payment_driver::shielded_driver::installed_mcp_payment_delegation",)
 FUNDED = (SUBMIT, RESUME, DUPLICATE, TRANSPORT, OVERSIZED)
 # check -> (covering test, exact scope). The scope is what the test asserts, no more.
 CHECKS = {
@@ -53,15 +57,19 @@ CHECKS = {
                                       "returns unknown with no buyer send; NOT the installed erebus-payment CLI or MCP"),
     "oversized_body_413": (OVERSIZED, "a 2 MiB body receives HTTP 413"),
     "loopback_and_chain_refusal": (GATES, "fixture scripts refuse non-loopback endpoints and foreign chains"),
+    "installed_mcp_delegation": (MCP_TESTS[0], "installed MCP sponsor_shielded_deal and recover_deal tools: durable "
+                                 "delegation, timeout/lost response, restart, no direct fallback, buyer sends 0 "
+                                 "and sponsor sends 1 with verified payment"),
 }
-# Tests that drive the installed erebus-payment (or MCP) through the installed relayer. Empty until OpenCode freezes
-# one; the transport test never belongs here. Each must pass for `installed_payment_delegation`.
-DELEGATION_TESTS: tuple[str, ...] = ()
+# The transport-only test never belongs here. The actual installed-payment test must pass.
+DELEGATION_TESTS: tuple[str, ...] = (
+    "payment_driver::shielded_driver::installed_payment_delegation",
+)
 DELEGATION_SCOPE = ("installed erebus-payment delegating to the installed relayer: delegation persisted before "
                     "transport, timeout or lost response, buyer restart, relay unavailable, recovery, no direct "
-                    "fallback, exactly one payment")
+                    "fallback, exactly one payment; CLI scope, not MCP")
 MISSING = {
-    "installed_payment_delegation": "installed erebus-payment (and MCP sponsor_shielded_deal) delegating to the installed "
+    "installed_payment_delegation": "installed erebus-payment delegating to the installed "
                                     "relayer: delegation persisted before transport, timeout or lost response, buyer "
                                     "restart, relay unavailable, recovery, no direct fallback, exactly one payment",
 }
@@ -81,8 +89,10 @@ def cargo_tests(checkout: Path, binaries: dict[str, Path], arguments: list[str],
     environment = {key: value for key, value in os.environ.items() if not key.startswith("EREBUS_")}
     for name, variable in PINNED.items():
         environment[variable] = str(binaries[name])
+    environment["EREBUS_TEST_INSTALLED_BIN_DIR"] = str(binaries["erebus-payment"].parent)
+    target = "negotiation_cli" if any(name in arguments for name in (*DELEGATION_TESTS, *MCP_TESTS)) else "relayer_binary"
     result = subprocess.run([cargo, "test", "--release", "--locked", "--manifest-path",
-                             str(checkout / "sdk/shielded/Cargo.toml"), "--test", "relayer_binary", "--", *arguments],
+                             str(checkout / "sdk/shielded/Cargo.toml"), "--test", target, "--", *arguments],
                             cwd=checkout, env=environment, capture_output=True, text=True, timeout=3600, check=False)
     with log.open("a") as handle:
         handle.write(result.stdout + result.stderr)
@@ -102,6 +112,7 @@ def evidence_lines(log: Path) -> list[dict]:
 
 def qualify(registry: Path, version: str, work: Path, checkout: Path, run=cargo_tests, install=None) -> dict:
     release_path = registry / "release.json"
+    release_sha256 = sha256(release_path)
     release = json.loads(release_path.read_text())
     expected = (release.get("binaries") or {}).get("erebus-shielded-relayer", {}).get("sha256")
     if expected is None:
@@ -122,9 +133,19 @@ def qualify(registry: Path, version: str, work: Path, checkout: Path, run=cargo_
         if path.resolve().is_relative_to(checkout.resolve()):
             raise ValueError(f"the {name} under test must be installed outside the checkout")
         pinned[name] = path
+    binary_hashes = {name: sha256(path) for name, path in pinned.items()}
+    fixture_hashes = {name: sha256(checkout / name) for name in FIXTURES}
     log = work / "relayer-tests.log"
-    results = run(checkout, pinned, ["--ignored", "--test-threads=1"], log)
+    results = run(checkout, pinned, ["--ignored", "--test-threads=1", "--show-output"], log)
     results.update(run(checkout, pinned, ["--exact", GATES], log))
+    for test in (*DELEGATION_TESTS, *MCP_TESTS):
+        results.update(run(checkout, pinned, ["--exact", test, "--ignored", "--test-threads=1", "--show-output"], log))
+    if sha256(release_path) != release_sha256:
+        raise ValueError("the package manifest changed during qualification")
+    if any(path.is_symlink() or sha256(path) != binary_hashes[name] for name, path in pinned.items()):
+        raise ValueError("a pinned binary changed during qualification")
+    if any(sha256(checkout / name) != digest for name, digest in fixture_hashes.items()):
+        raise ValueError("a fixture changed during qualification")
     checks = {}
     for check, (test, scope) in CHECKS.items():
         checks[check] = {"passed": results.get(test) == "ok", "scope": scope, "test": test}
@@ -137,7 +158,7 @@ def qualify(registry: Path, version: str, work: Path, checkout: Path, run=cargo_
     else:
         for check, scope in MISSING.items():
             checks[check] = {"passed": False, "scope": f"not covered by this fixture: {scope}", "test": None}
-    ran = [*FUNDED, *DELEGATION_TESTS, GATES]
+    ran = [*FUNDED, *DELEGATION_TESTS, *MCP_TESTS, GATES]
     passed = all(results.get(name) == "ok" for name in ran)
     native = (os.environ.get("GITHUB_ACTIONS") == "true" and os.environ.get("RUNNER_ENVIRONMENT") == "github-hosted"
               and release.get("dirty_source") is False)
@@ -147,12 +168,12 @@ def qualify(registry: Path, version: str, work: Path, checkout: Path, run=cargo_
         "coverage_gaps": sorted(name for name, entry in checks.items() if not entry["passed"]),
         "service": "installed-binary", "in_process": False,
         "source_imports": False, "fixture_harness_from_checkout": True,
-        "release_json_sha256": sha256(release_path), "version": release.get("version"),
+        "release_json_sha256": release_sha256, "version": release.get("version"),
         "source_commit": release.get("source_commit"),
         "candidate_source_tree_sha256": (release.get("candidate") or {}).get("source_tree_sha256"),
-        "installed_binaries_sha256": {name: sha256(path) for name, path in pinned.items()},
+        "installed_binaries_sha256": binary_hashes,
         "fixture_evidence": evidence_lines(log),
-        "fixture_files_sha256": {name: sha256(checkout / name) for name in FIXTURES},
+        "fixture_files_sha256": fixture_hashes,
         "tests": {name: results.get(name, "not run") for name in ran},
         "checks": checks,
         "claims": {"native_platform_qualification": native, "live_payment": False,

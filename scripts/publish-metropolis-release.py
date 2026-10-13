@@ -234,13 +234,16 @@ def check_feature_gates(platform: str, root: Path, manifest: dict, release_sha25
         delegation = checks.get("installed_payment_delegation") or {}
         if delegation.get("test") in TRANSPORT_ONLY_TESTS:
             problems.append(f"{platform}: relayer delegation is covered only at the transport level")
+        mcp = checks.get("installed_mcp_delegation") or {}
+        if mcp.get("test") in TRANSPORT_ONLY_TESTS or mcp.get("test") == delegation.get("test"):
+            problems.append(f"{platform}: MCP sponsorship lacks its own installed tool test")
         if relayer.get("gate_complete") is not True or relayer.get("coverage_gaps"):
             problems.append(f"{platform}: relayer gate reports coverage gaps {relayer.get('coverage_gaps')}")
     return problems
 
 
 RELAYER_CHECKS = ("submit", "status", "restart_recovery", "sponsor_sender", "dropped_broadcast_resumed",
-                  "duplicate_one_broadcast", "no_direct_fallback", "installed_payment_delegation")
+                  "duplicate_one_broadcast", "no_direct_fallback", "installed_payment_delegation", "installed_mcp_delegation")
 # Tests that drive only the library RelayEndpoint transport, not the installed erebus-payment CLI or MCP tool.
 TRANSPORT_ONLY_TESTS = {"buyer_transport_delegates_to_the_installed_binary_and_never_signs_directly"}
 

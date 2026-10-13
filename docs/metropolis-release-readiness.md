@@ -4,6 +4,40 @@ Review date: 2026-10-13. Decision: **not ready for the next release**.
 This is a source/evidence review, not native qualification or publication approval.
 The published `0.3.0.dev2026101202` remains separate and unchanged.
 
+## Shipping Candidate: 0.3.0.dev2026101307
+
+The owner requested autonomous shipping on 2026-10-13. The authorization now
+names this version and retains the existing publisher, hosting manifests and
+test-only, single-operator, unaudited limits. Publication still requires all gates.
+
+Installed payment-CLI delegation passed three times against the older local
+`0.3.0.dev2026101306` packages: buyer sends 0, sponsor sends 1, finalized payment
+verified. Both complete adapter runs kept the overall gate false because a 2 MiB
+request produced a transport reset instead of HTTP 413.
+
+The new source fix retains at most 2 KiB and drains rejected uploads within a
+2 MiB / two-second budget. The unchanged relayer-binary suite passed all six
+tests, including the oversized request. Six HTTP unit tests passed, including
+three full oversized uploads, exact-limit acceptance and a stalled-upload 408.
+Release-mode library Clippy passed with warnings denied. Packaging checks passed
+293 tests with 9 opt-in skips; focused adapter/publication checks passed 57.
+
+The rebuilt local `1307` packages now pass the entire installed-relayer adapter:
+eight tests, gate_complete true, no coverage gaps. The [bound report](metropolis-evidence/installed-relayer-1307-20261013.json)
+records installed binary hashes, stable fixture hashes and buyer sends 0 / sponsor
+sends 1 with verified payment. The fresh base install and both-pool real HTTPS
+proving also passed, with complete deployment coverage and recorded manifests.
+The additional installed MCP test exercises sponsor_shielded_deal and recover_deal
+with unavailable relay, timeout after forwarding, process restart and no direct
+fallback. It asserts the sponsored tool surface excludes settle_deal. Publication
+requires this named test separately; CLI-only evidence is refused.
+Release manifest: `af8ecc13fa4b937ccc9f6aaffebc257c25b7308ca1cbb4ad98e4e93d610e3a34`.
+
+These packages are dirty-tree team rehearsal, not native release qualification.
+Clean commit/push, native macOS/Linux qualification, publication and public-install
+verification remain required. No live settlement or independent acceptance is
+claimed by these tests.
+
 ## Integration Progress
 
 The relayer inventory is now integrated. New publication checks require

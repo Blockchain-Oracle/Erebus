@@ -300,6 +300,17 @@ pub(super) async fn deploy_profile(
     block_time: Option<u64>,
     configure: impl FnOnce(&mut AgreementTerms),
 ) -> Deployed {
+    deploy_on_chain(31337, lose_broadcast, block_time, configure).await
+}
+
+/// Same as `deploy_profile` but on an explicit local chain (31337 or 10143) so the
+/// installed chain-10143 relayer binary can serve a real negotiated deal.
+async fn deploy_on_chain(
+    chain: u64,
+    lose_broadcast: bool,
+    block_time: Option<u64>,
+    configure: impl FnOnce(&mut AgreementTerms),
+) -> Deployed {
     let port = TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
@@ -311,7 +322,7 @@ pub(super) async fn deploy_profile(
                 "--port",
                 &port.to_string(),
                 "--chain-id",
-                "31337",
+                &chain.to_string(),
                 "--slots-in-an-epoch",
                 "1",
                 "--silent",
@@ -351,6 +362,8 @@ pub(super) async fn deploy_profile(
         Command::new("node")
             .arg(script)
             .arg(fixture_url)
+            .arg("erc20")
+            .arg(chain.to_string())
             .output()
             .unwrap()
     })
@@ -375,12 +388,12 @@ pub(super) async fn deploy_profile(
         .unwrap();
     let mut template = terms(2, 60);
     template.domain = DeploymentDomain {
-        namespace: ChainNamespace::parse("eip155:31337").unwrap(),
+        namespace: ChainNamespace::parse(&format!("eip155:{chain}")).unwrap(),
         settlement_contract: Some(AddressBytes::new(pool_bytes.to_vec()).unwrap()),
         pool: Some(AddressBytes::new(pool_bytes.to_vec()).unwrap()),
         verifier_version: 2,
     };
-    template.asset = AssetId::parse(&format!("eip155:31337/erc20:{token}")).unwrap();
+    template.asset = AssetId::parse(&format!("eip155:{chain}/erc20:{token}")).unwrap();
     template.service.unit = "snapshot".into();
     template.service.quantity = BaseUnits::new(1);
     template.service.fulfillment_method = "http-access-v1".into();
@@ -393,7 +406,7 @@ pub(super) async fn deploy_profile(
     let wallet = WalletStore::new(
         &wallet_path,
         WalletDomain {
-            chain_id: 31337,
+            chain_id: chain,
             pool: pool_bytes,
             verifier_version: 2,
         },
@@ -505,7 +518,7 @@ pub(super) async fn deploy_profile(
         }
         circuit
     }).collect();
-    let manifest = serde_json::to_vec(&json!({"version":1,"chain_id":31337,"settlement_contract":pool,"verifier_version":2,"test_only":true,"circuits":circuits})).unwrap();
+    let manifest = serde_json::to_vec(&json!({"version":1,"chain_id":chain,"settlement_contract":pool,"verifier_version":2,"test_only":true,"circuits":circuits})).unwrap();
     private(&buyer_root.join("manifest.json"), &manifest);
     let mut config = deployment.clone();
     config.as_object_mut().unwrap().remove("artifact_build");
@@ -515,7 +528,7 @@ pub(super) async fn deploy_profile(
     config.as_object_mut().unwrap().remove("wmon");
     config.as_object_mut().unwrap().remove("asset_mode");
     config["state_root"] = json!(buyer_root.join("state"));
-    config["namespace"] = json!("eip155:31337");
+    config["namespace"] = json!(format!("eip155:{chain}"));
     config["verifier_version"] = json!(2);
     config["rpc_url"] = json!(peer_url);
     config["peer_rpc_url"] = json!(honest_url);
@@ -1575,4 +1588,567 @@ async fn hold_metropolis_agent_environment() {
             .to_string(),
     )
     .unwrap();
+}
+
+/// Installed payment and relayer binaries end to end on a local chain-10143 deal:
+/// durable delegation before any network use, no direct fallback across relayer failure,
+/// payment-process and relayer restarts, exactly one finalized sponsor payment and zero
+/// buyer sends. `EREBUS_TEST_SHIELDED_RELAYER` may point at the packaged relayer binary.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Anvil, Node dependencies, M5 artifacts and the installed payment/relayer binaries"]
+async fn installed_payment_delegation() {
+    installed_delegation_with_transport(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires installed Python/MCP/native commands, Anvil, Node and M5 fixture artifacts"]
+async fn installed_mcp_payment_delegation() {
+    assert!(std::env::var_os("EREBUS_TEST_INSTALLED_BIN_DIR").is_some());
+    installed_delegation_with_transport(true).await;
+}
+
+async fn installed_delegation_with_transport(mcp: bool) {
+    use std::process::{Command as ProcessCommand, Stdio as ProcessStdio};
+
+    struct RelayGateway {
+        upstream: String,
+        coordinator_root: PathBuf,
+        buyer: erebus_core::ids::KeyBytes,
+        context: SettlementContext,
+        calls: AtomicUsize,
+        client: reqwest::Client,
+    }
+    async fn relay_gateway(
+        State(state): State<Arc<RelayGateway>>,
+        headers: axum::http::HeaderMap,
+        body: axum::body::Bytes,
+    ) -> (axum::http::StatusCode, Json<Value>) {
+        let coordinator = Coordinator::open(
+            &state.coordinator_root,
+            state.buyer.clone(),
+            state.context.clone(),
+            &state.context,
+            &erebus_shielded_prover::preparation::capabilities(),
+            SpendingPolicy {
+                per_deal_max: BaseUnits::new(75),
+                allowed_assets: [state.context.asset.clone()].into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            coordinator
+                .submission_delegation(OPERATION)
+                .unwrap()
+                .is_some(),
+            "request preceded durable delegation"
+        );
+        let prepared = coordinator.prepared_settlement(OPERATION).unwrap();
+        let decoded = erebus_shielded_prover::relay_request::RelayRequest::decode(&body)
+            .unwrap()
+            .prepared(&state.context)
+            .unwrap();
+        assert_eq!(decoded.backend_evidence, prepared.backend_evidence);
+        state.calls.fetch_add(1, Ordering::SeqCst);
+        // Forwarding must survive the buyer dropping its connection.
+        let result = tokio::spawn(async move {
+            state
+                .client
+                .post(&state.upstream)
+                .header("authorization", headers["authorization"].clone())
+                .header("content-type", "application/json")
+                .body(body.to_vec())
+                .send()
+                .await
+        })
+        .await
+        .unwrap();
+        if let Ok(reply) = result {
+            assert!(matches!(reply.status().as_u16(), 200 | 429 | 503));
+        }
+        // Withhold the acknowledgement after forwarding; a buyer timeout is not nonpayment.
+        tokio::time::sleep(Duration::from_secs(8)).await;
+        (axum::http::StatusCode::SERVICE_UNAVAILABLE, Json(json!({})))
+    }
+
+    struct RelayerProcess {
+        child: std::process::Child,
+    }
+    impl RelayerProcess {
+        fn start(binary: &Path, config: &Path, log: PathBuf) -> Self {
+            let child = ProcessCommand::new(binary)
+                .env("EREBUS_SHIELDED_RELAY_CONFIG", config)
+                .stdout(ProcessStdio::null())
+                .stderr(ProcessStdio::from(fs::File::create(&log).unwrap()))
+                .spawn()
+                .unwrap();
+            Self { child }
+        }
+
+        fn stop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+    impl Drop for RelayerProcess {
+        fn drop(&mut self) {
+            self.stop();
+        }
+    }
+
+    let relayer_binary = std::env::var_os("EREBUS_TEST_SHIELDED_RELAYER")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_erebus-shielded-relayer")));
+    let deployed = deploy_on_chain(10143, false, None, |_| {}).await;
+    let (buyer, _) = deployed.fixture.pair(false);
+    let selected =
+        SelectedAgreement::decode(&fs::read(buyer["evidence_file"].as_str().unwrap()).unwrap())
+            .unwrap();
+    assert_eq!(
+        selected
+            .terms
+            .domain
+            .namespace
+            .reference()
+            .parse::<u64>()
+            .unwrap(),
+        10143
+    );
+    let config = deployed.config.clone();
+    let pool = config["pool"].as_str().unwrap().to_owned();
+    let asset = format!(
+        "0x{}",
+        config["asset"]
+            .as_str()
+            .unwrap()
+            .rsplit("0x")
+            .next()
+            .unwrap()
+    );
+    let sponsor_key = [25; 32];
+    let sponsor = TransactionKey::from_bytes(&sponsor_key).unwrap().address();
+    let sponsor_hex = format!("0x{}", hex::encode(sponsor));
+    rpc(
+        &deployed.client,
+        &deployed.url,
+        "anvil_setBalance",
+        json!([sponsor_hex, "0xde0b6b3a7640000"]),
+    )
+    .await;
+    let root = deployed.buyer_root.clone();
+    let gas_key = root.join("installed-relayer-gas.key");
+    let auth_key = root.join("installed-relayer-auth.key");
+    private(&gas_key, &sponsor_key);
+    private(&auth_key, &[7; 32]);
+    let zkey_path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../circuits/m5/build/transfer.zkey");
+    let zkey = fs::read(&zkey_path).unwrap();
+    // Sponsor sends are counted through this recorder only, so buyer and sponsor sends are separate.
+    let sent: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    struct Recorder {
+        upstream: String,
+        client: reqwest::Client,
+        sent: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+    async fn record(
+        axum::extract::State(state): axum::extract::State<Arc<Recorder>>,
+        axum::Json(request): axum::Json<Value>,
+    ) -> axum::Json<Value> {
+        if request["method"] == "eth_sendRawTransaction" {
+            state
+                .sent
+                .lock()
+                .unwrap()
+                .push(request["params"][0].as_str().unwrap().to_owned());
+        }
+        axum::Json(
+            state
+                .client
+                .post(&state.upstream)
+                .json(&request)
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap(),
+        )
+    }
+    let recorder = Arc::new(Recorder {
+        upstream: deployed.url.clone(),
+        client: deployed.client.clone(),
+        sent: sent.clone(),
+    });
+    let recorder_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let recorder_url = format!("http://{}", recorder_listener.local_addr().unwrap());
+    let recorder_app = axum::Router::new()
+        .route("/", axum::routing::post(record))
+        .with_state(recorder);
+    let _recorder_server = tokio::spawn(async move {
+        axum::serve(recorder_listener, recorder_app).await.unwrap();
+    });
+    let relay_port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let relayer_config = root.join("installed-relayer.json");
+    private(
+        &relayer_config,
+        &serde_json::to_vec(&json!({
+            "version": 1, "chain_id": 10143, "pool": pool, "asset": asset,
+            "verifier_version": 2,
+            "first_block": config["first_block"], "first_hash": config["first_hash"],
+            "runtime_pins": {
+                "pool": config["runtime_keccak256"], "poseidon": config["poseidon_keccak256"],
+                "deposit": config["deposit_verifier_keccak256"],
+                "transfer": config["transfer_verifier_keccak256"],
+                "withdraw": config["withdraw_verifier_keccak256"],
+            },
+            "transfer_zkey_file": zkey_path,
+            "transfer_zkey_sha256": format!("{:x}", Sha256::digest(&zkey)),
+            "transaction_key_file": gas_key, "authentication_key_file": auth_key,
+            "sponsor": sponsor_hex,
+            "state_root": root.join("installed-relayer-state"),
+            "signer_journal_root": root.join("installed-relayer-nonces"),
+            "rpc_url": recorder_url, "peer_rpc_url": deployed.url,
+            "port": relay_port, "gas_limit": 3_000_000,
+            "max_fee_per_gas": "2000000000", "max_priority_fee_per_gas": "1000000000",
+            "maximum_gas_budget": "6000000000000000", "maximum_operations": 1,
+            "requests_per_window": 50, "window_seconds": 60, "timeout_seconds": 60,
+            "allow_test_artifacts": true,
+        }))
+        .unwrap(),
+    );
+    let actual_endpoint = format!("http://127.0.0.1:{relay_port}/v1/relay");
+    let gateway_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let gateway_address = gateway_listener.local_addr().unwrap();
+    let endpoint = format!("http://{gateway_address}/v1/relay");
+    drop(gateway_listener);
+    let gateway_context = SettlementContext {
+        domain: selected.terms.domain.clone(),
+        asset: selected.terms.asset.clone(),
+        suite_id: 2,
+        mode: SettlementMode::Shielded,
+        required_guarantees: selected.terms.required_guarantees,
+        require_local_proving: true,
+    };
+    let gateway = Arc::new(RelayGateway {
+        upstream: actual_endpoint,
+        coordinator_root: root.join("state/coordinator"),
+        buyer: selected.terms.buyer_authorization_key.clone(),
+        context: gateway_context,
+        calls: AtomicUsize::new(0),
+        client: deployed.client.clone(),
+    });
+    let mut sponsored = deployed.config.clone();
+    sponsored["relay"] = json!({
+        "url": endpoint, "identity": "01".repeat(32),
+        "authentication_key_file": auth_key, "sponsor_address": sponsor_hex,
+        "timeout_seconds": 5, "allow_loopback_http": true,
+    });
+    sponsored["transaction_key_file"] = Value::Null;
+    let sponsored_path = root.join("installed-sponsored.json");
+    private(&sponsored_path, &serde_json::to_vec(&sponsored).unwrap());
+    let mut direct = deployed.config.clone();
+    direct.as_object_mut().unwrap().remove("relay");
+    let direct_path = root.join("installed-direct.json");
+    private(&direct_path, &serde_json::to_vec(&direct).unwrap());
+    let binary = native_binary("erebus-payment", env!("CARGO_BIN_EXE_erebus-payment"));
+    let negotiation_config = deployed.fixture.buyer_config.clone();
+    let run_payment = |binary: &Path, cwd: &Path, config: &Path, method: &str| {
+        let binary = binary.to_owned();
+        let cwd = cwd.to_owned();
+        let config = config.to_owned();
+        let method = method.to_owned();
+        let negotiation = negotiation_config.clone();
+        async move {
+            if !mcp {
+                return super::run_payment(&binary, &cwd, &config, &method).await;
+            }
+            let bins = binary.parent().unwrap();
+            let mut process = ProcessCommand::new(bins.join("python"));
+            process
+                .arg(
+                    Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("tests/support/installed_mcp_payment.py"),
+                )
+                .arg(bins)
+                .arg(negotiation)
+                .arg(config)
+                .arg(method)
+                .arg(hex::encode(OPERATION))
+                .current_dir(cwd)
+                .stdin(ProcessStdio::null())
+                .stdout(ProcessStdio::piped())
+                .stderr(ProcessStdio::piped());
+            finish_with_timeout(
+                Running(Some(process.spawn().unwrap())),
+                Duration::from_secs(180),
+            )
+        }
+    };
+    let buyer_sends = || deployed.sends.load(Ordering::SeqCst);
+    let sponsor_sends = || sent.lock().unwrap().len();
+
+    assert_ne!(config["signer_address"], sponsor_hex);
+    let mut missing = sponsored.clone();
+    missing["relay"]["authentication_key_file"] = json!(root.join("missing-relay.key"));
+    let missing_path = root.join("installed-missing-auth.json");
+    private(&missing_path, &serde_json::to_vec(&missing).unwrap());
+    let (_, missing_reply) = run_payment(
+        &binary,
+        deployed.fixture.root.path(),
+        &missing_path,
+        "settle",
+    )
+    .await;
+    assert_eq!(missing_reply["status"], "error");
+    let coordinator = Coordinator::open(
+        root.join("state/coordinator"),
+        selected.terms.buyer_authorization_key.clone(),
+        gateway.context.clone(),
+        &gateway.context,
+        &erebus_shielded_prover::preparation::capabilities(),
+        SpendingPolicy {
+            per_deal_max: BaseUnits::new(75),
+            allowed_assets: [selected.terms.asset.clone()].into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let delegation = coordinator
+        .submission_delegation(OPERATION)
+        .unwrap()
+        .expect("credential failure lost the delegation");
+    assert_eq!(
+        delegation.calldata_keccak256,
+        keccak256(&[&coordinator
+            .prepared_settlement(OPERATION)
+            .unwrap()
+            .backend_evidence])
+    );
+    assert_eq!(gateway.calls.load(Ordering::SeqCst), 0);
+    assert!(deployed
+        .wallet
+        .snapshot()
+        .unwrap()
+        .notes()
+        .iter()
+        .any(|note| note.amount() == 150
+            && note.reserved() == Some(OPERATION)
+            && note.consumption().is_none()));
+
+    // 1. Relayer unavailable: delegation is durable before any transport and nothing is sent.
+    let (_, down) = run_payment(
+        &binary,
+        deployed.fixture.root.path(),
+        &sponsored_path,
+        "settle",
+    )
+    .await;
+    assert_eq!(down["submission_delegated"], true, "{down}");
+    assert_eq!(down["submitted_this_call"], false, "{down}");
+    assert_eq!(down["relay_status"], "unavailable", "{down}");
+    assert_eq!(buyer_sends(), 0);
+    assert_eq!(sponsor_sends(), 0);
+
+    // 2. A fresh payment process keeps the delegation across restart; still nothing is sent.
+    let (_, restarted) = run_payment(
+        &binary,
+        deployed.fixture.root.path(),
+        &sponsored_path,
+        "settle",
+    )
+    .await;
+    assert_eq!(restarted["submission_delegated"], true, "{restarted}");
+    assert_eq!(restarted["submitted_this_call"], false, "{restarted}");
+    assert_eq!(buyer_sends(), 0);
+    assert_eq!(sponsor_sends(), 0);
+
+    // 3. The installed relayer submits exactly one sponsor payment; the buyer still never signs.
+    let gateway_listener = tokio::net::TcpListener::bind(gateway_address)
+        .await
+        .unwrap();
+    let gateway_state = gateway.clone();
+    let gateway_server = tokio::spawn(async move {
+        axum::serve(
+            gateway_listener,
+            Router::new()
+                .route("/v1/relay", post(relay_gateway))
+                .with_state(gateway_state),
+        )
+        .await
+        .unwrap();
+    });
+    let mut relayer = RelayerProcess::start(
+        &relayer_binary,
+        &relayer_config,
+        root.join("installed-relayer-1.err"),
+    );
+    for _ in 0..100 {
+        if deployed
+            .client
+            .get(format!("http://127.0.0.1:{relay_port}/healthz"))
+            .send()
+            .await
+            .is_ok_and(|reply| reply.status().is_success())
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let (_, submitted) = run_payment(
+        &binary,
+        deployed.fixture.root.path(),
+        &sponsored_path,
+        "settle",
+    )
+    .await;
+    assert_eq!(submitted["submission_delegated"], true, "{submitted}");
+    assert_eq!(submitted["submitted_this_call"], false, "{submitted}");
+    assert_eq!(submitted["payment_verified"], false, "{submitted}");
+    assert_eq!(
+        submitted["relay_status"], "unavailable",
+        "the timeout must remain unknown"
+    );
+    for _ in 0..200 {
+        if sponsor_sends() == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(sponsor_sends(), 1, "{submitted}");
+    assert_eq!(buyer_sends(), 0);
+    let raw = sent.lock().unwrap()[0].clone();
+    let signed =
+        SignedTransaction::from_raw(&hex::decode(raw.trim_start_matches("0x")).unwrap()).unwrap();
+    let tx = format!("0x{}", hex::encode(signed.hash()));
+    assert_eq!(
+        signed.input(),
+        coordinator
+            .prepared_settlement(OPERATION)
+            .unwrap()
+            .backend_evidence
+    );
+    assert_eq!(signed.params().value, 0);
+
+    // 4. Relayer restart plus a duplicate request never sends twice.
+    relayer.stop();
+    relayer = RelayerProcess::start(
+        &relayer_binary,
+        &relayer_config,
+        root.join("installed-relayer-2.err"),
+    );
+    for _ in 0..100 {
+        if deployed
+            .client
+            .get(format!("http://127.0.0.1:{relay_port}/healthz"))
+            .send()
+            .await
+            .is_ok_and(|reply| reply.status().is_success())
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let (_, duplicate) = run_payment(
+        &binary,
+        deployed.fixture.root.path(),
+        &sponsored_path,
+        "settle",
+    )
+    .await;
+    assert_eq!(duplicate["submission_delegated"], true, "{duplicate}");
+    assert_eq!(duplicate["submitted_this_call"], false, "{duplicate}");
+    assert_eq!(
+        sponsor_sends(),
+        1,
+        "a duplicate settle after a relayer restart must never send twice: {duplicate}"
+    );
+    assert_eq!(buyer_sends(), 0);
+
+    // 5. Removing the relay and restoring the buyer key cannot authorize direct signing.
+    let (_, fenced) = run_payment(
+        &binary,
+        deployed.fixture.root.path(),
+        &direct_path,
+        "settle",
+    )
+    .await;
+    assert_eq!(fenced["submitted_this_call"], false, "{fenced}");
+    assert_eq!(buyer_sends(), 0);
+    assert_eq!(sponsor_sends(), 1);
+
+    // 6. Exactly one finalized payment: sponsor sender, pool target, buyer never signed.
+    rpc(
+        &deployed.client,
+        &deployed.url,
+        "anvil_mine",
+        json!(["0x4"]),
+    )
+    .await;
+    let receipt = rpc(
+        &deployed.client,
+        &deployed.url,
+        "eth_getTransactionReceipt",
+        json!([tx]),
+    )
+    .await;
+    assert_eq!(receipt["status"], "0x1", "{receipt}");
+    assert_eq!(receipt["from"], sponsor_hex, "{receipt}");
+    assert_eq!(
+        receipt["to"].as_str().unwrap().to_lowercase(),
+        pool.to_lowercase(),
+        "{receipt}"
+    );
+    rpc(
+        &deployed.client,
+        &deployed.url,
+        "anvil_mine",
+        json!(["0x40"]),
+    )
+    .await;
+    let (ok, recovered) = run_payment(
+        &binary,
+        deployed.fixture.root.path(),
+        &direct_path,
+        "observe",
+    )
+    .await;
+    assert!(ok, "{recovered}");
+    assert_eq!(recovered["payment_verified"], true, "{recovered}");
+    assert_eq!(recovered["submitted_this_call"], false, "{recovered}");
+    assert_eq!(buyer_sends(), 0);
+    assert_eq!(sponsor_sends(), 1);
+    assert_eq!(
+        rpc(
+            &deployed.client,
+            &deployed.url,
+            "eth_getTransactionCount",
+            json!([config["signer_address"], "latest"])
+        )
+        .await,
+        "0x0"
+    );
+    assert_eq!(receipt["logs"].as_array().unwrap().len(), 3);
+    gateway_server.abort();
+    relayer.stop();
+    eprintln!(
+        "EREBUS_EVIDENCE {}",
+        json!({
+            "status": "installed-payment-delegation",
+            "transport": if mcp { "installed-mcp" } else { "installed-cli" },
+            "buyer_sends": buyer_sends(),
+            "sponsor_sends": sponsor_sends(),
+            "finalized_transaction": tx,
+            "sponsor_sender": sponsor_hex,
+            "payment_verified": true,
+            "delegation_before_transport": true,
+            "timeout_or_lost_response": true,
+            "buyer_restart": true,
+            "relay_unavailable": true,
+            "no_direct_fallback": true,
+        })
+    );
 }

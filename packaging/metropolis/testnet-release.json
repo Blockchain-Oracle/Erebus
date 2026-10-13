@@ -2,15 +2,15 @@
   "channel": "metropolis-testnet-shielded",
   "repository": "PoulavBhowmick03/erebus-metropolis",
   "artifact_tag": "artifacts-268bf1abe34d",
-  "package_version": "0.3.0.dev2026101202",
+  "package_version": "0.3.0.dev2026101307",
   "publisher": "0xcd71b49f350f536ee4c4a27c8d0104be91f684fe",
   "hosting_manifests": {
     "wmon": "3c1285e7c655fb516031380820fe49841a2e60193ead0e14c9293b4b1b4d9112",
     "usdc": "b6e1fb62cee01d37adca8fb7e9f35dd463d2c7edd8344c508e28943cac29c5be"
   },
-  "owner_authorized_date": "2026-10-12",
+  "owner_authorized_date": "2026-10-13",
   "artifact_publication_authorized": true,
-  "package_publication_condition": "All clean-source native macOS/Linux, real HTTPS, proving-domain and installed rehearsal gates pass",
+  "package_publication_condition": "All clean-source native macOS/Linux, real HTTPS, proving-domain, generated-agent workflow and installed relayer gates pass; owner requested autonomous shipping on 2026-10-13",
   "qualification_publish": false,
   "test_only": true,
   "single_operator": true,
