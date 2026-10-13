@@ -846,6 +846,10 @@ async def workflow(arguments: argparse.Namespace) -> dict:
                     "claims": {"native_platform_qualification": native, "live_payment": False,
                                "note": "loopback Anvil chain 10143 with mock assets; not live Monad evidence"},
                     "source_imports": False, "public_rpc_used": False}
+    if arguments.demo_main_only:
+        report.update(demo_only=True, gate_complete=False, publication_evidence=False,
+                      coverage_gaps=["timeout_and_reservation", "backup_restore", "endpoint_change", "deadline"])
+        report["claims"]["native_platform_qualification"] = False
     try:
         deployment, report["chain"] = chain.deploy(work, arguments.deployment_journal)
         pins = work / "pins"
@@ -867,8 +871,8 @@ async def workflow(arguments: argparse.Namespace) -> dict:
         report["pools"] = {}
         for index, name in enumerate(arguments.pools):
             pool = Pool(name, installed, chain, deployment, pins, work, dev_keys, prepublication=prepublication)
-            pool.report["main"] = await pool.main_pair(extended=index == 0)
-            if index == 0:
+            pool.report["main"] = await pool.main_pair(extended=index == 0 and not arguments.demo_main_only)
+            if index == 0 and not arguments.demo_main_only:
                 pool.report["deadline"] = await pool.deadline_pair()
             report["pools"][name] = pool.report
         report["total_operator_broadcasts"] = chain.sends()
@@ -900,6 +904,8 @@ def bootstrap(arguments: argparse.Namespace) -> int:
                "--deployment-journal", str(arguments.deployment_journal.resolve())]
     if arguments.prepublication_authorization is not None:
         command += ["--prepublication-authorization", str(arguments.prepublication_authorization.resolve())]
+    if arguments.demo_main_only:
+        command += ["--demo-main-only"]
     environment = {key: value for key, value in os.environ.items() if not key.startswith(("EREBUS_", "VIRTUAL_ENV", "PYTHON"))}
     environment["PATH"] = f"{bins}:{os.environ.get('PATH', '/usr/bin:/bin')}"
     return subprocess.run(command, env=environment, check=False).returncode
@@ -914,6 +920,8 @@ def main() -> int:
     parser.add_argument("--pools", default="wmon,usdc", type=lambda value: value.split(","))
     parser.add_argument("--phase", choices=("bootstrap", "run"), default="bootstrap")
     parser.add_argument("--hold-on-failure", action="store_true", help="keep the loopback chain up for diagnosis")
+    parser.add_argument("--demo-main-only", action="store_true",
+                        help="record the core MCP workflow only; explicitly incomplete and never publication evidence")
     parser.add_argument("--deployment-journal", type=Path, default=JOURNAL,
                         help="directory with the six signed production deployment transactions (<n>-signed.json)")
     parser.add_argument("--prepublication-authorization", type=Path,

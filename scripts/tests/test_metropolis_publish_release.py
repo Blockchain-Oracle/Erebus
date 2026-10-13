@@ -192,6 +192,7 @@ def test_the_named_run_must_be_the_successful_qualification_of_this_commit():
     ("relayer", lambda r: r.update(source_commit="6" * 40), "stale or for other packages"),
     ("workflow", lambda r: r.update(pins_mode="rehearsal"), "not pinned to this authorized version"),
     ("workflow", lambda r: r.update(rehearsal=True, publication_evidence=False), "never publication evidence"),
+    ("workflow", lambda r: r.update(demo_only=True, gate_complete=False, publication_evidence=False), "never publication evidence"),
     ("workflow", lambda r: r["claims"].update(native_platform_qualification=False), "native hosted runner"),
     ("workflow", lambda r: r["pools"].pop("usdc"), "exactly the authorized pools"),
     ("workflow", lambda r: r["pools"]["wmon"]["main"]["deal"].update(settlement_broadcasts=2), "payment, delivery and audit"),
