@@ -46,9 +46,6 @@ export default function UseCases() {
               <a href="https://docs.erebusagents.live/monad" className="link">
                 Monad setup ↗
               </a>
-              <a href="https://docs.erebusagents.live/monad/use-cases" className="link">
-                Use cases in the docs ↗
-              </a>
             </p>
           </div>
 
@@ -151,7 +148,7 @@ export default function UseCases() {
             </div>
 
             <div className="mt-10">
-              <Snippet label="run it" command={useCase.command} />
+              <Snippet label="run it" command={useCase.command} glow />
               <div className="mt-4">
                 <SourceLinks paths={useCase.sources} />
               </div>
