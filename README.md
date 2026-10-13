@@ -11,8 +11,8 @@ about through it.
 
 ## Metropolis development
 
-**Monad reviewers: start here, not at the Starknet install below.**
-Use the [Metropolis install guide](./docs/metropolis-install.md) and
+**Monad reviewers and judges: start at [JUDGES.md](./JUDGES.md), not at the Starknet install below.**
+It links the [Metropolis install guide](./docs/metropolis-install.md) and
 [operations guide](./docs/metropolis-operations.md). The stable `v0.3.0`
 package and the video below demonstrate the older Starknet product, not Monad.
 
