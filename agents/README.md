@@ -41,7 +41,41 @@ seller-authored offer.
   selects and exports one deal to the auditor's key, the auditor verifies the agreement and polls
   the payment check. It never reports delivery as verified. Evidence and grant files are
   create-new, so re-issuing takes fresh `--evidence-name`/`--grant-name` values. Also a CLI.
+- `marketplace.py` / `marketplace_demo.py`. A capability marketplace on the real Metropolis
+  loop. Sellers publish a `ServiceListing` into a file-backed `ServiceRegistry`; the buyer's
+  operator keeps a route file (`PurchaseRoute`) mapping each listing to the configured servers for
+  that seller, since each negotiation file pins exactly one peer. The buyer picks the cheapest
+  routed listing inside its ceiling and buys it through `metropolis_loop.run_over_mcp`: negotiate,
+  settle at most once, recover by observation until finalized, and retrieve the resource when
+  access is configured. The advertised band only chooses the seller; the agreed price is fixed by
+  operator files and capped natively by the buyer's `maximum_price`. Delivery state
+  (`PENDING`/`DELIVERED`/`REFUNDED`/`DISPUTED`) is kept apart from settlement on purpose: the
+  protocol never proves delivery.
+- `api_gateway_demo.py`. Pay per call over the operator-selected `x402-exact` rail: one deal per
+  call through the participants' real MCP servers (`metropolis_loop.drive_x402_deal`), so every
+  retry is a retrieval reusing the retained permit. Operation IDs are written to an owner-only
+  ledger before the first call, and an interrupted run resumes from the same ledger. Standard
+  x402 is public, never private; payment is verified only by an independent auditor.
+- `receipt_explorer.py`. Renders one disclosed deal as a private receipt from a
+  `metropolis_audit.py` report, and nothing else. It keeps agreement, payment and delivery
+  distinct, refuses a receipt that claims delivery verification, and exports text, JSON or a
+  self-contained static HTML file. Also a CLI.
 - `demo.py` / `demo_mcp.py`, the two CLI entry points above.
+
+```bash
+# Marketplace: buy the cheapest routed listing through the real Metropolis servers
+uv run python agents/src/erebus_agents/marketplace_demo.py --registry registry.json \
+  --routes buyer-routes.json --capability summarize-documents --ceiling-unit-price 8 \
+  --operation <64-hex operation ID; reuse it after any interruption>
+
+# Paid API gateway: per-call access over the public x402-exact rail (not private)
+uv run python agents/src/erebus_agents/api_gateway_demo.py --buyer-negotiation buyer.json \
+  --buyer-access buyer-access.json --seller-negotiation seller.json --calls 3 --ledger calls.json
+
+# Receipt explorer: format the report metropolis_audit.py produced
+uv run python agents/src/erebus_agents/receipt_explorer.py --report audit.json \
+  --issuer <participant> --format text   # or --format html --out receipt.html
+```
 
 ## Where it sits
 
