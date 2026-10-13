@@ -1,5 +1,7 @@
 # Erebus Metropolis Architecture
 
+Implementation order and completion criteria: [Metropolis roadmap](metropolis-roadmap.md).
+
 ## 1. Goal and current boundary
 
 Erebus owns private negotiation and agreement semantics. Each settlement backend enforces its declared guarantees on one chain.
@@ -26,7 +28,7 @@ Three cryptographic jobs are separable and must not be conflated:
 | Agreement authorization | Signatures, or a proof when signer identity must stay hidden | Only to hide the signer |
 | Private settlement | The backend's privacy mechanism | Only for the shielded guarantee |
 
-Only private settlement makes zero-knowledge mandatory, and only for the shielded guarantee.
+The planned shielded EVM backend requires zero-knowledge proofs. Other privacy mechanisms need their own trust and capability declarations.
 The core therefore must not assume that every backend generates a proof. A backend declares the
 guarantees it provides; a TEE attestation or a native private rollup could satisfy the same
 interface without one. Coupling the core to proofs would re-couple Erebus to one privacy
@@ -85,7 +87,8 @@ those deployments differ in backend, not in adapter.
 
 Offchain Eleusis transport is new work. Existing STRK20 note transport cannot become a network transport through a configuration change.
 Start with explicit peer keys and endpoints. Discovery and identity registries remain separate integration decisions.
-Discovery, negotiation, and message transport are chain-independent; only settlement touches a chain.
+The new discovery and negotiation protocol does not require chain transactions. Funding, settlement, receipt verification, and note discovery use chain access.
+The existing STRK20 channel transport remains onchain until a separate migration is implemented.
 
 ## 3. One deal, end to end
 
@@ -117,23 +120,41 @@ Both authorizations permit settlement. They do not guarantee submission or servi
 A backend that requires no proof omits the prover step; the coordinator submits the authorized
 transition directly. This diagram shows the shielded path.
 
+For the shielded developer product, the local prover is an implementation detail of the
+installed Erebus client/MCP package, not a separately operated service. The package must
+obtain the shared, versioned circuit/proving artifacts, verify their published hashes and
+deployed verifier identity, and fail closed on a mismatch. Operators keep spend secrets and
+witnesses locally; they do not run a setup ceremony. Artifact download availability and local
+CPU/RAM requirements remain explicit operational dependencies.
+M8 now has hash-checked artifact installation and isolated SDK/MCP component proof tests.
+Published platform packages, secure release artifacts, and live verifier authentication remain open.
+See the [local proving section](metropolis-operations.md#7-local-proving).
+
 ## 4. Agreement representation
 
-The following fields are conceptual. Freeze the byte encoding and cryptographic suite before implementation.
+Frozen at M1: the v1 field list, canonical encoding, commitment, authorization digest, and deal identity are specified in [metropolis-agreement.md](metropolis-agreement.md) and implemented in [`sdk/core`](../sdk/core). Three differences from the earlier conceptual draft are recorded here:
+
+- `chain_id` is carried inside the CAIP-2 chain namespace, not as a separate field.
+- `recipient_note_key` is named `payment_recipient`: a public-bound backend pays a visible address, a shielded backend pays a note key, and the backend interprets the bytes.
+- `terms_digest` was removed; the blinded commitment is the digest. The service record, settlement mode, and required guarantees are committed fields.
 
 ```text
-Deal D = {
-  protocol_version, suite_id,
-  domain: {chain_namespace, chain_id, settlement_contract, pool, verifier_version},
-  deal_id, revision, transcript_root,
-  buyer_authorization_key, seller_authorization_key,
-  recipient_note_key, asset_identifier, amount_base_units,
-  expiry, terms_digest, fee_policy,
-  settlement_nonce
-}
-Cdeal = Commit("EREBUS_DEAL_V1", Encode(D), random_blinding)
-Authorization = Sign(role_tag, domain, Cdeal)
+Cdeal = Commit_suite(D, blinding)
+Authorization = Sign_suite(role_tag, domain, Cdeal)
+Ndeal = Nullify_suite(domain, buyer_key, settlement_nonce)
+transcript_root = Keccak256_v1(...)   // transport hash version 1, independent of the suite
 ```
+
+There are two hash families, and they are versioned separately:
+
+- **Agreement suite.** Suite 1 hashes canonical bytes with keccak256
+  (`"EREBUS_DEAL_COMMITMENT_V1" || Encode(D) || blinding`). Suite 2 uses the typed Poseidon
+  field map in [status decisions appendix](metropolis-status.md#decisions-appendix). A suite is not a byte-hash
+  function, so `sdk/core` has no shared `Suite::hash`.
+- **Transport transcript.** Message digests, author chain links, and `transcript_root` use
+  keccak256 under `TRANSCRIPT_HASH_VERSION = 1` (`sdk/transport/src/hashing.rs`), whatever
+  suite the agreement selects. The suite-2 circuit carries the root as two opaque 128-bit
+  halves. Changing the transcript hash or its encoding requires a new transport hash version.
 
 Use fresh cryptographic randomness for the blinding value. A hash of predictable prices and addresses alone does not hide terms.
 Specify lengths, field order, integer bounds, endianness, and address namespaces. Reject ambiguous encodings and field reductions.
@@ -142,8 +163,15 @@ Bind relayer fees and any recipient restrictions into the authorized fee policy.
 
 Messages need a session ID, deal ID, revision, author, sequence, parent hash, type, and authenticated payload.
 The final transcript root commits to the agreed transcript. It does not prove that every unshared message exists or that business claims are true.
+The M8 negotiation profile freezes that transcript before final authorizations.
+Both peers accept the same draft digest; final signatures remain outside the root they authorize.
+The buyer reserves policy capacity before signing, through the existing coordinator.
+For shielded negotiation, an encrypted descriptor-signed binding authenticates each separate agreement key.
+These are the owner's decisions [DM8-6 and DM8-7](metropolis-status.md#m8-decisions-dm8-1dm8-13-and-dm8-15).
+The [negotiation section](metropolis-operations.md#5-negotiation-command) records the command; [status](metropolis-status.md) records evidence and remaining gates.
 Authenticating a shared encryption key alone cannot establish which participant authored a message to an auditor.
 Choose a signature scheme for independently verifiable authorship where disclosure requires it.
+M2 specifies the envelope, the Noise session protocol, the ordering rules, and the transcript-root derivation in [status decisions appendix](metropolis-status.md#decisions-appendix); the transport is implemented in [`sdk/transport`](../sdk/transport).
 There must be exactly one deterministic encoding: both participants must compute the same
 commitment from the same terms. Any representation ambiguity — decimals, base units, address
 namespace, field order — is a protocol bug that silently forks the agreement.
@@ -156,7 +184,7 @@ The verifier must enforce the following relation, including the pool transition:
 Public inputs:
   domain, Cdeal, Ndeal, accepted_input_root,
   input_note_nullifiers, output_note_commitments,
-  output_ciphertext_digest, expiry, authorized_public_fee_fields
+  output recovery data as required by the backend, expiry, authorized_public_fee_fields
 
 Private witness:
   D, commitment_blinding, both authorizations,
@@ -172,7 +200,7 @@ Constraints:
   payment.recipient == D.recipient_note_key
   inputs == payment + change + authorized fees, per asset
   all amounts satisfy range constraints
-  output commitments and recoverable ciphertexts describe those outputs
+  output commitments describe recoverable notes owned by the intended recipients
   Ndeal derives from the unique authorized settlement identity
 ```
 
@@ -183,14 +211,17 @@ Publishing expiry leaks expiry. A hidden expiry requires an additional proof des
 
 An agreement proof and a pool proof cannot be unrelated valid proofs.
 They must share constrained payment commitments and transaction context, and execute atomically.
-A combined circuit or a supported pool verification hook can provide this binding. The choice is unresolved.
-Binding a ciphertext digest alone does not prove decryptability. Define encryption correctness constraints or a recipient acknowledgment protocol.
+M4 selected a combined Circom/Groth16 relation for the initial EVM pool; see
+[status decisions appendix](metropolis-status.md#decisions-appendix). The seller chooses a spend tag and signs only
+after checking that it controls the secret. The payment-note salt derives from the signed
+deal nonce, so the seller can reconstruct its output without ciphertext. The M4 harness proves
+this relation locally but does not yet hold funds or maintain a live tree.
 
-For an exact authorized agreement, a deterministic domain-separated hash of `Cdeal` can serve as its replay identifier.
-This openly links the identifier to the commitment. Hiding that link is not required for replay prevention.
-Do not let the prover choose a new nullifier secret for each attempt.
-If multiple signed revisions must be mutually exclusive, derive the nullifier from a fixed deal identity committed in every revision.
-Resolve that rule before freezing the circuit. Pool note nullifiers prevent double spending but do not prevent repeat payment from different notes.
+M0 selects one consumption identity across every signed revision of a deal, as specified in D02 of the decision record.
+Derive it from the deployment domain, buyer identity, and a fixed random settlement nonce authorized in every revision.
+Do not let the prover choose a new nonce for each settlement attempt.
+The first valid revision to settle consumes the deal. A counteroffer does not revoke earlier signed permission.
+Pool note nullifiers prevent double spending but do not prevent repeat payment from different notes.
 
 ## 6. Backend contract and migration
 
@@ -200,13 +231,27 @@ Define behavior before choosing Rust trait syntax:
 |---|---|
 | `capabilities()` | Declare privacy, agreement enforcement, authorization, and finality support |
 | `prepare(agreement, operation_id)` | Persist canonical intent and create a backend-specific prepared settlement |
-| `prove(prepared)` | Optional. Produce proof material when the backend requires it, without sending secrets to the relayer |
+| Backend-internal evidence preparation | Produce signatures or proofs as required. No public `prove` method is mandatory in the common interface |
 | `submit(prepared)` | Submit the same authorized transition and record its transaction identity |
 | `status(operation_id)` | Return unknown, pending, included, finalized, reverted, or expired |
 | `verify(receipt)` | Verify domain, agreement binding, state transition, and chain evidence |
 
+M1 implements the shared capability, prepared-settlement, receipt, and recovery types in `erebus_core::settlement`.
+The canonical backend lifecycle above remains an M3/M6 implementation target.
+The existing public settlement method now delegates through `sdk/rs/src/strk20_settlement.rs`.
+This legacy adapter checks requirements before calling the unchanged STRK20 execution body.
+It declares hidden amount and recipient, but no canonical suite, proof-enforced agreement binding, or local proving.
+Wire-v3 scoped disclosure remains available separately; it is not a guarantee common to historical channels.
+
 Keep funding and withdrawal as explicit wallet operations. Negotiation must not silently authorize either.
 Core types must not assume a Starknet `Felt`, EVM address, proof system, or transaction format.
+
+Scoped disclosure has separate agreement and payment checks. The owner selected direct suite-2 signing for shielded grants.
+Version-2 grants use a participant's agreement seed locally and a distinct disclosure-signature domain.
+The auditor verifies the issuer against the disclosed buyer or seller key before observing payment.
+Public-bound version-1 grants remain supported. Neither grant contains spending secrets or parent session keys.
+Public grant headers reveal the issuer identity, recipient public key, deal ID, expiry, and ciphertext size.
+See [status decisions appendix](metropolis-status.md#decisions-appendix) for the encoding and the [disclosure section](metropolis-operations.md#6-disclosure-and-auditor-operations) for CLI/MCP commands.
 A receipt includes domain, commitment, nullifier, transaction and block identifiers, finality state, and the verified guarantee set.
 The caller rejects a backend that lacks a required guarantee. Never silently downgrade to public settlement.
 
@@ -218,14 +263,23 @@ ERC-20 settlement cannot satisfy hidden amount and recipient and must not be cho
 that requires them.
 
 Two EVM milestones are distinct. V1 binds a publicly visible settlement to the accepted deal
-through signatures and contract state; it preserves negotiation privacy but not settlement
-privacy. V2 hides amount and recipient behind a proof and is the analogue of the STRK20
+through signatures and contract state. Its calldata exposes the full accepted canonical
+agreement, blinding, and final signatures, including the service fields.
+The offchain transcript and rejected offers remain confidential; accepted terms do not.
+V2 hides amount and recipient behind a proof and is the analogue of the STRK20
 backend. V1 exercises the coordinator and backend boundary; it does not satisfy the shielded
 guarantee and must not be presented as though it does.
 
 Proposed lifecycle: `Negotiating -> Authorized -> Prepared -> Submitted -> Included -> Finalized`.
 `Unknown` requires reconciliation, not a fresh payment. Reorgs can return included transactions to pending or unknown.
 An expired unsubmitted agreement cannot settle. A local timeout does not prove that an already submitted transaction failed.
+
+The Metropolis EVM operator default requires two matching RPC providers before changing
+payment accounting, recovered note state, or finalized signer claims. Incomplete history,
+provider failure, and disagreement keep reservations held. Broadcast failover does not
+reduce verification to one provider. Each observer uses a separate persistent history cache.
+This is a consistency check, not consensus proof; operators must choose independent providers.
+Honest provider lag can also delay recovery. See [status decisions appendix](metropolis-status.md#decisions-appendix) (DM6-5).
 
 Keep existing STRK20 codecs and execution behind its adapter.
 Extract shared semantics only after tests describe their current behavior.
@@ -240,17 +294,29 @@ Record your choice, reasoning, and evidence for each item before building the de
 |---|---|
 | EVM privacy pool and integration hook | Small private transfer with enforceable agreement binding |
 | Circuit, commitment hash, and authorization scheme | Rust/circuit vectors, proof timing, verifier cost, reviewable dependencies |
-| Exact-agreement versus deal-wide replay rule | Tests with two signed revisions and different funding notes |
+| Deal-wide replay rule (M0 D02) | Tests with two signed revisions and different funding notes |
 | Transport and key establishment | Peer authentication, nonce rules, crash recovery, metadata exposure |
 | Output delivery and encryption | Seller recovers spendable payment after buyer disconnects |
 | Disclosure storage and retention | Auditor reconstructs the deal after the relay loses its copy |
-| x402 integration | Defined scheme and receipt verification without a second payment |
+| x402 integration | Compare per-request, prepaid-allocation, and batched models using measured cost and latency; then define one scheme and receipt verification without a second payment |
 | Chain selection model | Recommended: fixed at session creation before negotiation; negotiating the chain itself is out of scope |
-| EVM milestone | V1 public-bound versus V2 shielded, and which one the demo must demonstrate |
+| EVM milestone (M0 D01) | V1 is intermediate. V2 shielded is required for the final product demo |
 | Backend selection by guarantee | A required guarantee that a backend cannot provide must fail, not silently downgrade |
 
 EIP-712 provides EVM typed signing, but no replay protection. Public signature recovery also reveals the signer.
 Private authorization needs a compatible proof design; EIP-712 alone does not provide it. See [EIP-712](https://eips.ethereum.org/EIPS/eip-712).
 Use established encryption implementations. [HPKE](https://www.rfc-editor.org/rfc/rfc9180) is a candidate building block, not a complete session protocol.
-x402 is a payment and fulfilment mechanism beneath an EVM backend, not the settlement coordinator and not a second settlement.
-Erebus owns the agreement; x402 owns resource access. There must be exactly one payment.
+x402 composition requires an explicitly supported payment scheme and resource-server integration.
+The resource server controls access issuance. There must be exactly one payment, and payment finality does not prove service delivery.
+The first HTTP access profile uses the buyer agreement key, as selected by the owner.
+It rejects a different `access_recipient` and binds the request to the service and resource digest.
+It persists issuance before returning an immutable snapshot.
+Both funded local settlement modes pass restart recovery without another payment.
+This profile does not implement usage accounting, refunds, or an x402 payment scheme.
+See [status](metropolis-status.md) and the [access section](metropolis-operations.md#4-seller-access-service).
+A private settlement per API call is not the default architecture. M8 must compare it with a
+prepaid service allocation and batched usage, then document capability binding, accounting,
+replay, overspend, refund, expiry, and recovery. Do not call a prepaid or batched adapter x402
+unless the selected x402 scheme supports that flow and passes an end-to-end test.
+
+M0 defaults and implementation gates are recorded in the [status decisions appendix](metropolis-status.md#decisions-appendix).

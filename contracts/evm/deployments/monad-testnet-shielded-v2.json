@@ -1,0 +1,103 @@
+{
+  "version": 1,
+  "chain_id": 10143,
+  "test_only": true,
+  "audited": false,
+  "live_transactions_sent": 0,
+  "observation": "paired-provider-finalized",
+  "anchor": {
+    "block": 69903054,
+    "hash": "0xfbc8f34646ee50ffa6749112828b91074f434b594454ec83fa7491d77d52b24b"
+  },
+  "manifest_sha256": "268bf1abe34d738859a20d5db8cee96a30fd4dbb4b2e25b8b5b9da7084d59a4a",
+  "creations": [
+    {
+      "name": "poseidon",
+      "address": "0xfC57a8Fe45969c81B280dfD39BE0cb48c2cdceb3",
+      "tx_hash": "0x7c0b8a1d8280086447dd000b2b2ad59b7eec0ddb620dd05193953ce5a47d158c",
+      "block": 69902525,
+      "block_hash": "0xd188d6f880a837051446e0130cf5130592bfebbd3cf9a60b73315e41613c487d",
+      "runtime_keccak256": "0x354b26999e434f8256d168395315e1f51fc15bf49bf2e6bb58fc549bd597e7da"
+    },
+    {
+      "name": "deposit",
+      "address": "0x5c14124D0F348c7728d7c4Eb429C8Fa26C76075a",
+      "tx_hash": "0xbf6bc931f426d211db5d4c164c56bba55482b4bfc2319e18e38a8750ea020e22",
+      "block": 69902557,
+      "block_hash": "0xb131ffa192017694de7836d201a84fdb3ab5affab5de86f185e79f4af5a0e0ce",
+      "runtime_keccak256": "0x1fb29f200eb881987ebd09d396687e8499181193f6b479f854619949a7c8ba3c"
+    },
+    {
+      "name": "transfer",
+      "address": "0xba65d0a2F3952751bF86222d5d13A58fD7eC1644",
+      "tx_hash": "0xbba1bfa823ca7f11eab5568061a9f0052c36b1158544367212657e498b832f86",
+      "block": 69902591,
+      "block_hash": "0xabc1c98a50dbdcbe2fa759d350ef2ced5c2a8d04e7f876276e032b794b4907e0",
+      "runtime_keccak256": "0x0c79a2c47b4aa8401a3b418ad3d021f168b287dff93f74114794b12115896ad0"
+    },
+    {
+      "name": "withdraw",
+      "address": "0x6d41Bc634C262e5AfA9CB39E2D747ff8A07619b2",
+      "tx_hash": "0x09224366e174ff61f2cc9b9689f8b459e73c94b546156d00806a527f1d1519e1",
+      "block": 69902622,
+      "block_hash": "0xbad667580cbc8d41d40b9a76adc880d4bfaab3838a5f663b1329dcb4e63c4d47",
+      "runtime_keccak256": "0x450627281b9b24a6167c41975c8ce2e63adfe97d64b8bfa6bf0a45e587319afb"
+    },
+    {
+      "name": "pool_wmon",
+      "address": "0x8868f35140f3602C80E2C76132740B6f0c0b409D",
+      "tx_hash": "0x724d0d280b1fa950e11d60fcc0e10982222a6b562eea6d2b529fbc60f374a55f",
+      "block": 69902653,
+      "block_hash": "0xc9f4a81a42b3505eaccbe105e63082240e32d7a686f13567270bf4ab37af8715",
+      "runtime_keccak256": "0x4965730fb58c3d2685e29f9857074e5b81d4fa0e21926c6e76800e0fa280f679"
+    },
+    {
+      "name": "pool_usdc",
+      "address": "0x863f540471C0aD33c68D1218f31E8C9fe9cD50FB",
+      "tx_hash": "0xb5fad2d6723d2b7556b6b1c16b9f036be37caa0794020563b828cb46639890e7",
+      "block": 69902683,
+      "block_hash": "0x83ecf420349d4a1738f16bf554b5804db5ff552346d18a48093faf4402f7d434",
+      "runtime_keccak256": "0x1ca881783d272534444d30971b21c1dc0e95235997b089215b2963ffa73b63c5"
+    }
+  ],
+  "pools": [
+    {
+      "name": "wmon",
+      "pool": "0x8868f35140f3602C80E2C76132740B6f0c0b409D",
+      "asset": "0xFb8bf4c1CC7a94c73D209a149eA2AbEa852BC541",
+      "asset_runtime_keccak256": "a32df4f1226f1bb0d6ce9b917752ed687857899a35ebf902c9992edb73b138b6",
+      "verifier_version": 2,
+      "namespace": "eip155:10143",
+      "runtime_pins": {
+        "pool": "4965730fb58c3d2685e29f9857074e5b81d4fa0e21926c6e76800e0fa280f679",
+        "poseidon": "354b26999e434f8256d168395315e1f51fc15bf49bf2e6bb58fc549bd597e7da",
+        "deposit": "1fb29f200eb881987ebd09d396687e8499181193f6b479f854619949a7c8ba3c",
+        "transfer": "0c79a2c47b4aa8401a3b418ad3d021f168b287dff93f74114794b12115896ad0",
+        "withdraw": "450627281b9b24a6167c41975c8ce2e63adfe97d64b8bfa6bf0a45e587319afb"
+      },
+      "artifact_domain_requires_rebinding": true,
+      "deployment_block": 69902653,
+      "deployment_hash": "0xc9f4a81a42b3505eaccbe105e63082240e32d7a686f13567270bf4ab37af8715"
+    },
+    {
+      "name": "usdc",
+      "pool": "0x863f540471C0aD33c68D1218f31E8C9fe9cD50FB",
+      "asset": "0x534b2f3A21130d7a60830c2Df862319e593943A3",
+      "asset_runtime_keccak256": "96215e6049ed615cdc22fea7701e85458a8e51a2df3e7d45e8f9fa1d521b5a78",
+      "verifier_version": 2,
+      "namespace": "eip155:10143",
+      "runtime_pins": {
+        "pool": "1ca881783d272534444d30971b21c1dc0e95235997b089215b2963ffa73b63c5",
+        "poseidon": "354b26999e434f8256d168395315e1f51fc15bf49bf2e6bb58fc549bd597e7da",
+        "deposit": "1fb29f200eb881987ebd09d396687e8499181193f6b479f854619949a7c8ba3c",
+        "transfer": "0c79a2c47b4aa8401a3b418ad3d021f168b287dff93f74114794b12115896ad0",
+        "withdraw": "450627281b9b24a6167c41975c8ce2e63adfe97d64b8bfa6bf0a45e587319afb"
+      },
+      "artifact_domain_requires_rebinding": true,
+      "deployment_block": 69902683,
+      "deployment_hash": "0x83ecf420349d4a1738f16bf554b5804db5ff552346d18a48093faf4402f7d434"
+    }
+  ],
+  "artifact_domain_requires_rebinding": true,
+  "prepared_plan_sha256": "c7dffb78163c52b1f8ad46b143960afe7249a2e4cc98e46babdbe0f5497ae34a"
+}

@@ -1,0 +1,430 @@
+name: Metropolis registry
+
+# Build-only by default. Release creation, asset upload to the registry repository, and the
+# dispatch that triggers its Pages deployment happen ONLY when publish=true is passed to a
+# manual dispatch. Both platform legs build from the same commit; a compare job fails if the
+# pure-Python wheel hashes differ across runners or the source commit differs.
+on:
+  push:
+    branches: [metropolis]
+    paths:
+      - .github/workflows/metropolis-registry.yml
+      - packaging/metropolis/**
+      - scripts/build-metropolis-registry.py
+      - scripts/check-metropolis-install.py
+      - sdk/**
+      - mcp-server/**
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Dev prerelease version, for example 0.3.0.dev20261004"
+        required: true
+      profile:
+        description: "Build profile"
+        type: choice
+        options: [release, debug]
+        default: release
+      publish:
+        description: "Publish to PoulavBhowmick03/erebus-metropolis (release + dispatch)"
+        type: boolean
+        default: false
+      hosted_domains:
+        description: 'JSON list, one per pool: [{"name":"wmon","manifest_url":"https://...","manifest_sha256":"<hex>","signature_url":"https://..."}]. Empty: qualify against an in-job CI fixture bundle, which is never publishable'
+        default: ""
+      hosted_publisher:
+        description: "Independently pinned publisher address for every hosted manifest"
+        default: ""
+      deployment_record:
+        description: "Deployment record whose every pool the hosted packages must record and prove"
+        default: "contracts/evm/deployments/monad-testnet-shielded-v2.json"
+      public_install_version:
+        description: "Only verify a published version from the public index on native runners (no build, no publish)"
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  METROPOLIS_VERSION: ${{ inputs.version || format('0.3.0.dev{0}', github.run_number) }}
+
+jobs:
+  public-install:
+    name: Public install
+    if: ${{ inputs.public_install_version != '' && inputs.public_install_version != null }}
+    uses: ./.github/workflows/metropolis-public-install.yml
+    with:
+      version: ${{ inputs.public_install_version }}
+
+  build:
+    name: ${{ matrix.platform }}
+    if: ${{ inputs.public_install_version == '' || inputs.public_install_version == null }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            platform: macos-arm64
+          - os: ubuntu-latest
+            platform: linux-x86_64
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - name: Require a clean source tree
+        run: |
+          test -z "$(git status --porcelain)" \
+            || { echo "release builds require a clean checkout"; exit 1; }
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: astral-sh/setup-uv@v5
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.5.1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Registry unit tests
+        run: uv run --frozen pytest scripts/tests/test_metropolis_registry.py scripts/tests/test_metropolis_release_index.py scripts/tests/test_metropolis_candidate_identity.py scripts/tests/test_metropolis_artifact_hosting.py scripts/tests/test_metropolis_disclosure_config.py -q
+      - name: Install pinned Circom compiler
+        run: |
+          git clone --depth 1 --branch v2.2.3 https://github.com/iden3/circom.git "$RUNNER_TEMP/erebus-circom"
+          test "$(git -C "$RUNNER_TEMP/erebus-circom" rev-parse HEAD)" = ad44e915a12bb047b05745c2884aad9cc8326bc6
+          cargo install --path "$RUNNER_TEMP/erebus-circom/circom" --locked
+      - name: Generate the known-entropy fixture circuits the Anvil rehearsals and witnesses use
+        working-directory: circuits/m5
+        env:
+          NODE_OPTIONS: --max-old-space-size=4096
+        run: |
+          npm ci
+          npm run prototype
+      - name: Select the proving manifest
+        id: proving
+        env:
+          HOSTED_DOMAINS: ${{ inputs.hosted_domains }}
+          HOSTED_PUBLISHER: ${{ inputs.hosted_publisher }}
+          DEPLOYMENT_RECORD: ${{ inputs.deployment_record }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/proving"
+          if test -n "$HOSTED_DOMAINS$HOSTED_PUBLISHER"; then
+            # Each pool's manifest is fetched over HTTPS only and checked against the pin given in
+            # the dispatch. Every hosted artifact and verification key is then downloaded and checked
+            # (`stage_artifacts.py fetch`), and synthetic offline witnesses bound to that pool are
+            # generated from the fetched bytes. Argument files carry the per-domain flags onward.
+            python3 - "$RUNNER_TEMP/proving" <<'PY_HOSTED'
+          import hashlib, json, os, pathlib, re, subprocess, sys
+          root = pathlib.Path(sys.argv[1])
+          publisher = os.environ["HOSTED_PUBLISHER"]
+          if not re.fullmatch(r"0x[0-9a-f]{40}", publisher):
+              sys.exit("hosted qualification needs a lowercase hosted_publisher address")
+          domains = json.loads(os.environ["HOSTED_DOMAINS"])
+          if not isinstance(domains, list) or not domains:
+              sys.exit("hosted_domains must be a non-empty JSON list")
+          deployment = pathlib.Path(os.environ["DEPLOYMENT_RECORD"]).resolve()
+          if not deployment.is_file():
+              sys.exit(f"deployment record not found in this revision: {deployment}")
+          build = ["--require-deployment", str(deployment)]
+          check, names = ["--hosted-publisher", publisher, "--require-deployment", str(deployment)], set()
+          (root / "qualification").mkdir(exist_ok=True)
+          for domain in domains:
+              name = domain.get("name", "")
+              if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,31}", name) or name in names:
+                  sys.exit(f"invalid or repeated pool name: {name!r}")
+              names.add(name)
+              pin = domain.get("manifest_sha256", "")
+              if not re.fullmatch(r"[0-9a-f]{64}", pin):
+                  sys.exit(f"{name}: manifest_sha256 must be 64 lowercase hex characters")
+              manifest, signature = root / f"manifest-{name}.json", root / f"manifest-{name}.signature.json"
+              for url, path in ((domain.get("manifest_url", ""), manifest), (domain.get("signature_url", ""), signature)):
+                  if not url.startswith("https://"):
+                      sys.exit(f"{name}: hosted URLs must be https")
+                  subprocess.run(["curl", "-fsSL", "--proto", "=https", "--proto-redir", "=https", url, "-o", str(path)], check=True)
+              if hashlib.sha256(manifest.read_bytes()).hexdigest() != pin:
+                  sys.exit(f"{name}: hosted manifest does not match its pin")
+              fetched = subprocess.run([sys.executable, "packaging/metropolis/stage_artifacts.py", "fetch", "--manifest", str(manifest),
+                                        "--manifest-sha256", pin, "--output", str(root / f"bundle-{name}")],
+                                       check=True, capture_output=True, text=True).stdout
+              (root / "qualification" / f"fetch-{name}.json").write_text(fetched)
+              subprocess.run(["node", "circuits/m5/scripts/qualification-witnesses.mjs", str(deployment), str(root / f"bundle-{name}"),
+                              pin, name, str(root / f"witnesses-{name}")], check=True)
+              build += ["--proving-manifest", str(manifest), "--proving-manifest-sha256", pin, "--proving-signature", str(signature)]
+              check += ["--hosted-manifest", str(manifest), "--hosted-manifest-sha256", pin, "--hosted-signature", str(signature),
+                        "--hosted-witnesses", str(root / f"witnesses-{name}")]
+          (root / "build-args").write_text("\n".join(build) + "\n")
+          (root / "check-args").write_text("\n".join(check) + "\n")
+          PY_HOSTED
+            echo "mode=hosted" >> "$GITHUB_OUTPUT"
+          else
+            # CI fixture: generated in this job from known-entropy keys. Never publishable.
+            python3 - "$RUNNER_TEMP/proving" <<'PY_PLAN'
+          import json, pathlib, sys
+          values = json.loads(pathlib.Path("circuits/m5/build/deposit-input.json").read_text())
+          root = pathlib.Path(sys.argv[1])
+          (root / "plan.json").write_text(json.dumps({"test_only": True, "build_dir": str(pathlib.Path("circuits/m5/build").resolve()),
+              "output_dir": str(root / "bundle"), "base_url": "https://fixtures.invalid/bundle/",
+              "chain_id": int(values["chainId"]), "settlement_contract": f'0x{int(values["contractAddress"]):040x}',
+              "verifier_version": int(values["verifierVersion"])}))
+          PY_PLAN
+            node circuits/m5/scripts/build-artifact-bundle.mjs "$RUNNER_TEMP/proving/plan.json"
+            sha256=$(python3 -c 'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$RUNNER_TEMP/proving/bundle/manifest.json")
+            printf '%s\n' --proving-manifest "$RUNNER_TEMP/proving/bundle/manifest.json" --proving-manifest-sha256 "$sha256" \
+              > "$RUNNER_TEMP/proving/build-args"
+            printf '%s\n' --proving-bundle "$RUNNER_TEMP/proving/bundle" --hosted-fixture > "$RUNNER_TEMP/proving/check-args"
+            echo "mode=ci-fixture" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Build the registry
+        run: |
+          # Bash 3.2 on macOS runners has no mapfile; read one argument per line.
+          proving=(); while IFS= read -r argument; do proving+=("$argument"); done < "$RUNNER_TEMP/proving/build-args"
+          python3 scripts/build-metropolis-registry.py \
+            --version "$METROPOLIS_VERSION" \
+            --output registry \
+            --profile "${{ inputs.profile || 'release' }}" \
+            --build "${proving[@]}"
+          echo "${{ steps.proving.outputs.mode }}" > registry/proving-mode
+      - name: Native installed qualification (install, onboarding, proving, rehearsals)
+        run: |
+          forge build --root contracts/evm
+          cargo fetch --locked --manifest-path sdk/shielded/Cargo.toml
+          mkdir -p registry/qualification
+          # Bash 3.2 on macOS runners has no mapfile; read one argument per line.
+          proving=(); while IFS= read -r argument; do proving+=("$argument"); done < "$RUNNER_TEMP/proving/check-args"
+          python3 scripts/check-metropolis-install.py --registry registry --proving-witnesses circuits/m5/build \
+            "${proving[@]}" --prover-timeout-seconds 1800 \
+            | tail -1 > registry/qualification/install.json
+          cp "$RUNNER_TEMP"/proving/qualification/fetch-*.json registry/qualification/ 2>/dev/null || true
+          for gate in assets metered x402; do
+            python3 scripts/check-metropolis-install.py --registry registry --rehearse-$gate \
+              | tail -1 > "registry/qualification/$gate.json"
+          done
+      - name: Native generated two-agent workflow from public replay inputs
+        if: ${{ steps.proving.outputs.mode == 'hosted' }}
+        env:
+          DEPLOYMENT_RECORD: ${{ inputs.deployment_record || 'contracts/evm/deployments/monad-testnet-shielded-v2.json' }}
+        run: |
+          # Qualification uses the committed authorization for this exact version, never old rehearsal pins.
+          node --input-type=module -e '
+            import { readFileSync } from "node:fs";
+            const authorization = JSON.parse(readFileSync("packaging/metropolis/testnet-release.json"));
+            if (authorization.package_version !== process.env.METROPOLIS_VERSION) {
+              throw new Error("native generated workflow needs owner authorization for this exact version");
+            }
+          '
+          deployment_sha256=$(node --input-type=module -e '
+            import { readFileSync } from "node:fs";
+            import { createHash } from "node:crypto";
+            console.log(createHash("sha256").update(readFileSync(process.env.DEPLOYMENT_RECORD)).digest("hex"));
+          ')
+          node circuits/m5/scripts/export-testnet-replay.mjs \
+            --deployment "$DEPLOYMENT_RECORD" --deployment-sha256 "$deployment_sha256" \
+            --rpc-url https://testnet-rpc.monad.xyz --peer-rpc-url https://rpc-testnet.monadinfra.com \
+            --output "$RUNNER_TEMP/public-deployment-replay" \
+            > registry/qualification/public-replay.json
+          mkdir "$RUNNER_TEMP/workflow-authorized-pins"
+          cp "$RUNNER_TEMP"/proving/manifest-*.json "$RUNNER_TEMP/workflow-authorized-pins/"
+          cp packaging/metropolis/testnet-release.json "$RUNNER_TEMP/workflow-authorized-pins/testnet-release.json"
+          cp "$DEPLOYMENT_RECORD" "$RUNNER_TEMP/workflow-authorized-pins/monad-testnet-shielded-v2.json"
+          python3 scripts/rehearse-metropolis-workflow.py \
+            --registry registry --version "$METROPOLIS_VERSION" \
+            --authorized-pins "$RUNNER_TEMP/workflow-authorized-pins" \
+            --deployment-journal "$RUNNER_TEMP/public-deployment-replay" \
+            --prepublication-authorization packaging/metropolis/testnet-release.json \
+            --work "$RUNNER_TEMP/generated-workflow" --pools wmon,usdc \
+            > registry/qualification/workflow.json
+      - name: Native installed relayer fixture (packaged binary, loopback chain 10143)
+        if: ${{ steps.proving.outputs.mode == 'hosted' }}
+        run: |
+          # The fixture tests drive the relayer installed from these packages, never a cargo-built copy. The report
+          # records each check's scope; installed payment-CLI delegation stays a gap until a fixture covers it.
+          python3 scripts/qualify-metropolis-relayer.py --registry registry --version "$METROPOLIS_VERSION" \
+            --work "$RUNNER_TEMP/relayer-qualification" > registry/qualification/relayer.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: metropolis-registry-${{ matrix.platform }}
+          path: registry
+          if-no-files-found: error
+          retention-days: 14
+
+  compare:
+    name: Compare platform builds
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      # The feature-gate checker and the committed authorization come from the same commit the legs built.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: metropolis-registry-*
+          path: artifacts
+      - name: Same commit, clean source, identical pure-Python wheels
+        run: |
+          python3 - <<'PY'
+          import json, pathlib, sys
+          manifests = {}
+          for path in pathlib.Path("artifacts").glob("*/release.json"):
+              data = json.loads(path.read_text())
+              manifests[data["platform"]] = data
+          if len(manifests) != 2:
+              sys.exit(f"expected two platform manifests, found {len(manifests)}")
+          commits = {m["source_commit"] for m in manifests.values()}
+          if len(commits) != 1:
+              sys.exit(f"platform builds used different commits: {sorted(commits)}")
+          dirty = [p for p, m in manifests.items() if m["dirty_source"]]
+          if dirty:
+              sys.exit(f"platform builds have a dirty source tree: {dirty}")
+          trees = {m["candidate"]["source_tree_sha256"] for m in manifests.values()}
+          if len(trees) != 1:
+              sys.exit(f"platform builds packaged different input trees: {sorted(trees)}")
+          ineligible = [p for p, m in manifests.items() if not m["candidate"]["release_eligible"]]
+          if ineligible:
+              sys.exit(f"platform builds are not release eligible: {ineligible}")
+          recorded = {platform: sorted(r["manifest_sha256"] for r in m.get("proving_domains") or []) for platform, m in manifests.items()}
+          modes = {(d / "proving-mode").read_text().strip() for d in pathlib.Path("artifacts").glob("metropolis-registry-*")}
+          if len(modes) != 1:
+              sys.exit(f"platform legs used different proving modes: {sorted(modes)}")
+          if not all(recorded.values()):
+              sys.exit(f"a platform build recorded no proving manifest: {recorded}")
+          # Hosted inputs are shared, so both legs must record the same manifests. In ci-fixture mode each
+          # leg generates its own throwaway bundle (never publishable), so each leg is checked against its own.
+          if modes == {"hosted"} and len({tuple(v) for v in recorded.values()}) != 1:
+              sys.exit(f"platform builds recorded different hosted proving manifests: {recorded}")
+          for directory in pathlib.Path("artifacts").glob("metropolis-registry-*"):
+              domains = sorted(r["manifest_sha256"] for r in json.loads((directory / "release.json").read_text()).get("proving_domains") or [])
+              reports = {}
+              for gate in ("install", "assets", "metered", "x402"):
+                  path = directory / "qualification" / f"{gate}.json"
+                  if not path.is_file():
+                      sys.exit(f"{directory.name}: missing native {gate} qualification")
+                  reports[gate] = json.loads(path.read_text())
+                  if reports[gate].get("status") != "verified" or reports[gate].get("source_imports") is not False:
+                      sys.exit(f"{directory.name}: {gate} qualification did not verify")
+              install = reports["install"]
+              if install.get("installed_onboarding") is None or install.get("installed_hosted_artifacts") is None:
+                  sys.exit(f"{directory.name}: onboarding or hosted-artifact qualification missing")
+              hosted = install["installed_hosted_artifacts"]
+              # Every recorded pool domain must have its own installed hosted-download report.
+              if sorted(h.get("source_manifest_sha256") or h.get("manifest_sha256") for h in hosted) != domains:
+                  sys.exit(f"{directory.name}: hosted-artifact reports do not cover every recorded pool domain")
+              for h in hosted:
+                  if h.get("release_recorded") is not True:
+                      sys.exit(f"{directory.name}: {h.get('settlement_contract')} is not a pool domain the packages recorded")
+                  if not h.get("authorization_refusals") \
+                          or not all(h["authorization_refusals"].values()) or h.get("cache_tamper") not in {"redownloaded", "refused"}:
+                      sys.exit(f"{directory.name}: hosted-artifact refusals incomplete for {h.get('settlement_contract')}")
+                  if h.get("proved") is not True:
+                      # Witnesses bound to another domain: download/authentication only. Publish refuses this.
+                      print(f"{directory.name}: {h.get('settlement_contract')} installed and authenticated, not proved")
+              for gate, flag in (("assets", "installed_asset_rehearsal"), ("metered", "installed_metered_rehearsal"), ("x402", "installed_x402_rehearsal")):
+                  if reports[gate].get(flag) is not True:
+                      sys.exit(f"{directory.name}: {gate} rehearsal did not run")
+              manifest = json.loads((directory / "release.json").read_text())
+              if modes == {"hosted"} and "erebus-shielded-relayer" in manifest.get("binaries", {}):
+                  import hashlib, importlib.util
+                  spec = importlib.util.spec_from_file_location("feature_publish", "scripts/publish-metropolis-release.py")
+                  checker = importlib.util.module_from_spec(spec)
+                  spec.loader.exec_module(checker)
+                  authorization = json.loads(pathlib.Path("packaging/metropolis/testnet-release.json").read_text())
+                  release_pin = hashlib.sha256((directory / "release.json").read_bytes()).hexdigest()
+                  failures = checker.check_feature_gates(directory.name, directory, manifest, release_pin, authorization)
+                  if failures:
+                      sys.exit("; ".join(failures))
+              print(f"{directory.name}: native gates verified ({(directory / 'proving-mode').read_text().strip()} proving manifest)")
+          pure = {}
+          for platform, manifest in manifests.items():
+              for name, meta in manifest["wheels"].items():
+                  if name.endswith("-py3-none-any.whl"):
+                      pure.setdefault(name, {})[platform] = meta["sha256"]
+          if not pure:
+              sys.exit("no pure-Python wheels found")
+          mismatched = {n: h for n, h in pure.items() if len(h) != 2 or len(set(h.values())) != 1}
+          if mismatched:
+              sys.exit(f"pure-Python wheel hashes differ across runners: {mismatched}")
+          print(f"same commit {commits.pop()}; pure wheels match: {sorted(pure)}")
+          PY
+
+  publish:
+    name: Publish registry
+    needs: compare
+    if: ${{ inputs.publish }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: metropolis-registry-*
+          path: artifacts
+      - name: Refuse packages qualified only against the CI fixture bundle
+        run: |
+          for directory in artifacts/metropolis-registry-*; do
+            test "$(cat "$directory/proving-mode")" = hosted \
+              || { echo "$directory was qualified against an in-job fixture bundle; publish needs hosted artifacts"; exit 1; }
+            python3 -c 'import json,sys; report = json.load(open(sys.argv[1])); hosted = report["installed_hosted_artifacts"]; coverage = report.get("deployment_coverage") or {}; sys.exit(0 if hosted and all(h.get("proved") is True and h.get("https_exercised") is True for h in hosted) and coverage.get("complete") and all(p.get("proved") for p in coverage.get("pools", [])) and report.get("claims", {}).get("native_platform_qualification") is True else "every deployed pool must be recorded and proved from real HTTPS hosting with installed binaries on a native hosted runner")' \
+              "$directory/qualification/install.json"
+            ls "$directory"/qualification/fetch-*.json >/dev/null || { echo "$directory: no hosted artifact fetch reports"; exit 1; }
+            for fetch in "$directory"/qualification/fetch-*.json; do
+              python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("hosted") is True else "hosted artifact fetch did not verify")' "$fetch"
+            done
+          done
+      - name: Combine the platform manifests
+        run: |
+          python3 - <<'PY'
+          import json, pathlib
+          platforms = {}
+          for path in sorted(pathlib.Path("artifacts").glob("*/release.json")):
+              data = json.loads(path.read_text())
+              platforms[data["platform"]] = data
+          import os
+          version = os.environ["METROPOLIS_VERSION"]
+          combined = {
+              "version": version,
+              "tag": "v" + version,
+              "channel": "metropolis-testnet",
+              "source_commit": "${{ github.sha }}",
+              "build_profile": "${{ inputs.profile || 'release' }}",
+              "platforms": platforms,
+          }
+          pathlib.Path("release-manifest.json").write_text(json.dumps(combined, indent=2) + "\n")
+          PY
+      - name: Refuse to overwrite an existing version
+        env:
+          GH_TOKEN: ${{ secrets.METROPOLIS_REGISTRY_TOKEN }}
+        run: |
+          if gh release view "v$METROPOLIS_VERSION" --repo PoulavBhowmick03/erebus-metropolis >/dev/null 2>&1; then
+            echo "release already exists; refusing to overwrite"
+            exit 1
+          fi
+      - name: Create the prerelease and upload the wheels and manifest
+        env:
+          GH_TOKEN: ${{ secrets.METROPOLIS_REGISTRY_TOKEN }}
+        run: |
+          gh release create "v$METROPOLIS_VERSION" \
+            --repo PoulavBhowmick03/erebus-metropolis \
+            --title "Metropolis $METROPOLIS_VERSION" \
+            --prerelease \
+            --notes "Built from ${{ github.sha }}. See release-manifest.json for wheel, native, and launcher hashes and platform qualifications."
+          mkdir release-assets
+          for dir in artifacts/metropolis-registry-*; do
+            for wheel in "$dir"/wheels/*.whl; do
+              name=$(basename "$wheel")
+              if test -f "release-assets/$name"; then
+                cmp "$wheel" "release-assets/$name"
+              else
+                cp "$wheel" "release-assets/$name"
+              fi
+            done
+          done
+          gh release upload "v$METROPOLIS_VERSION" --repo PoulavBhowmick03/erebus-metropolis \
+            release-assets/*.whl
+          gh release upload "v$METROPOLIS_VERSION" --repo PoulavBhowmick03/erebus-metropolis \
+            release-manifest.json
+      - name: Trigger the registry Pages deployment
+        env:
+          GH_TOKEN: ${{ secrets.METROPOLIS_REGISTRY_TOKEN }}
+        run: |
+          gh api repos/PoulavBhowmick03/erebus-metropolis/dispatches \
+            -f event_type=metropolis-registry \
+            -f "client_payload[tag]=v$METROPOLIS_VERSION"

@@ -12,9 +12,12 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, metropolis]
   pull_request:
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -50,8 +53,8 @@ jobs:
 
       - name: Test
         working-directory: sdk/rs
-        # Ignored tests are live-prover probes and the F31 fingerprint target. They need a
-        # network and a fix respectively, so they stay out of CI.
+        # Explicitly ignored tests need a live prover or mainnet operations.
+        # Fingerprint regression tests run normally in this suite.
         run: cargo test --all-targets
 
       - name: Docs
@@ -68,6 +71,472 @@ jobs:
         with:
           name: erebus-cli-linux
           path: sdk/rs/target/debug/erebus-cli
+          if-no-files-found: error
+          retention-days: 7
+
+  rust-core:
+    name: Rust core
+    runs-on: ubuntu-latest
+    # The chain-neutral agreement crate. It is a path dependency of sdk/rs, so the Rust job
+    # compiles it, but `cargo test` in sdk/rs never runs its tests. A separate job keeps the
+    # isolation claim checkable: sdk/core has no Starknet dependency in its manifest, and this
+    # job fails if one is added.
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: sdk/core
+
+      - name: Format
+        working-directory: sdk/core
+        run: cargo fmt --check
+
+      - name: Check chain-neutral dependencies
+        working-directory: sdk/core
+        run: |
+          cargo metadata --locked --format-version 1 | python3 -c '
+          import json, sys
+          packages = json.load(sys.stdin)["packages"]
+          forbidden = [p["name"] for p in packages if "starknet" in p["name"] or "felt" in p["name"]]
+          if forbidden:
+              sys.exit("Chain-specific dependencies in erebus-core: " + ", ".join(forbidden))
+          '
+
+      - name: Independent agreement encoding vectors
+        run: python3 scripts/check_agreement_vectors.py
+
+      - name: Clippy
+        working-directory: sdk/core
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        working-directory: sdk/core
+        run: cargo test --all-targets
+
+      - name: Compile-fail API and documentation tests
+        working-directory: sdk/core
+        run: cargo test --locked --doc
+
+      - name: Docs
+        working-directory: sdk/core
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --no-deps
+
+  rust-journal:
+    name: Rust journal
+    runs-on: ubuntu-latest
+    # The shared operation-journal storage engine (Metropolis M6, DM6-2). sdk/rs compiles it
+    # as a path dependency but never runs its tests. The EVM and shielded backends are meant to
+    # share it, so it must not pull in any chain, proving, or SDK crate: this job fails if one
+    # is added.
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: sdk/journal
+
+      - name: Format
+        working-directory: sdk/journal
+        run: cargo fmt --check
+
+      - name: Check chain-neutral dependencies
+        working-directory: sdk/journal
+        run: |
+          cargo metadata --locked --format-version 1 | python3 -c '
+          import json, sys
+          packages = json.load(sys.stdin)["packages"]
+          def banned(name):
+              return (
+                  "starknet" in name
+                  or "felt" in name
+                  or name.startswith("alloy")
+                  or name == "ark" or name.startswith("ark-")
+                  or name == "erebus-sdk"
+              )
+          forbidden = [p["name"] for p in packages if banned(p["name"])]
+          if forbidden:
+              sys.exit("Chain-specific dependencies in erebus-journal: " + ", ".join(forbidden))
+          '
+
+      - name: Clippy
+        working-directory: sdk/journal
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Test
+        working-directory: sdk/journal
+        run: cargo test --locked --all-targets
+
+      - name: Docs
+        working-directory: sdk/journal
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --locked --no-deps
+
+  rust-coordinator:
+    name: Rust coordinator
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: sdk/coordinator
+      - name: Format
+        working-directory: sdk/coordinator
+        run: cargo fmt --check
+      - name: Clippy
+        working-directory: sdk/coordinator
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Test durable local lifecycle
+        working-directory: sdk/coordinator
+        run: cargo test --locked
+      - name: Exhaustive two-suite persistence sweep
+        working-directory: sdk/coordinator
+        run: cargo test --locked --release --test lifecycle every_discovered -- --ignored
+      - name: Docs
+        working-directory: sdk/coordinator
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --locked --no-deps
+
+  rust-transport:
+    name: Rust transport
+    runs-on: ubuntu-latest
+    # The offchain Eleusis transport crate (roadmap M2). It depends on the chain-neutral
+    # erebus-core, so like that crate it must stay free of chain and proving dependencies:
+    # transport privacy is a different job from settlement privacy, and mixing them is how a
+    # session key ends up in a settlement path.
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: sdk/transport
+
+      - name: Format
+        working-directory: sdk/transport
+        run: cargo fmt --check
+
+      - name: Check chain-neutral dependencies
+        working-directory: sdk/transport
+        run: |
+          cargo metadata --locked --format-version 1 | python3 -c '
+          import json, sys
+          packages = json.load(sys.stdin)["packages"]
+          forbidden = [p["name"] for p in packages if "starknet" in p["name"] or "felt" in p["name"]]
+          if forbidden:
+              sys.exit("Chain-specific dependencies in erebus-transport: " + ", ".join(forbidden))
+          '
+
+      - name: Clippy
+        working-directory: sdk/transport
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        working-directory: sdk/transport
+        run: cargo test --all-targets
+
+      - name: Docs
+        working-directory: sdk/transport
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --no-deps
+
+  evm:
+    name: EVM settlement
+    runs-on: ubuntu-latest
+    # Metropolis M3. The Solidity decoder must reproduce the Rust agreement bytes exactly, so
+    # the Foundry known-answer test runs first; the Rust adapter tests then drive a real anvil
+    # chain. A green Solidity suite without the KAT would prove nothing about agreement binding.
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.5.1
+
+      - name: Install the Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: sdk/evm
+
+      - name: Build the contracts
+        working-directory: contracts/evm
+        run: |
+          forge fmt --check
+          forge build
+
+      - name: Solidity tests, including the Rust agreement vectors
+        working-directory: contracts/evm
+        run: forge test
+
+      - name: Format
+        working-directory: sdk/evm
+        run: cargo fmt --check
+
+      - name: Clippy
+        working-directory: sdk/evm
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Test the adapter against a local chain
+        working-directory: sdk/evm
+        # The ignored tests spawn anvil, which this job installed above.
+        run: cargo test --locked -- --include-ignored --skip every_public_bound_operation_write_recovers_one_actual_payment
+
+      - name: Exhaustive funded public-bound persistence sweep
+        working-directory: sdk/evm
+        run: cargo test --locked --release --test local_chain every_public_bound_operation -- --ignored
+
+      - name: Removed legacy API compile-fail guards
+        working-directory: sdk/evm
+        run: cargo test --locked --doc
+
+      - name: Docs
+        working-directory: sdk/evm
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --locked --no-deps
+
+  m4-proof:
+    name: M4 proof prototype
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.5.1
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install pinned Circom compiler
+        run: |
+          git clone --depth 1 --branch v2.2.3 https://github.com/iden3/circom.git /tmp/erebus-circom
+          test "$(git -C /tmp/erebus-circom rev-parse HEAD)" = ad44e915a12bb047b05745c2884aad9cc8326bc6
+          cargo install --path /tmp/erebus-circom/circom --locked
+
+      - name: Install pinned proof dependencies
+        working-directory: circuits/m4
+        run: npm ci
+
+      - name: Prove and enforce a private transfer on Anvil
+        working-directory: circuits/m4
+        env:
+          NODE_OPTIONS: --max-old-space-size=4096
+        run: npm run prototype
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: m4-prototype-metrics
+          path: circuits/m4/build/metrics.json
+          if-no-files-found: error
+          retention-days: 7
+
+  m5-proof:
+    name: M5 funded local proof prototype
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.5.1
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: sdk/shielded
+
+      - name: Install pinned Circom compiler
+        run: |
+          git clone --depth 1 --branch v2.2.3 https://github.com/iden3/circom.git /tmp/erebus-circom
+          test "$(git -C /tmp/erebus-circom rev-parse HEAD)" = ad44e915a12bb047b05745c2884aad9cc8326bc6
+          cargo install --path /tmp/erebus-circom/circom --locked
+
+      - name: Install proof dependencies
+        working-directory: circuits/m5
+        run: npm ci
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Install branch MCP packages for independent shielded disclosure
+        run: uv sync --all-packages --locked
+
+      - name: Check shielded wallet and indexer
+        working-directory: sdk/shielded
+        run: cargo test --locked --all-targets
+
+      - name: Lock tokens, prove private transfer, and withdraw on Anvil
+        working-directory: circuits/m5
+        env:
+          NODE_OPTIONS: --max-old-space-size=4096
+        run: npm run prototype
+
+      - name: Prove all three M5 transitions locally in Rust
+        working-directory: sdk/shielded
+        run: cargo test --locked --test local_proof -- --ignored
+
+      - name: Reject mutated candidate witnesses without emitting private inputs
+        working-directory: circuits/m5
+        run: npm run test:negative-witness
+
+      - name: Check seeded private conservation sequences with real verifiers
+        working-directory: circuits/m5
+        env:
+          NODE_OPTIONS: --max-old-space-size=4096
+        run: npm run test:stateful-proof
+
+      - name: Recover positive change from encrypted backup and prove a new withdrawal
+        working-directory: sdk/shielded
+        run: cargo test --locked --test wallet positive_change -- --include-ignored
+
+      - name: Check setup consistency and reject tampered verification keys
+        working-directory: circuits/m5
+        run: |
+          node scripts/verify-setup.mjs
+          node scripts/verify-setup.test.mjs
+          node scripts/build-artifact-bundle.test.mjs
+          node scripts/bundle-testnet-setup.test.mjs
+          node --test scripts/export-testnet-replay.test.mjs
+          node scripts/stage-test-bundle.test.mjs
+          node scripts/verify-phase1.test.mjs
+          node scripts/verify-phase2-step.test.mjs
+          node scripts/verify-phase2-chain.test.mjs
+
+      - name: Measure source and offline-installed fixture proving without witness output
+        env:
+          EREBUS_M5_QUALIFY_FIXTURE: "1"
+          EREBUS_M5_QUALIFY_WHEEL: "1"
+        run: |
+          cargo build --locked --manifest-path sdk/shielded/Cargo.toml --bins
+          cargo build --locked --manifest-path sdk/rs/Cargo.toml --bin erebus-cli
+          cargo build --locked --manifest-path sdk/evm/Cargo.toml --bins
+          cargo build --locked --manifest-path sdk/transport/Cargo.toml --bins
+          uv run --locked --with hatchling==1.32.4 pytest scripts/tests/test_metropolis_prover_qualification.py -q -s
+
+      - name: Install hash-pinned public artifacts and prove in fresh processes
+        working-directory: sdk/shielded
+        run: cargo test --locked --test artifacts -- --include-ignored --skip actual_tmpfs_exhaustion_cleans_partial_download_and_can_retry
+
+      - name: Recover artifact installation after real bounded ENOSPC
+        working-directory: sdk/shielded
+        run: |
+          sudo mkdir /erebus-pressure
+          sudo mount -t tmpfs -o size=16m,mode=1777 tmpfs /erebus-pressure
+          trap 'sudo umount /erebus-pressure; sudo rmdir /erebus-pressure' EXIT
+          cargo test --locked --test artifacts actual_tmpfs_exhaustion_cleans_partial_download_and_can_retry -- --ignored --exact
+
+      - name: Deposit and withdraw with the installed wallet over fresh random notes
+        working-directory: sdk/shielded
+        run: cargo test --locked --test wallet_ops -- --ignored
+
+      - name: Recover an actually rolled-back withdrawal with one same-intent replacement
+        working-directory: sdk/shielded
+        run: cargo test --locked --test wallet_faults rolled_back_withdrawal -- --ignored
+
+      - name: Exercise local proof generation over installed Python and MCP boundaries
+        env:
+          EREBUS_M8_TEST_LOCAL_PROOF: "1"
+        run: uv run --locked pytest sdk/py/tests/test_proving_seam.py mcp-server/tests/test_proving.py
+
+      - name: Compare Rust agreement-to-witness construction with the JS flow
+        working-directory: sdk/shielded
+        run: cargo test --locked --test witness -- --ignored
+
+      - name: Settle the local funded flow with the Rust-generated proof
+        working-directory: circuits/m5
+        env:
+          EREBUS_M5_NATIVE_PROOF: "1"
+          EREBUS_M5_RUST_SCAN: "1"
+          NODE_OPTIONS: --max-old-space-size=4096
+        run: npm run prototype
+
+      - name: Recover funded shielded settlement at every durable boundary
+        working-directory: circuits/m5
+        env:
+          EREBUS_M5_NATIVE_PROOF: "1"
+          EREBUS_M6_COORDINATED: "1"
+          EREBUS_M6_MATRIX: "1"
+          EREBUS_M8_ACCESS: "1"
+          EREBUS_TEST_MCP_PYTHON: ${{ github.workspace }}/.venv/bin/python
+          NODE_OPTIONS: --max-old-space-size=4096
+        run: npm run prototype
+
+      - name: Build the EVM contracts the funded HTTP and x402 tests deploy
+        run: forge build --root contracts/evm
+
+      - name: Recover public-bound HTTP access without another payment
+        working-directory: sdk/shielded
+        env:
+          EREBUS_TEST_MCP_PYTHON: ${{ github.workspace }}/.venv/bin/python
+        run: cargo test --locked --test access_http -- --include-ignored
+
+      - name: Recover seller-facilitated x402 access without another broadcast
+        working-directory: sdk/shielded
+        run: cargo test --locked --test x402_http x402_http_submits_once_recovers_restart_and_rejects_mutations -- --ignored
+
+      - name: Negotiate in separate processes, recover a lost payment response, and audit x402
+        working-directory: sdk/shielded
+        run: cargo test --locked --test negotiation_cli payment_driver -- --include-ignored
+
+      - name: Verify external shielded relay proofs and paired funded admission without sends
+        working-directory: sdk/shielded
+        run: cargo test --locked --test relay_admission -- --ignored
+
+      - name: Check prepaid request and profile vectors independently
+        run: python3 scripts/check_agreement_vectors.py
+
+      - name: Check path-only buyer access SDK and MCP boundaries
+        env:
+          EREBUS_M8_TEST_ACCESS_INSTALL: "1"
+        run: uv run --locked pytest sdk/py/tests/test_access_seam.py mcp-server/tests/test_access.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: m5-local-prototype-run
+          path: |
+            circuits/m5/build/run.json
+            circuits/m5/build/artifact-manifest.json
+            circuits/m5/build/coordinated-*/disclosure-report.json
+            circuits/m5/build/coordinated-*/access-report.json
           if-no-files-found: error
           retention-days: 7
 
@@ -104,6 +573,20 @@ jobs:
         # Plain `uv sync` skips workspace members' editable installs, so the erebus-*
         # packages would not be importable. See CLAUDE.md.
         run: uv sync --all-packages
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: sdk/evm
+
+      - name: Build the disclosure binding target
+        run: cargo build --locked --manifest-path sdk/evm/Cargo.toml --bin erebus-disclosure
+
+      - name: Verify the fresh auditor through MCP
+        env:
+          EREBUS_TEST_MCP_PYTHON: ${{ github.workspace }}/.venv/bin/python
+        run: cargo test --locked --manifest-path sdk/evm/Cargo.toml --test disclosure_cli issuer_selects
 
       - name: Test
         # -rs reports skips in the log so a silent skip is visible in review even when the

@@ -1,0 +1,68 @@
+[package]
+name = "erebus-evm"
+version = "0.1.0"
+edition = "2021"
+description = "EVM public-bound settlement adapter for Erebus: authorized agreement to on-chain payment"
+license = "Apache-2.0"
+
+[dependencies]
+# Chain-neutral agreement core: canonical terms encoding, commitment, authorizations, and the
+# settlement capability types this adapter fills in. The adapter must not duplicate any of it.
+erebus-core = { path = "../core" }
+erebus-journal = { path = "../journal" }
+erebus-coordinator = { path = "../coordinator" }
+erebus-transport = { path = "../transport" }
+# The Rust EVM client: JSON-RPC, local transaction signing, nonce and gas filling, receipts.
+# Selected as the maintained successor to ethers-rs (see docs/metropolis-status.md).
+alloy = { version = "1", features = [
+    "provider-http",
+    "signer-local",
+    "network",
+    "rpc-types-eth",
+    "consensus",
+    # `RpcSend`/`RpcRecv` bounds for the raw observation client.
+    "json-rpc",
+] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Function selectors and the digest the contract recomputes.
+sha3 = "0.10"
+hex = "0.4"
+# x402 Permit2: recovers the buyer from a payment signature before the seller submits it.
+k256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+zeroize = "1"
+
+[[bin]]
+name = "erebus-tx-relayer"
+path = "src/bin/erebus_tx_relayer.rs"
+
+[[bin]]
+name = "erebus-settle"
+path = "src/bin/erebus_settle.rs"
+
+[[bin]]
+name = "erebus-disclosure"
+path = "src/bin/erebus_disclosure.rs"
+
+[[bin]]
+name = "erebus-network-check"
+path = "src/bin/erebus_network_check.rs"
+
+[dev-dependencies]
+tempfile = "3"
+# The RPC fault proxy needs a TCP listener and async read/write in tests only.
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "io-util",
+    "time",
+] }
+
+[lints.rust]
+missing_docs = "warn"
+
+[lints.clippy]
+all = "deny"

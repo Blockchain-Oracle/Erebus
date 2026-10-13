@@ -235,9 +235,16 @@ def configuration_schema() -> dict[str, object]:
 def init_main(argv: Sequence[str] | None = None) -> int:
     """Console entry point for ``erebus-init`` and ``erebus-mcp-server init``."""
 
+    arguments = list(argv) if argv is not None else sys.argv[1:]
+    if "--metropolis" in arguments:
+        from erebus_mcp.metropolis_setup.operator_init import main
+
+        arguments.remove("--metropolis")
+        return main(arguments)
+
     from erebus_mcp.setup import main
 
-    return main(list(argv) if argv is not None else None)
+    return main(arguments)
 
 
 def schema_main() -> int:

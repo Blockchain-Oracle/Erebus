@@ -9,6 +9,165 @@ STRK20 privacy pool.
 **Erebus hides the terms, not the relationship.** Unaudited. Do not put value you care
 about through it.
 
+## Metropolis development
+
+**Monad reviewers: start here, not at the Starknet install below.**
+Use the [Metropolis install guide](./docs/metropolis-install.md) and
+[operations guide](./docs/metropolis-operations.md). The stable `v0.3.0`
+package and the video below demonstrate the older Starknet product, not Monad.
+
+Monad testnet evidence includes public-bound settlement and one team-operated
+shielded WMON payment. Public-bound calldata exposes the agreement opening,
+signatures, amount and parties. The shielded rail uses proofs and note commitments;
+the outer gas sender, funding and withdrawals remain public. Offchain negotiation
+history stays encrypted. Full installed live workflows for both assets and sponsored
+submission remain incomplete; the setup is test-only, single-operator and unaudited.
+
+The x402 `exact` rail (seller-facilitated Permit2) is implemented and locally verified end to
+end: real discovery and encrypted negotiation, one fenced payment, restart recovery, matching
+resource delivery, and independent auditor verification from the encrypted grant alone. Published
+`0.3.0.dev4` commands also completed one **team-operated live Monad x402 payment**
+([`0x8a0272e6…`](https://testnet.monadexplorer.com/tx/0x8a0272e69188ac3be52783ddfc4d4436496a58f2d5c63d808cd3320a1fa5df43)),
+including seller restart, resource recovery, and auditor verification. The installed public-bound
+rehearsal also completed on Monad testnet: one payment
+([`0x1ba9ddb3…`](https://testnet.monadexplorer.com/tx/0x1ba9ddb363a0c916f8e41ca8eca7d4c524d1ba4722bf4ea37ed423547700ff73)),
+buyer-finalized observation, seller access across a restart, and independent auditor verification
+(`payment_verified: true`). These are team-operated native CLI runs, not MCP/LLM or third-party
+acceptance. The shielded WMON payment
+([`0xe01666d8…`](https://testnet.monadexplorer.com/tx/0xe01666d8c4e16efe8195da8047674c71a325ee20ff250f02f4fdf570a04934fa))
+used source-built payment commands, not the complete published-release workflow.
+
+### Install the published Metropolis packages
+
+The recorded release `0.3.0.dev2026101307` is published as a prerelease on a separate Metropolis index (the stable Starknet
+index is unrelated). With [uv](https://docs.astral.sh/uv/) and Python 3.11+:
+
+```sh
+uv venv --python 3.11 erebus-metropolis
+uv pip install --python erebus-metropolis/bin/python \
+  --no-config \
+  --index https://poulavbhowmick03.github.io/erebus-metropolis/simple/ \
+  --default-index https://pypi.org/simple --index-strategy first-index \
+  "erebus-mcp-server==0.3.0.dev2026101307"
+```
+
+Use uv with the index order above. Metropolis takes priority; PyPI supplies missing dependencies.
+The explicit `first-index` strategy prevents PyPI packages from replacing the three Metropolis packages.
+The default index always has lower priority ([uv index rules](https://docs.astral.sh/uv/concepts/indexes/#index-url-and-extra-index-url)).
+If downloads from GitHub release assets time out, set
+`UV_HTTP_TIMEOUT=300`. Supported platforms: macOS 11+ on Apple silicon and Linux x86_64 (built on
+GitHub's `ubuntu-latest`; not a manylinux build, so older glibc may not run it). There are no
+Intel macOS, Linux arm64, or Windows wheels. The install puts the native commands, the
+`erebus-mcp-server` entry point, and `erebus-selfhost` in `erebus-metropolis/bin`. Verified
+on native macOS and Linux from fresh environments outside the checkout (see the
+[install guide](./docs/metropolis-install.md)).
+
+Recorded Monad testnet payments: the earlier public-bound example
+[`0x1f7ec208…`](https://testnet.monadexplorer.com/tx/0x1f7ec208a7b03b835f224ac989cc59c9aee4c33634a2b04498b8394ddede4c09)
+and the live x402 payment
+[`0x8a0272e6…`](https://testnet.monadexplorer.com/tx/0x8a0272e69188ac3be52783ddfc4d4436496a58f2d5c63d808cd3320a1fa5df43).
+See [dated evidence and remaining gates](./docs/metropolis-status.md).
+The [status and acceptance gates](./docs/metropolis-status.md) record the rubric and mandatory evidence gates.
+An outside developer can run the [external acceptance handoff](./docs/metropolis-external-acceptance.md);
+it has not yet been run by a third party.
+The [demo script](./docs/metropolis-demo.md) is recording-ready with real captured output; the video
+recording is pending and no video is linked until it exists.
+No Metropolis demo video, hosted service, or third-party external rehearsal is claimed complete.
+
+### Local Monad-Backend Rehearsal
+
+From this branch checkout, with Rust stable, uv, and Foundry installed:
+
+```sh
+uv sync --all-packages
+forge build --root contracts/evm
+cargo test --locked --manifest-path sdk/shielded/Cargo.toml --test negotiation_cli \
+  two_mcp_agents_negotiate_pay_and_retrieve_public_bound_with_one_send -- --ignored --nocapture
+```
+
+This starts Anvil, negotiates through two MCP servers, pays once, recovers a lost
+broadcast response, and retrieves the resource. It is a local rehearsal, not a
+live Monad interaction. The live path needs separate participant keys, two RPC
+providers, test-token allowance, faucet gas, and the configuration in the runbooks.
+
+### Use Cases
+
+Both fit the current mechanism: two known parties, one payment from the buyer, an off-chain
+deliverable, and disclosure of one deal.
+
+**Procurement with an audit.** A buyer agent holds a requisition (item, quantity, maximum unit
+price). A supplier agent holds a catalog floor. They negotiate a total, the buyer pays once, and
+one participant grants an auditor a scoped disclosure of that deal. The auditor passes it only if
+it settled, paid what was agreed, and stayed under the buyer's ceiling.
+
+```sh
+uv run python agents/src/erebus_agents/procurement_demo.py --latency 0
+```
+
+That rehearsal runs on the mock client. On the Metropolis rail each operator's files fix the
+price policy, so the deal agents supply only the operation ID (`docs/friction.md` F58). After a
+deal settles, the real disclosure step runs against the participant's durable state:
+
+```sh
+uv run python agents/src/erebus_agents/metropolis_audit.py --operation <op> \
+  --expected-issuer <issuer identity> --expected-commitment <deal commitment> \
+  --issuer-dir <dir> --auditor-dir <fresh dir> --state-root <issuer state> --store-root <store> \
+  --namespace eip155:10143 --issuer-key-file <issuer agreement key> --deployment <deployment.json>
+```
+
+The issuer selects the deal and exports a grant to the auditor's public key. The auditor, with only
+that grant and its own key, verifies the agreement offline and, with `--deployment`, the payment
+against chain data. A payment check that stays pending is not evidence of non-payment, and delivery
+is never verified. Evidence and grant files are create-new; re-issuing a grant takes fresh
+`--evidence-name` and `--grant-name` values.
+
+**Paid API or compute purchase.** The buyer negotiates a price and retrieves the resource through
+the `x402-exact` profile of `metropolis_loop.py`. The seller submits the payment, and only an
+independent auditor verifies it, with the same disclosure step.
+
+Public-bound payments expose the accepted terms and parties. Neither case proves delivery.
+
+### AI-Assisted Development
+
+Claude, Codex, and OpenCode have assisted with implementation, tests, documentation,
+and review of the Metropolis work. AI-generated code requires human review and does
+not establish security or release readiness. The pre-existing Starknet/STRK20
+implementation is prior work; the Metropolis roadmap records the new branch work.
+
+### External Code Attribution
+
+The Metropolis implementation uses Circom, circomlib, circomlibjs and snarkjs for
+circuits and proving, arkworks and ark-circom for Rust proving and verification,
+and ethers and solc for EVM tooling. These are external projects, not Erebus inventions.
+Dependency versions are recorded in the [circuit manifest](./circuits/m5/package.json),
+its lockfile, the [shielded Rust manifest](./sdk/shielded/Cargo.toml) and its lockfile.
+The [MCP package manifest](./mcp-server/pyproject.toml) records the external MCP tooling.
+The older Starknet implementation composes `starkware-libs/starknet-privacy`.
+
+The `metropolis` branch targets a developer/agent product on Monad testnet. `0.3.0.dev5` is a
+published prerelease and both rails have team-operated live Monad runs, but this is not yet a
+shipped or externally accepted Monad release.
+The goal is for an external developer or marketplace to integrate agents, negotiate privately, settle, disclose one deal, and recover failures.
+The [Metropolis roadmap](./docs/metropolis-roadmap.md) defines the milestones and acceptance criteria.
+
+The planned operating model keeps keys, payment authorization, and proving on the developer's machine or server.
+Optional Erebus-hosted message relay, transaction relayer, and indexer services will also support self-hosting through the same implementations.
+Hosted services receive ciphertext, public proofs, and public chain data, not spending keys or plaintext proof witnesses.
+They can observe routing, timing, and query metadata, and their availability affects progress. Self-custody does not eliminate those dependencies.
+This model describes the new Monad target, not the existing STRK20 proving infrastructure.
+
+Public-bound settlement is an intermediate milestone. It does not satisfy the shielded-payment completion criteria.
+The release gate requires an independent integration from a fresh environment using documented packages and commands.
+Mainnet activation remains unresolved and requires a separate release decision.
+
+Local development components now include [hash-checked local proving](./docs/metropolis-operations.md#7-local-proving),
+[buyer-authenticated snapshot access](./docs/metropolis-operations.md#4-seller-access-service),
+[native private negotiation](./docs/metropolis-operations.md#5-negotiation-command),
+and [durable public-bound payment](./docs/metropolis-operations.md#3-buyer-payment-and-recovery).
+Both rails have published-package live Monad runs; the private/shielded path is not a released
+Monad product, and the observation, catch-up, and lifetime fixes described in the
+[status](./docs/metropolis-status.md) are released in `0.3.0.dev5`.
+
 ## Four settlements on mainnet
 
 | Date | Paid | Transaction |
@@ -19,7 +178,7 @@ about through it.
 | 2026-09-12 | 0.8 STRK | [`0x43329b0f…adcd`](https://starkscan.co/tx/0x43329b0ff5d7865e0be3d4180e608229a5e8fd0d90312f4189f7aa9b8acadcd) |
 
 Amount and recipient are not recoverable from any of them. Every negotiation round is.
-Full ledger and the observer check: [docs/evidence.md](./docs/evidence.md).
+Full ledger and the observer check: [docs/status.md](./docs/status.md).
 
 **[Install the MCP server](#install) · [Add it to your client](#add-it-to-your-mcp-client) · [The thirteen tools](#the-thirteen-tools) · [Docs](#documentation)**
 
@@ -486,7 +645,7 @@ Configuration, the full tool surface, error handling, and the raw CLI protocol a
 | [First product](./docs/product.md) | Agent-to-agent paid work: the four gaps, sequence, and open decisions |
 | [Friction log](./docs/friction.md) | Where the stack fought us, and how we worked around it |
 | [Agent skill](./skills/erebus/) | Operating Erebus from an agent, with unsafe-behavior evals |
-| [Evidence](./docs/evidence.md) | Every mainnet transaction, and the observer check against one |
+| [Evidence](./docs/status.md) | Every mainnet transaction, and the observer check against one |
 | [Run evidence](./docs/runs/) | Real mainnet and Sepolia runs with transaction hashes and timings |
 
 ## Repo layout

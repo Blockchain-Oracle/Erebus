@@ -1,0 +1,78 @@
+name: Metropolis public install
+
+# Dispatch-only. Installs a published Metropolis release from the public index on native runners with
+# an empty cache, outside any build, and proves both deployed pools over public HTTPS with the pinned
+# publisher. It never builds, signs, publishes or sends a transaction. Witnesses are synthetic offline
+# fixtures regenerated from the hosted artifacts for each pool.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Published version, for example 0.3.0.dev2026101202"
+        required: true
+  # Also called by metropolis-registry.yml (public_install_version), which is dispatchable from the
+  # default branch while this file exists only on metropolis.
+  workflow_call:
+    inputs:
+      version:
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  install:
+    name: ${{ matrix.platform }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            platform: macos-arm64
+          - os: ubuntu-latest
+            platform: linux-x86_64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Regenerate synthetic witnesses per pool from the hosted artifacts
+        run: |
+          npm --prefix circuits/m5 ci
+          mkdir -p "$RUNNER_TEMP/public"
+          python3 - "$RUNNER_TEMP/public" <<'PY'
+          import hashlib, json, pathlib, subprocess, sys, urllib.request
+          root = pathlib.Path(sys.argv[1])
+          authorization = json.loads(pathlib.Path("packaging/metropolis/testnet-release.json").read_text())
+          base = "https://github.com/PoulavBhowmick03/erebus-metropolis/releases/download/artifacts-268bf1abe34d"
+          for name, pin in sorted(authorization["hosting_manifests"].items()):
+              manifest = root / f"manifest-{name}.json"
+              manifest.write_bytes(urllib.request.urlopen(f"{base}/manifest-{name}.json", timeout=120).read())
+              if hashlib.sha256(manifest.read_bytes()).hexdigest() != pin:
+                  sys.exit(f"{name}: hosted manifest is not the authorized one")
+              subprocess.run([sys.executable, "packaging/metropolis/stage_artifacts.py", "fetch", "--manifest", str(manifest),
+                              "--manifest-sha256", pin, "--output", str(root / f"bundle-{name}")], check=True, capture_output=True)
+              subprocess.run(["node", "circuits/m5/scripts/qualification-witnesses.mjs",
+                              "contracts/evm/deployments/monad-testnet-shielded-v2.json", str(root / f"bundle-{name}"),
+                              pin, name, str(root / f"witnesses-{name}")], check=True)
+          PY
+      - name: Fresh public install and HTTPS proving outside the checkout
+        run: |
+          python3 scripts/check-metropolis-public-install.py --version "${{ inputs.version }}" \
+            --authorization packaging/metropolis/testnet-release.json \
+            --witnesses "wmon=$RUNNER_TEMP/public/witnesses-wmon" --witnesses "usdc=$RUNNER_TEMP/public/witnesses-usdc" \
+            --work "$RUNNER_TEMP/public/install" | tee "$RUNNER_TEMP/public/report.json"
+          python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); sys.exit(0 if r["status"]=="verified" and r["native_runner"] and r["outside_checkout"] else "public install did not verify on a native runner")' "$RUNNER_TEMP/public/report.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: metropolis-public-install-${{ matrix.platform }}
+          path: ${{ runner.temp }}/public/report.json
+          if-no-files-found: error

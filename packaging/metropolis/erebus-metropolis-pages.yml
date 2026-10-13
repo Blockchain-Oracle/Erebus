@@ -1,0 +1,66 @@
+# Template for PoulavBhowmick03/erebus-metropolis: copy to .github/workflows/pages.yml in that
+# repository alongside packaging/metropolis/build_index.py as build_index.py.
+# It builds the hash-pinned PEP 503 index from the release assets and deploys it
+# under the required github-pages environment. The Erebus build workflow dispatches here only
+# when publish=true; this file itself never builds or signs anything.
+name: Metropolis package index
+
+on:
+  repository_dispatch:
+    types: [metropolis-registry]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag, for example v0.3.0.dev20261004"
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: metropolis-package-index
+  cancel-in-progress: false
+
+jobs:
+  publish-index:
+    name: Build and deploy the index
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.pages.outputs.page_url }}
+    env:
+      TAG: ${{ github.event.client_payload.tag || inputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Download every published release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # The index covers all published package versions, so a new release never makes an older
+          # pinned version uninstallable. Drafts are never indexed. Only `v<version>` releases are
+          # packages; other releases in this repository (the `artifacts-*` proving-artifact releases)
+          # are never indexed or downloaded here.
+          gh release list --repo PoulavBhowmick03/erebus-metropolis --limit 1000 \
+            --json tagName,isDraft --jq '.[] | select(.isDraft | not) | .tagName | select(startswith("artifacts-") | not)' > tags.txt
+          grep -Fxq -- "$TAG" tags.txt || { echo "dispatched tag is not a published release"; exit 1; }
+          while read -r tag; do
+            [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+\.dev[0-9]+$ ]] || { echo "invalid release tag"; exit 1; }
+            mkdir -p "releases/$tag"
+            gh release download "$tag" --repo PoulavBhowmick03/erebus-metropolis \
+              --dir "releases/$tag" --pattern '*.whl' --pattern 'release-manifest.json'
+          done < tags.txt
+      - name: Build the hash-pinned index from the manifests
+        run: python3 build_index.py --releases releases --output site/simple --tag "$TAG"
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+      - uses: actions/deploy-pages@v4
+        id: pages

@@ -2,6 +2,20 @@
 
 Guidance for Claude Code working in this repository.
 
+## Metropolis Branch Scope
+
+On `metropolis`, use `docs/metropolis-roadmap.md` and the Metropolis architecture,
+agreement, and milestone decision records as the product specification.
+The STRK20-specific instructions below apply to the legacy Starknet backend only.
+Do not require a STRK20 proof for the EVM public-bound backend or weaken legacy
+Starknet safety checks to implement Monad work.
+
+The Metropolis release gate requires independent participants, finalized Monad
+settlement, scoped disclosure, delivery recovery, installable packages, self-hosting,
+and a fresh-environment external rehearsal. Public-bound payments expose accepted
+terms and identities; local shielded prototype proofs are not a live private release.
+The old MVP definition below describes the pre-existing Starknet product.
+
 ## What this project is
 
 Erebus is private coordination and settlement infrastructure for AI agents, built on Starknet's STRK20 privacy framework. Two agents open an encrypted channel, negotiate as structured state transitions, and settle atomically through the shielded privacy pool, with viewing-key selective disclosure afterwards.
@@ -93,7 +107,7 @@ Ownership: `/sdk/rs` and `/contracts` are Poulav's. `/agents`, `/mcp-server` are
 - **The seam is a subprocess**. `erebus-cli`, one JSON request on stdin and one envelope on
   stdout. Async stays in Rust. Key *paths* cross the request; key values do not. Protocol 3
   uses opaque random channel handles backed by locked, mode-`0600` Rust state files. The
-  Python binding speaks protocol 4 and refuses a mismatched CLI by its envelope tag; do
+  Python binding speaks protocol 5 and refuses a mismatched CLI by its envelope tag; do
   not add protocol logic there.
 - **This is not for x402/ERC-8004 reuse.** That was checked and it does not transfer as
   code: ERC-8004 is EVM-only, and while x402 has an official Python SDK, x402-on-Starknet

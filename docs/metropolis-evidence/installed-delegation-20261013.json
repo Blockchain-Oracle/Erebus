@@ -1,0 +1,115 @@
+{
+  "status": "failed",
+  "gate_complete": false,
+  "coverage_gaps": [
+    "oversized_body_413"
+  ],
+  "service": "installed-binary",
+  "in_process": false,
+  "source_imports": false,
+  "fixture_harness_from_checkout": true,
+  "release_json_sha256": "a479dc79c406008bdfd88c0140ff4bcc481b7568511b41295f88206a2bb6b773",
+  "version": "0.3.0.dev2026101306",
+  "source_commit": "482d912cbc33e5f96de85f49b3006d631454b607",
+  "candidate_source_tree_sha256": "af7e69d864677f12b02b16d875b4d0a7bbbdafaac571a2d17fc24454c7ab9a53",
+  "installed_binaries_sha256": {
+    "erebus-shielded-relayer": "84cc7e6bae232f4c5a852b98333873f7946a2e267490627b25f0da5001c80168",
+    "erebus-payment": "40fad58fb039cbdc01bffab56f9fb40e32ddac5538b69666969ff8a755aa8ba1"
+  },
+  "fixture_evidence": [
+    {
+      "buyer_restart": true,
+      "buyer_sends": 0,
+      "delegation_before_transport": true,
+      "finalized_transaction": "0xa12ac735984478e4dc27db61671ca497ed10ed39f3f48209c51e3b94646d56f4",
+      "no_direct_fallback": true,
+      "payment_verified": true,
+      "relay_unavailable": true,
+      "sponsor_sender": "0x04929bb86076e09f248b254931491e361d3b4e54",
+      "sponsor_sends": 1,
+      "status": "installed-payment-delegation",
+      "timeout_or_lost_response": true
+    }
+  ],
+  "fixture_files_sha256": {
+    "sdk/shielded/tests/relayer_binary.rs": "0866a0d669690e99af0097030156c7ceed52a86cbedc619ee78886b2b130a40f",
+    "circuits/m5/scripts/native-fixture.mjs": "dff80ab7cd95cb30597492a3ebe48df832e7e51fefc471d3459bc7d8d80c5667",
+    "circuits/m5/scripts/relay-admission-fixture.mjs": "de2fc7c8b8eead78fd04b1ba6baaab5390f429f84b24ba8a919b416bd8522eba",
+    "sdk/shielded/tests/support/shielded_driver.rs": "75da0a1987fdb974a892bffbc0ebd335a6e6cd5c5749fbe58dff302d7ba63412",
+    "sdk/shielded/tests/support/payment_driver.rs": "961d06e8caf8ee1533694edd72ee604a8fc79683a5fefa84ec7cff6e412d2ad6",
+    "sdk/shielded/tests/negotiation_cli.rs": "7846c5aaa72a3e3364e220f6b16aa69f38fc9a580318ef1b8a4ff74da5f1c9ae"
+  },
+  "tests": {
+    "installed_relayer_binary_submits_observes_restarts_and_recovers_finalized_receipt": "ok",
+    "installed_relayer_binary_recovers_a_dropped_broadcast_with_explicit_resume": "ok",
+    "installed_relayer_binary_serves_duplicate_requests_with_one_broadcast": "ok",
+    "buyer_transport_delegates_to_the_installed_binary_and_never_signs_directly": "ok",
+    "installed_relayer_binary_answers_an_oversized_body_without_a_reset": "FAILED",
+    "payment_driver::shielded_driver::installed_payment_delegation": "ok",
+    "fixture_scripts_refuse_non_loopback_endpoints_and_foreign_chains": "ok"
+  },
+  "checks": {
+    "submit": {
+      "passed": true,
+      "scope": "installed relayer accepts a proof-only request and sends one sponsor transaction",
+      "test": "installed_relayer_binary_submits_observes_restarts_and_recovers_finalized_receipt"
+    },
+    "status": {
+      "passed": true,
+      "scope": "observe reports pending, then finalized with the same transaction hash",
+      "test": "installed_relayer_binary_submits_observes_restarts_and_recovers_finalized_receipt"
+    },
+    "restart_recovery": {
+      "passed": true,
+      "scope": "relayer restart keeps its journal; finalized receipt recovered after restart",
+      "test": "installed_relayer_binary_submits_observes_restarts_and_recovers_finalized_receipt"
+    },
+    "sponsor_sender": {
+      "passed": true,
+      "scope": "receipt from the sponsor to the pool with exact calldata, value 0, status 1, one payment",
+      "test": "installed_relayer_binary_submits_observes_restarts_and_recovers_finalized_receipt"
+    },
+    "dropped_broadcast_resumed": {
+      "passed": true,
+      "scope": "dropped first broadcast; owner --resume resends identical bytes exactly once",
+      "test": "installed_relayer_binary_recovers_a_dropped_broadcast_with_explicit_resume"
+    },
+    "duplicate_one_broadcast": {
+      "passed": true,
+      "scope": "concurrent and sequential duplicates: one raw broadcast, one hash, finalized once",
+      "test": "installed_relayer_binary_serves_duplicate_requests_with_one_broadcast"
+    },
+    "no_direct_fallback": {
+      "passed": true,
+      "scope": "buyer RelayEndpoint transport only: buyer nonce stays 0 and a stopped relayer returns unknown with no buyer send; NOT the installed erebus-payment CLI or MCP",
+      "test": "buyer_transport_delegates_to_the_installed_binary_and_never_signs_directly"
+    },
+    "oversized_body_413": {
+      "passed": false,
+      "scope": "a 2 MiB body receives HTTP 413",
+      "test": "installed_relayer_binary_answers_an_oversized_body_without_a_reset"
+    },
+    "loopback_and_chain_refusal": {
+      "passed": true,
+      "scope": "fixture scripts refuse non-loopback endpoints and foreign chains",
+      "test": "fixture_scripts_refuse_non_loopback_endpoints_and_foreign_chains"
+    },
+    "installed_payment_delegation": {
+      "passed": true,
+      "scope": "installed erebus-payment delegating to the installed relayer: delegation persisted before transport, timeout or lost response, buyer restart, relay unavailable, recovery, no direct fallback, exactly one payment; CLI scope, not MCP",
+      "test": "payment_driver::shielded_driver::installed_payment_delegation"
+    }
+  },
+  "claims": {
+    "native_platform_qualification": false,
+    "live_payment": false,
+    "note": "loopback Anvil chain 10143 with fixture keys; not live Monad or relayed settlement evidence"
+  },
+  "labels": [
+    "test-only",
+    "single-operator",
+    "unaudited",
+    "local-anvil",
+    "installed-relayer"
+  ]
+}
