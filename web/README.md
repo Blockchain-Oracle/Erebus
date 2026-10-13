@@ -71,9 +71,22 @@ the logo are the same orange, so the page reads as one material.
 
 ## Routes
 
-One static route:
+Four static routes:
 
 - `/` — the landing page. Four sections: hero, evidence, the pool band, the replay, the boundary.
+- `/use-cases/` — what agents build on Erebus: the shared negotiate/settle/recover/deliver loop,
+  then discovery, purchases, pay-per-call x402, prepaid metering and receipts, each with how it
+  works, what a chain reader sees, the command and its sources (`lib/usecases.ts`). It also lists
+  what is not yet on the real path.
+- `/tools/receipt/` — opens a `metropolis_audit.py` report and renders the receipt under the same
+  rules as `agents/src/erebus_agents/receipt_explorer.py` (`lib/receipt.ts`); saves HTML or JSON.
+- `/tools/discovery/` — opens a `discovery_demo.py` index, filters sellers, and checks a descriptor
+  file's SHA-256 against the digest its record pinned (`lib/discovery.ts`).
+
+The two tools read files in the tab (`components/FileDrop.tsx`) and never upload them, ask for a
+key or verify a signature. They format and compare; Rust and the auditor do the verifying. Keep
+their rules in step with the Python they mirror. Use-case source links point at the `metropolis`
+branch, where that code lives.
 
 The docs are **not** in this package any more. They moved to their own repo,
 `ishitab02/erebus-docs`, on 2026-09-17 and publish at `https://docs.erebusagents.live` (root,

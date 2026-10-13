@@ -28,6 +28,7 @@ const NAV = [
   { href: "#proof", label: "Proof" },
   { href: "#how", label: "How it works" },
   { href: "#limits", label: "Limits" },
+  { href: "/use-cases/", label: "Use cases" },
   { href: "https://docs.erebusagents.live", label: "Docs" },
 ];
 
