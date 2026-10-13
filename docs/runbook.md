@@ -21,7 +21,7 @@ relationship. The counterparty address is public at channel-open, the submitter 
 and the prover plus preflight RPC both see the pool private key during writes.
 
 For privacy scope and the known leaks, read [privacy-model.md](./privacy-model.md) first.
-For the implementation and trust boundaries, read [custody-design.md](./custody-design.md)
+For the implementation and trust boundaries, read `sdk/rs/src/signer.rs`
 and [local-prover.md](./local-prover.md).
 
 ## Clean shell
@@ -283,8 +283,5 @@ say so directly.
 Use this guide together with:
 
 - [README.md](../README.md)
-- [reference.md](./reference.md)
-- [status.md](./status.md)
 - [privacy-model.md](./privacy-model.md)
 - [local-prover.md](./local-prover.md)
-- [custody-design.md](./custody-design.md)

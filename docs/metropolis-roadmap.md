@@ -3,8 +3,8 @@
 Updated: 2026-10-12. Branch: `metropolis`. Submission target: October 13, 2026.
 
 This file tracks tasks and owners. Detailed runs, decisions and hashes belong in
-[status](metropolis-status.md), [operations](metropolis-operations.md), and [install](metropolis-install.md).
-[Agreement](metropolis-agreement.md) remains normative for protocol formats.
+[operations](metropolis-operations.md) and [install](metropolis-install.md).
+The `sdk/core` agreement vectors remain normative for protocol formats.
 
 Checked items have evidence at the stated scope. Local tests, team-run testnet workflows
 and published installed workflows are separate gates. Agent reports are not independent audits.
@@ -125,11 +125,9 @@ spend authorization without paired evidence; its separate reproducer passed thre
 Installed qualification, live asset/relayer loops and cold seller catch-up remain open.
 Cold-history improvements must use a separate candidate and cannot silently replace this snapshot.
 
-The [release-readiness review](metropolis-release-readiness.md) records concrete blockers:
-integrate relayer inventory; require funded installed-relayer and generated-agent reports;
+Concrete blockers: integrate relayer inventory; require funded installed-relayer and generated-agent reports;
 qualify the changed onboarding candidate; then approve a clean revision and exact version.
 Its focused release tests passed 57 with the expected missing-relayer inventory failure.
-This completes the readiness review, not the release or end-to-end product gate.
 Subsequent integration resolved the inventory gap and added publication report guards.
 Focused onboarding/publication/registry tests passed 126. The installed relayer passed
 five funded local chain-10143 tests; generated-agent/native report execution remains open.

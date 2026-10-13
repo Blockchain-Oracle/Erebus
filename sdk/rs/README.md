@@ -36,7 +36,7 @@ The three are not equally precious. Channel records are rebuildable from the poo
 chain (`rebuild_state`), and the note cache is pure derived data that is discarded whenever it
 does not parse. **The journal is the one that cannot be reconstructed**, because it is the only
 record that a transaction was signed. Back it up with the channel records, from the same
-moment: see [custody-operations.md](../../docs/custody-operations.md).
+moment.
 
 ### Provision the two keys
 

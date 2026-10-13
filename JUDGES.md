@@ -81,8 +81,7 @@ All of these were run by our team; none is third-party acceptance.
 This is a test-only, single-operator, unaudited deployment. The Groth16 setup is a test setup, and
 the live relayer loop is still being completed. Public-bound and x402 payments expose the
 accepted terms and the parties; the shielded rail hides amounts and participant keys, while the
-gas sender, funding and withdrawals stay public. Current state and every qualification run:
-[metropolis-status.md](docs/metropolis-status.md).
+gas sender, funding and withdrawals stay public.
 
 More context: [use cases](https://erebusagents.live/use-cases/) and the
 [Monad docs](https://docs.erebusagents.live/monad).

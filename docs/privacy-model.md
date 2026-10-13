@@ -162,7 +162,7 @@ repository for the content claim.
 Its boundaries: it tests the supplied fixtures, it relies on AES-256-GCM-SIV being sound and
 the channel key staying secret, and it is not an external cryptographic review. It also
 currently mislabels wire-v1 traffic as wire v2 — a defect in the version classifier, not in
-the recovery result. See [privacy-observer-finding.md](./privacy-observer-finding.md).
+the recovery result.
 
 ---
 
@@ -232,6 +232,5 @@ meaning to an external verifier.
 
 - [friction.md](./friction.md) F30, F31 — how the salt lane turned out to be public, and what
   wire v2 fixed and did not
-- [privacy-observer-finding.md](./privacy-observer-finding.md) — the harness result in full
 - [roadmap.md](./roadmap.md) — privacy requirements for planned features
 - [runbook.md](./runbook.md) — the seven steps, reproducible

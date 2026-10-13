@@ -18,7 +18,7 @@
 //! the root.
 //!
 //! The root is all-zero only when the deal has no messages, which is the legacy and pre-M2 case
-//! ([metropolis-agreement.md](../../docs/metropolis-agreement.md) field 6).
+//! (agreement field 6, `erebus_core::terms`).
 
 use crate::hashing::{self, HashVersionError};
 use erebus_core::auth::Role;

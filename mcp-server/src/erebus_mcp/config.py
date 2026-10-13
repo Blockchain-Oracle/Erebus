@@ -2,7 +2,7 @@
 
 ``docs/ishita.md``: "It needs a prover URL and identity in its config, and it should fail
 loudly rather than fall back to a shared endpoint." Erebus holds no keys, so this process
-runs against the operator's prover (``docs/custody-design.md``). ``prover_url`` remains
+runs against the operator's prover. ``prover_url`` remains
 required for the mock backend so every configuration names its endpoint explicitly.
 
 ``mock`` is the default and needs an address and prover URL. ``seam`` drives the Rust client

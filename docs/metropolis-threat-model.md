@@ -59,7 +59,6 @@ candidate accepts only version and proof calldata, under Bearer authentication.
 Do not send shielded openings or witnesses through either service.
 A separate gas key does not hide network identity or prove that payments are unrelated.
 Wallet tool responses can expose private amounts and future spend identifiers to an agent's model provider.
-See the [source and test review](metropolis-leakage-review.md) for the tested boundary and remaining logging gaps.
 
 ### Diagnostic formatting boundary
 
@@ -202,9 +201,7 @@ were actually enforced rather than which were intended.
 
 ## 8. M5A shielded review findings (2026-10-06; candidate v2 implementation 2026-10-07)
 
-Source: `94aa059` plus the uncommitted candidate v2 working tree on `metropolis`; the full
-invariant-to-code-to-test checklist, hashes, and reruns are in the
-[status record](metropolis-status.md). This is a design review plus local implementation, not an
+Source: `94aa059` plus the uncommitted candidate v2 working tree on `metropolis`. This is a design review plus local implementation, not an
 audit, and it does not close M5A or M5. The candidate is uncommitted, uses known-entropy test
 artifacts, is unaudited, and is not deployed.
 

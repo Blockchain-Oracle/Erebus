@@ -144,5 +144,5 @@ static frame under `prefers-reduced-motion`.
 ## Content
 
 Every fact on the page is sourced in `lib/content.ts`, which names the document each value came
-from. `docs/status.md` is the tiebreaker and `docs/privacy-model.md` is the only source allowed
+from. `docs/privacy-model.md` is the only source allowed
 to make a privacy claim. Do not add a claim that is not already written down in the repo.

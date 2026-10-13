@@ -23,7 +23,7 @@ which exists only on `mcp<2`. This workspace uses 2.0.0.
 
 This server holds no key material. It takes a prover URL and an identity from config and
 fails at startup when either is absent. The proving call sends the plaintext pool private
-key, so the key owner must control the prover. See docs/custody-design.md.
+key, so the key owner must control the prover.
 """
 
 import argparse

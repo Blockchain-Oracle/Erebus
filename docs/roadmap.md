@@ -2,7 +2,7 @@
 
 Updated September 12, 2026. This roadmap starts after the published `v0.2.0` release.
 Versions below are planning targets, not release dates or shipped capabilities.
-Completed work and dated measurements belong in [status](./status.md) and [run records](./runs/).
+Completed work and dated measurements belong in [run records](./runs/).
 
 ## Baseline: v0.2.0
 
@@ -37,7 +37,7 @@ All four items run on the published `v0.2.0` wire. None needs a protocol change.
 
 | # | Work | Why it is next |
 | --- | --- | --- |
-| 1 | **`memo_hash` preimage convention.** A canonical record of what was bought, hashed into the existing 128-bit field, published as a spec with known-answer vectors | A settlement currently records "0.8 STRK agreed, 0.8 STRK paid" and nothing about the subject of the deal. [usecases.md](./usecases.md) has listed this as open work. It is the precondition for receipts, disputes and third-party integration |
+| 1 | **`memo_hash` preimage convention.** A canonical record of what was bought, hashed into the existing 128-bit field, published as a spec with known-answer vectors | A settlement currently records "0.8 STRK agreed, 0.8 STRK paid" and nothing about the subject of the deal. It is the precondition for receipts, disputes and third-party integration |
 | 2 | **Counterparty allowlist**, beside the existing spending limits in `mcp-server/src/erebus_mcp/spending.py` | The policy layer caps *how much* an agent may spend and nothing caps *to whom*. Half a policy |
 | 3 | **`funding_plan` read-only tool** — takes an intended run shape, returns the exact allowance each identity needs | [friction.md](./friction.md) F42. A wrong allowance costs a failed write and 6 STRK, and it lands on a new operator's first attempt. The 2026-09-11 run added a second cause: an `approve` must be ten blocks deep before the next write simulates against it |
 | 4 | **Minimal counterparty discovery** | Two agents can transact only if each already knows the other's address and both are registered. Without discovery there is no loop an outside party can enter |
@@ -56,8 +56,6 @@ Not engineering work, but it belongs on the roadmap because it gates every produ
 - Replace the site's primary call to action. It currently offers a demo, an explanation and
   source. None of those is "start using it."
 
-Reasoning and sources are in `claudesplan.md` at the repository root.
-
 ## 4. Privacy and operational work
 
 Open work carried forward from the release:
@@ -72,14 +70,14 @@ Standing constraints that no item above removes: the counterparty address is pub
 channel open (F38); each write costs a proof and a pool fee (F27, F7); the prover and the
 preflight RPC both receive the pool private key (F14).
 
-The [targeted review](./v0.2-targeted-review.md) retains the hosted prover's one-time result
+The v0.2 review retained the hosted prover's one-time result
 delivery risk. It does not substitute for independent security review.
 
 ## 5. Release and product gates
 
 Each feature release needs compatible artifacts, relevant tests, current documentation,
 and explicit owner publication approval. The release workflow remains the executable source
-for artifact checks. [Production gaps](./production-gaps.md) remain open after publication.
+for artifact checks.
 
 Product progress uses external evidence: agents completing paid work through Erebus, repeat
 deals between the same parties, paying integrations, support hours, intervention rate, and

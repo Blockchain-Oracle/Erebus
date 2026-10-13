@@ -69,7 +69,7 @@ DEFAULT_FIXTURES = (
 #: Historical transactions/fixtures that retain the classifier as a negative control. Both
 #: are wire-v2-shaped for M1 purposes: the
 #: fingerprint is a property of the fifth salt, which v1 also exhibits, and that is itself the
-#: finding recorded in privacy-observer-finding.md.
+#: finding recorded in docs/privacy-model.md.
 HISTORICAL_FIXTURES = ("observer-wire-v1.json", "observer-wire-v2.json")
 
 

@@ -17,7 +17,7 @@ Component status lines carried over from the merged runbooks stay with their sec
 remain accurate.
 
 Related documents: [architecture](metropolis-architecture.md),
-[agreement format](metropolis-agreement.md), [threat model](metropolis-threat-model.md),
+[threat model](metropolis-threat-model.md),
 [roadmap](metropolis-roadmap.md),
 [published-package install guide](metropolis-install.md#10-published-metropolis-packages), and
 [friction](friction.md).
@@ -756,7 +756,7 @@ on macOS arm64 and Linux x86_64. Linux used a complete debug wheel under QEMU;
 these timings are not native-hardware benchmarks. The recovered Linux run passed
 six installed proof/authorization cases after rechecking the retained wheel,
 binary inventory, launcher and licenses. Earlier timeout and host-disk failures
-remain recorded in [status](metropolis-status.md); they are not passing test runs.
+are not passing test runs.
 Reserve space for both unpacked debug binaries and fresh installed copies before
 starting an emulated run. Never bypass VM write errors or discard source, keys,
 journals or retained evidence to reclaim space.

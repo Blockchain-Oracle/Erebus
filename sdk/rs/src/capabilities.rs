@@ -11,8 +11,7 @@
 //!   It does **not** declare
 //!   [`Guarantee::AgreementBoundSettlement`]: the amount equality between the accepted offer
 //!   and the payment is a Rust check in `channel::accept_and_settle_with_change`, not a
-//!   predicate the pool proof enforces. The M0 enforcement map
-//!   (`docs/metropolis-status.md`) records that boundary.
+//!   predicate the pool proof enforces.
 //! - **Local proving**: false. The current path submits through a hosted proving service
 //!   (`prover.rs`); only the planned EVM shielded backend proves locally by default
 //!   (decisions D01).

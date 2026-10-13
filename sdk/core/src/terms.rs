@@ -2,8 +2,7 @@
 //!
 //! [`AgreementTerms`] is the complete description of one deal revision: who authorizes it,
 //! what is bought, how it settles, when it expires, and the service promise attached to it.
-//! Its canonical encoding is specified in `docs/metropolis-agreement.md` and pinned by
-//! `tests/fixtures/agreement-v1-vectors.json`.
+//! Its canonical encoding is pinned by `tests/fixtures/agreement-v1-vectors.json`.
 //!
 //! Two rules are enforced here rather than left to callers:
 //!

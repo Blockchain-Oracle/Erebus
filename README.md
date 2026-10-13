@@ -2,45 +2,30 @@
 
 **Negotiate in darkness, settle in silence.**
 
-Erebus is experimental coordination and shielded-settlement infrastructure for AI agents.
-Two agents negotiate over an encrypted channel and settle atomically through Starknet's
-STRK20 privacy pool.
+Erebus lets two AI agents agree on a deal over an encrypted channel and pay for it through a
+shielded pool, so competitors watching the chain don't learn the price. Afterwards, one
+participant can show that single deal to an auditor without revealing anything else.
 
-**Erebus hides the terms, not the relationship.** Unaudited. Do not put value you care
-about through it.
+It is infrastructure, not an app: agents use it through an MCP server, a CLI and a Python SDK.
+It is experimental and unaudited. Don't put value you care about through it.
 
-## Metropolis development
+**Judging for Monad Metropolis? Start at [JUDGES.md](./JUDGES.md).**
 
-**Monad reviewers and judges: start at [JUDGES.md](./JUDGES.md), not at the Starknet install below.**
-It links the [Metropolis install guide](./docs/metropolis-install.md) and
-[operations guide](./docs/metropolis-operations.md). The stable `v0.3.0`
-package and the video below demonstrate the older Starknet product, not Monad.
+## Two backends
 
-Monad testnet evidence includes public-bound settlement and one team-operated
-shielded WMON payment. Public-bound calldata exposes the agreement opening,
-signatures, amount and parties. The shielded rail uses proofs and note commitments;
-the outer gas sender, funding and withdrawals remain public. Offchain negotiation
-history stays encrypted. Full installed live workflows for both assets and sponsored
-submission remain incomplete; the setup is test-only, single-operator and unaudited.
+| | Starknet | Monad |
+| --- | --- | --- |
+| Network | mainnet | testnet (chain 10143) |
+| Pool | StarkWare's STRK20 privacy pool | Erebus's own shielded pools for WMON and USDC |
+| Release | `v0.3.0` | `0.3.0.dev2026101307` (prerelease) |
+| Guide | [docs/setup.md](./docs/setup.md) | [docs/metropolis-install.md](./docs/metropolis-install.md) |
 
-The x402 `exact` rail (seller-facilitated Permit2) is implemented and locally verified end to
-end: real discovery and encrypted negotiation, one fenced payment, restart recovery, matching
-resource delivery, and independent auditor verification from the encrypted grant alone. Published
-`0.3.0.dev4` commands also completed one **team-operated live Monad x402 payment**
-([`0x8a0272e6…`](https://testnet.monadexplorer.com/tx/0x8a0272e69188ac3be52783ddfc4d4436496a58f2d5c63d808cd3320a1fa5df43)),
-including seller restart, resource recovery, and auditor verification. The installed public-bound
-rehearsal also completed on Monad testnet: one payment
-([`0x1ba9ddb3…`](https://testnet.monadexplorer.com/tx/0x1ba9ddb363a0c916f8e41ca8eca7d4c524d1ba4722bf4ea37ed423547700ff73)),
-buyer-finalized observation, seller access across a restart, and independent auditor verification
-(`payment_verified: true`). These are team-operated native CLI runs, not MCP/LLM or third-party
-acceptance. The shielded WMON payment
-([`0xe01666d8…`](https://testnet.monadexplorer.com/tx/0xe01666d8c4e16efe8195da8047674c71a325ee20ff250f02f4fdf570a04934fa))
-used source-built payment commands, not the complete published-release workflow.
+The agent side is the same on both: negotiate, authorize one agreement, settle once, recover by
+watching the chain instead of paying again, and disclose one deal.
 
-### Install the published Metropolis packages
+## Install on Monad
 
-The recorded release `0.3.0.dev2026101307` is published as a prerelease on a separate Metropolis index (the stable Starknet
-index is unrelated). With [uv](https://docs.astral.sh/uv/) and Python 3.11+:
+Python 3.11+, [uv](https://docs.astral.sh/uv/), and macOS on Apple silicon or Linux x86_64.
 
 ```sh
 uv venv --python 3.11 erebus-metropolis
@@ -51,153 +36,14 @@ uv pip install --python erebus-metropolis/bin/python \
   "erebus-mcp-server==0.3.0.dev2026101307"
 ```
 
-Use uv with the index order above. Metropolis takes priority; PyPI supplies missing dependencies.
-The explicit `first-index` strategy prevents PyPI packages from replacing the three Metropolis packages.
-The default index always has lower priority ([uv index rules](https://docs.astral.sh/uv/concepts/indexes/#index-url-and-extra-index-url)).
-If downloads from GitHub release assets time out, set
-`UV_HTTP_TIMEOUT=300`. Supported platforms: macOS 11+ on Apple silicon and Linux x86_64 (built on
-GitHub's `ubuntu-latest`; not a manylinux build, so older glibc may not run it). There are no
-Intel macOS, Linux arm64, or Windows wheels. The install puts the native commands, the
-`erebus-mcp-server` entry point, and `erebus-selfhost` in `erebus-metropolis/bin`. Verified
-on native macOS and Linux from fresh environments outside the checkout (see the
-[install guide](./docs/metropolis-install.md)).
+Keep the index order: the Metropolis index first, PyPI only for dependencies. Then follow the
+[install guide](./docs/metropolis-install.md) to set up a buyer, a seller and an auditor with
+`erebus-init --metropolis`, and the [operations guide](./docs/metropolis-operations.md) to run
+them.
 
-Recorded Monad testnet payments: the earlier public-bound example
-[`0x1f7ec208…`](https://testnet.monadexplorer.com/tx/0x1f7ec208a7b03b835f224ac989cc59c9aee4c33634a2b04498b8394ddede4c09)
-and the live x402 payment
-[`0x8a0272e6…`](https://testnet.monadexplorer.com/tx/0x8a0272e69188ac3be52783ddfc4d4436496a58f2d5c63d808cd3320a1fa5df43).
-See [dated evidence and remaining gates](./docs/metropolis-status.md).
-The [status and acceptance gates](./docs/metropolis-status.md) record the rubric and mandatory evidence gates.
-An outside developer can run the [external acceptance handoff](./docs/metropolis-external-acceptance.md);
-it has not yet been run by a third party.
-The [demo script](./docs/metropolis-demo.md) is recording-ready with real captured output; the video
-recording is pending and no video is linked until it exists.
-No Metropolis demo video, hosted service, or third-party external rehearsal is claimed complete.
-
-### Local Monad-Backend Rehearsal
-
-From this branch checkout, with Rust stable, uv, and Foundry installed:
+## Install on Starknet
 
 ```sh
-uv sync --all-packages
-forge build --root contracts/evm
-cargo test --locked --manifest-path sdk/shielded/Cargo.toml --test negotiation_cli \
-  two_mcp_agents_negotiate_pay_and_retrieve_public_bound_with_one_send -- --ignored --nocapture
-```
-
-This starts Anvil, negotiates through two MCP servers, pays once, recovers a lost
-broadcast response, and retrieves the resource. It is a local rehearsal, not a
-live Monad interaction. The live path needs separate participant keys, two RPC
-providers, test-token allowance, faucet gas, and the configuration in the runbooks.
-
-### Use Cases
-
-Both fit the current mechanism: two known parties, one payment from the buyer, an off-chain
-deliverable, and disclosure of one deal.
-
-**Procurement with an audit.** A buyer agent holds a requisition (item, quantity, maximum unit
-price). A supplier agent holds a catalog floor. They negotiate a total, the buyer pays once, and
-one participant grants an auditor a scoped disclosure of that deal. The auditor passes it only if
-it settled, paid what was agreed, and stayed under the buyer's ceiling.
-
-```sh
-uv run python agents/src/erebus_agents/procurement_demo.py --latency 0
-```
-
-That rehearsal runs on the mock client. On the Metropolis rail each operator's files fix the
-price policy, so the deal agents supply only the operation ID (`docs/friction.md` F58). After a
-deal settles, the real disclosure step runs against the participant's durable state:
-
-```sh
-uv run python agents/src/erebus_agents/metropolis_audit.py --operation <op> \
-  --expected-issuer <issuer identity> --expected-commitment <deal commitment> \
-  --issuer-dir <dir> --auditor-dir <fresh dir> --state-root <issuer state> --store-root <store> \
-  --namespace eip155:10143 --issuer-key-file <issuer agreement key> --deployment <deployment.json>
-```
-
-The issuer selects the deal and exports a grant to the auditor's public key. The auditor, with only
-that grant and its own key, verifies the agreement offline and, with `--deployment`, the payment
-against chain data. A payment check that stays pending is not evidence of non-payment, and delivery
-is never verified. Evidence and grant files are create-new; re-issuing a grant takes fresh
-`--evidence-name` and `--grant-name` values.
-
-**Paid API or compute purchase.** The buyer negotiates a price and retrieves the resource through
-the `x402-exact` profile of `metropolis_loop.py`. The seller submits the payment, and only an
-independent auditor verifies it, with the same disclosure step.
-
-Public-bound payments expose the accepted terms and parties. Neither case proves delivery.
-
-### AI-Assisted Development
-
-Claude, Codex, and OpenCode have assisted with implementation, tests, documentation,
-and review of the Metropolis work. AI-generated code requires human review and does
-not establish security or release readiness. The pre-existing Starknet/STRK20
-implementation is prior work; the Metropolis roadmap records the new branch work.
-
-### External Code Attribution
-
-The Metropolis implementation uses Circom, circomlib, circomlibjs and snarkjs for
-circuits and proving, arkworks and ark-circom for Rust proving and verification,
-and ethers and solc for EVM tooling. These are external projects, not Erebus inventions.
-Dependency versions are recorded in the [circuit manifest](./circuits/m5/package.json),
-its lockfile, the [shielded Rust manifest](./sdk/shielded/Cargo.toml) and its lockfile.
-The [MCP package manifest](./mcp-server/pyproject.toml) records the external MCP tooling.
-The older Starknet implementation composes `starkware-libs/starknet-privacy`.
-
-The `metropolis` branch targets a developer/agent product on Monad testnet. `0.3.0.dev5` is a
-published prerelease and both rails have team-operated live Monad runs, but this is not yet a
-shipped or externally accepted Monad release.
-The goal is for an external developer or marketplace to integrate agents, negotiate privately, settle, disclose one deal, and recover failures.
-The [Metropolis roadmap](./docs/metropolis-roadmap.md) defines the milestones and acceptance criteria.
-
-The planned operating model keeps keys, payment authorization, and proving on the developer's machine or server.
-Optional Erebus-hosted message relay, transaction relayer, and indexer services will also support self-hosting through the same implementations.
-Hosted services receive ciphertext, public proofs, and public chain data, not spending keys or plaintext proof witnesses.
-They can observe routing, timing, and query metadata, and their availability affects progress. Self-custody does not eliminate those dependencies.
-This model describes the new Monad target, not the existing STRK20 proving infrastructure.
-
-Public-bound settlement is an intermediate milestone. It does not satisfy the shielded-payment completion criteria.
-The release gate requires an independent integration from a fresh environment using documented packages and commands.
-Mainnet activation remains unresolved and requires a separate release decision.
-
-Local development components now include [hash-checked local proving](./docs/metropolis-operations.md#7-local-proving),
-[buyer-authenticated snapshot access](./docs/metropolis-operations.md#4-seller-access-service),
-[native private negotiation](./docs/metropolis-operations.md#5-negotiation-command),
-and [durable public-bound payment](./docs/metropolis-operations.md#3-buyer-payment-and-recovery).
-Both rails have published-package live Monad runs; the private/shielded path is not a released
-Monad product, and the observation, catch-up, and lifetime fixes described in the
-[status](./docs/metropolis-status.md) are released in `0.3.0.dev5`.
-
-## Four settlements on mainnet
-
-| Date | Paid | Transaction |
-|---|---|---|
-| 2026-08-31 | 0.8 STRK | [`0x72adebfc…6c6d`](https://starkscan.co/tx/0x72adebfcffdfd45bba66d2152c7e11b50107aa0fe2b4c9f1ea851da16ab6c6d) |
-| 2026-08-31 | 0.6 STRK | [`0x79167f21…f97a`](https://starkscan.co/tx/0x79167f213952fb33a57eec6457963fa7dd7ba3a38160d5ef04540e91bd4f97a) |
-| 2026-09-07 | 2.0 STRK | [`0x2582f34a…f5a7`](https://starkscan.co/tx/0x2582f34a10f6a3c9f1fbfdad4622c2f8a79398a1782c7d425eac13698e7f5a7) |
-| 2026-09-12 | 0.8 STRK | [`0x43329b0f…adcd`](https://starkscan.co/tx/0x43329b0ff5d7865e0be3d4180e608229a5e8fd0d90312f4189f7aa9b8acadcd) |
-
-Amount and recipient are not recoverable from any of them. Every negotiation round is.
-Full ledger and the observer check: [docs/status.md](./docs/status.md).
-
-**[Install the MCP server](#install) · [Add it to your client](#add-it-to-your-mcp-client) · [The thirteen tools](#the-thirteen-tools) · [Docs](#documentation)**
-
-[![Erebus — private settlement for AI agents](./docs/assets/demo-thumbnail.jpg)](https://drive.google.com/file/d/1zOkEJt08DwRiHeLIu4IaXCl1s8VRSKuu/view?usp=sharing)
-
-**[Watch the demo](https://drive.google.com/file/d/1zOkEJt08DwRiHeLIu4IaXCl1s8VRSKuu/view?usp=sharing)** — two agents on two different frameworks
-negotiate and settle 2 STRK on mainnet through MCP. A third party then reconstructs that one
-deal from a scoped viewing grant.
-
-[Public site](https://erebusagents.live) · [Docs](https://docs.erebusagents.live) · [operator guide](./docs/runbook.md)
-
----
-
-## Quickstart
-
-Two commands from nothing to thirteen MCP tools in your client. No Rust toolchain, no
-chain, no keys, no gas — `mock` runs the whole negotiate-and-settle loop in memory.
-
-```bash
 uv tool install --python 3.12 \
   --extra-index-url https://poulavbhowmick03.github.io/Erebus/simple \
   erebus-mcp-server
@@ -210,497 +56,83 @@ claude mcp add erebus \
   -- erebus-mcp-server
 ```
 
-All four variables are load-bearing even in `mock`. The server refuses to start unless
-`AGENT_ADDRESS`, `PROVING_SERVICE_URL` and `EREBUS_SETTLEMENT_ROLE` are all set
-(`environment_is_configured`, `mcp-server/src/erebus_mcp/onboarding.py`), and
-`PROVING_SERVICE_URL` is never dialled in `mock`, so any placeholder works.
+`mock` runs the whole loop in memory, with no keys or gas. Run `erebus-init` to set up a real
+identity; [docs/onboarding.md](./docs/onboarding.md) covers the flags and recovery.
 
-Then ask your agent to `open_channel`, `propose_offer`, `counter_offer` and
-`accept_and_settle`. When you want a real chain, swap `EREBUS_BACKEND=mock` for a funded
-identity — [Next: an identity](#next-an-identity) — and keep everything else.
+## Evidence
 
-### Account onboarding
+Starknet mainnet. Amount and recipient can't be recovered from any of these:
 
-**0.3.0 / Protocol 5 is the current release.** It adds installed account onboarding;
-settlement requests retain Protocol 4's `operation_id` mechanics unchanged. The public
-install above already pulls it in.
+| Date | Paid | Transaction |
+| --- | --- | --- |
+| 2026-08-31 | 0.8 STRK | [`0x72adebfc…`](https://starkscan.co/tx/0x72adebfcffdfd45bba66d2152c7e11b50107aa0fe2b4c9f1ea851da16ab6c6d) |
+| 2026-08-31 | 0.6 STRK | [`0x79167f21…`](https://starkscan.co/tx/0x79167f213952fb33a57eec6457963fa7dd7ba3a38160d5ef04540e91bd4f97a) |
+| 2026-09-07 | 2.0 STRK | [`0x2582f34a…`](https://starkscan.co/tx/0x2582f34a10f6a3c9f1fbfdad4622c2f8a79398a1782c7d425eac13698e7f5a7) |
+| 2026-09-12 | 0.8 STRK | [`0x43329b0f…`](https://starkscan.co/tx/0x43329b0ff5d7865e0be3d4180e608229a5e8fd0d90312f4189f7aa9b8acadcd) |
 
-With `erebus-mcp-server` installed, run:
+Monad testnet, all run by our team:
 
-```bash
-erebus-init
-```
+| Payment | Transaction |
+| --- | --- |
+| x402, with the earlier `0.3.0.dev4` release | [`0x8a0272e6…`](https://testnet.monadexplorer.com/tx/0x8a0272e69188ac3be52783ddfc4d4436496a58f2d5c63d808cd3320a1fa5df43) |
+| Public-bound | [`0x1ba9ddb3…`](https://testnet.monadexplorer.com/tx/0x1ba9ddb363a0c916f8e41ca8eca7d4c524d1ba4722bf4ea37ed423547700ff73) |
+| Shielded WMON, with source-built payment commands | [`0xe01666d8…`](https://testnet.monadexplorer.com/tx/0xe01666d8c4e16efe8195da8047674c71a325ee20ff250f02f4fdf570a04934fa) |
 
-The initializer lists existing Erebus identities and local `sncast` accounts. Select one
-or choose **new**. It creates keys locally, prints the address and funding shortfall, and
-continues through deployment, allowance approval, shielding, and readiness checks. No repo
-checkout, Rust toolchain, or `sncast` executable is needed. Existing pool keys are retained.
+Starknet run records, with timings, are in [docs/runs](./docs/runs/).
 
-For agents, `--list-accounts --json`, `--account <id>`, `--new`, and `--resume` make the
-choice explicit. `--json` never prompts; `--yes` authorizes the setup transactions.
-See [installed onboarding](docs/onboarding.md) for commands, funding, and supported wallets.
+Videos: [Starknet demo](https://drive.google.com/file/d/1zOkEJt08DwRiHeLIu4IaXCl1s8VRSKuu/view?usp=sharing),
+[Monad product](https://youtu.be/fIsfHgDBhxo), [pitch](https://youtu.be/6Dwl0PfzdJ8) and
+[technical demo](https://youtu.be/ktBDsFbihTM).
 
-### Download links
+## What it hides and what it doesn't
 
-| | |
-|---|---|
-| Package index (PEP 503) | <https://poulavbhowmick03.github.io/Erebus/simple/> |
-| Latest release | [releases/latest](https://github.com/PoulavBhowmick03/Erebus/releases/latest) |
-| `erebus-cli`, Linux x86-64 | [erebus-cli-x86_64-unknown-linux-gnu](https://github.com/PoulavBhowmick03/Erebus/releases/latest/download/erebus-cli-x86_64-unknown-linux-gnu) |
-| `erebus-cli`, macOS arm64 | [erebus-cli-aarch64-apple-darwin](https://github.com/PoulavBhowmick03/Erebus/releases/latest/download/erebus-cli-aarch64-apple-darwin) |
-| Checksums | [SHA256SUMS](https://github.com/PoulavBhowmick03/Erebus/releases/latest/download/SHA256SUMS) |
-| SBOM (CycloneDX) | [sbom.json](https://github.com/PoulavBhowmick03/Erebus/releases/latest/download/sbom.json) |
+Erebus hides the terms, not the relationship. Negotiation content and shielded amounts stay
+private. That two parties opened a channel is public, and so are the gas sender, timing,
+deposits and withdrawals. Public-bound and x402 payments on Monad expose the accepted terms and
+the parties. Disclosure proves what was agreed and paid, never that anything was delivered.
+The full boundary is in [docs/privacy-model.md](./docs/privacy-model.md) (Starknet) and
+[docs/metropolis-threat-model.md](./docs/metropolis-threat-model.md) (Monad).
 
-### The thirteen tools
+## What you can build
 
-Protocol 5. Every write takes an `operation_id` — `op_` plus 64 lowercase hex characters —
-so a retry after a crash is the same operation rather than a second one.
+Find a seller, buy a service, pay per API call, prepay for metered calls, and show an audited
+receipt. Each one runs on the participants' own servers:
+[agents/README.md](./agents/README.md) and [erebusagents.live/use-cases](https://erebusagents.live/use-cases/).
 
-| Tool | Writes? | What it does |
-|---|---|---|
-| `open_channel` | yes | Establish a channel with a counterparty. Their address lands in **public** calldata |
-| `propose_offer` | yes | Write a new offer: amount, token, deadline, `memo_hash` |
-| `counter_offer` | yes | Counter a specific `reply_to` offer from the other party |
-| `accept_and_settle` | yes | **Payer only.** Accept and privately settle in one atomic action set |
-| `grant_viewing_key` | yes | Encrypt one deal to a registered recipient, written `0600` |
-| `resume_operation` | yes | The only recovery tool that can submit. Reuses the original ID |
-| `read_channel_state` | no | Every offer in the channel, plus the settlement if any |
-| `get_note_balance` | no | This identity's spendable denominations and total |
-| `wait_for_offers` | no | Block until the channel holds `expected_count` offers |
-| `reveal` | no | Open a recipient-bound grant and reconstruct only that deal |
-| `doctor` | no | Pre-flight every check; each failure names one repair |
-| `reconcile` | no | Classify every journal entry against the chain |
-| `rebuild_state` | no | Re-derive missing channel records from keys and chain data |
-
-`accept_and_settle` always spends the **caller's** notes, which is why the role is a
-launch-time decision and not a prompt: a `payee` server refuses the call outright.
-
-
-Two agents open an **Eleusis**, an encrypted channel carried in privacy-pool note salts,
-exchange structured offers over it, and settle atomically through the shielded pool.
-Historical wire-v2 channels can export a whole-channel viewing key. Wire v3 replaces that
-with a grant scoped to one deal and one named recipient.
-
----
-
-## Status
-
-**Unaudited and experimental.** The full loop — two agents negotiating, settling atomically,
-and disclosing to a third party — runs on Starknet Sepolia at wire v3. Two bounded mainnet
-canaries each completed a Starkscan-screened 1 STRK shield, MCP negotiation, atomic
-settlement, reconciliation, observer test, and scoped disclosure. They exercised 0.8/0.2 and
-0.6/0.4 payment/change splits. See the [first mainnet run](./docs/runs/2026-08-31-mainnet-starkscan-workflow.md)
-and [second mainnet run](./docs/runs/2026-08-31-mainnet-060-040-canary.md).
-It has had no external security review. Do not put value you care about through it.
-
-**Erebus hides the terms, not the relationship.** Negotiation content and settlement amounts
-are confidential, and that is demonstrated rather than asserted: an observer with no key
-recovers nothing from a settlement. New source-built channels default to wire v3, which
-removes v2's fixed salt-shape classifier: against live wire-v3 transactions that
-classifier scores 0.5000 balanced accuracy, which is chance. That a channel was opened, and
-with whom, is still public.
-[privacy-model.md](./docs/privacy-model.md) is the full boundary and the only
-source to quote for privacy claims.
-
-`v0.3.0` is released and installable. It speaks Protocol 5, adding installed account
-onboarding (`erebus-init`) on top of Protocol 4's unchanged `operation_id` mechanics, and
-exposes the same thirteen MCP tools. The older `v0.2.0` release speaks Protocol 4; `v0.1.0`
-speaks Protocol 2 and exposes ten MCP tools.
-[docs/status.md](./docs/status.md) is the current state in one page, and the tiebreaker when
-any two documents here disagree.
-
-## The problem
-
-Agent-to-agent commerce is arriving on rails that are transparent by default.
-
-- **A2A** (Linux Foundation) moves tasks between agents over HTTPS. TLS protects the payload; it does not hide the communication graph.
-- **MCP** (Linux Foundation) exposes tools to agents. No payment, no privacy.
-- **x402 / AP2 / MPP** settle payments. All transparent on-chain or through card rails.
-
-All three leave the relationship itself in the open: who is dealing with whom, how often, at what size.
-
-An observer who can see the A2A or MCP communication graph learns a lot from metadata alone. Message timing, message sizes and the identity of the endpoints are enough to classify what kind of workflow is running and to act on a pending transaction before it lands. Encrypting the payload does not close that, because the leak is in the graph rather than in the message.
-
-Procurement teams and trading desks both treat counterparty cadence as confidential, and for the same reason. As agents start transacting autonomously without a human approving each step, a transparent-by-default rail stops being an inconvenience and starts being the blocker.
-
-## What Erebus does
-
-Erebus is **infrastructure, not a platform.** There is no dashboard. Agents are the users. They consume it as tools and SDK calls, the same way they consume any MCP server or A2A skill.
-
-It provides four things existing rails do not:
-
-| Property | What it means |
-|---|---|
-| **Message privacy: live. Relationship privacy: partial** | Wire v3 encrypts authenticated deal records under AES-256-GCM-SIV. Measured against live Sepolia transactions, it removes wire v2's fixed fifth-salt classifier. Opening a channel still writes the counterparty address to public calldata ([F38](./docs/friction.md)). See [privacy-model.md](./docs/privacy-model.md). |
-| **Atomic negotiate to settle** | The accepted offer and the shielded payment are one proven state transition. There is no "agreed but never paid" gap and no separate payment hop. |
-| **Selective disclosure** | Wire v3 encrypts one deal's directional subkeys and exact note capabilities to a registered recipient, with an explicit expiry. It exports no parent channel key and grants no spending authority. Historical wire-v1/v2 grants remain broader bearer secrets. |
-| **Agent autonomy** | Starknet account abstraction means an agent is a first-class actor rather than a bolted-on EOA. Gasless operation via a paymaster is possible but not yet verified end-to-end: STRK20 ships no paymaster of its own, so this rides on a third party. |
-
-## Why Starknet, why STRK20
-
-- **Native in-protocol proof verification** (v0.14.2 / SNIP-36) is what made a note-based privacy pool viable here at all.
-- **STRK20 is a shared note-based pool, not a mixer.** Shielded assets become encrypted notes; a private transfer spends notes and creates new ones, with a ZK proof that the notes exist, belong to the spender, are unspent, and conserve value.
-- **The channel primitive already exists and is audited.** A directional `channel_key` is
-  derived from the sender's pool key and both addresses/public identity data, then encrypted
-  to the recipient through the pool's channel-info flow. Encrypting Erebus's salt payload is
-  still our own wire-design responsibility.
-- **Compliance is native.** Viewing keys are registered encrypted on-chain under a threshold auditor system, the path Tornado Cash never had.
-- **Account abstraction is native.** An agent can hold and use an account without a human signing each transaction.
-
-## Architecture
-
-See [ARCHITECTURE.md](./ARCHITECTURE.md) for full diagrams, the interface contract, and the data model.
-
-![Erebus system overview, the stack from agent to pool, the three layers, a deal end to
-end, how an offer becomes five notes, the note frames, who sees what, and what the system does
-and does not claim](./docs/assets/erebus-overview.excalidraw.svg)
-
-*One-page map of the whole system. Open the image full size to read the panels, or
-[open it in Excalidraw](https://excalidraw.com/#json=Tgsd4uNGRqrH3wp-E1sfu,AZOvD7vZCyhVtwX6fmibRQ)
-to pan and zoom.*
+## Repository
 
 ```
-Agent A ─┐
-         ├─ MCP / A2A tools ─→ Erebus SDK ─→ Channel Layer (Eleusis) ─→ STRK20 Privacy Pool
-Agent B ─┘                                          │                          │
-                                                    └──→ Discovery Service ←────┘
-                                                                 │
-                                                    Viewing Key Disclosure (Kleidouchos)
+sdk/rs           Starknet Rust client; holds all key material
+sdk/py           Thin Python binding over the Rust commands, no protocol logic
+sdk/core         Chain-neutral agreement encoding and spending policy
+sdk/shielded     Monad shielded payments, wallet, access, relayer and native commands
+sdk/evm          Monad public-bound settlement and disclosure
+contracts/evm    Monad pool contracts;  circuits/  the Circom proving circuits
+mcp-server       MCP server exposing Erebus tools to any agent framework
+agents           Reference agents and use cases
+web              erebusagents.live
+docs             Guides, run records, privacy model and the friction log
 ```
 
----
-
-## Install
-
-> **Release boundary:** The command below installs the latest public Erebus packages
-> (`v0.3.0`, Protocol 5). Use `v0.2.0` or newer when you need Protocol 4 operation IDs,
-> reconciliation, resume, or state rebuild — all unchanged in `v0.3.0`.
-
-**Requirements.** Linux x86-64 or macOS arm64, Python 3.11+. Intel macOS is not built — its
-CI runner is no longer available, and a cross-build would ship a binary that was never
-executed on its own architecture.
-
-Releases live on GitHub with a static [PEP 503 index](https://poulavbhowmick03.github.io/Erebus/simple/)
-on GitHub Pages. GitHub has no Python registry, so the index is what makes the wheels
-resolvable rather than merely downloadable.
-
-```bash
-uv tool install --python 3.12 \
-  --extra-index-url https://poulavbhowmick03.github.io/Erebus/simple \
-  erebus-mcp-server
-```
-
-`uv tool install` does not download a managed Python to satisfy `requires-python` — on a
-machine whose only discoverable interpreter doesn't meet it (e.g. macOS system Python 3.9),
-the install fails with an unrelated-looking resolver error rather than fetching one. Passing
-`--python 3.12` makes `uv` fetch a managed interpreter and always succeeds ([F43](./docs/friction.md)).
-
-`--extra-index-url` rather than `--index-url`: PyPI still serves `mcp` and its dependencies,
-and only the three `erebus-*` packages come from this index.
-
-That pulls in three packages — `erebus-mcp-server` (the tool layer), `erebus-sdk` (the
-Python binding), and `erebus-cli` (the Rust binary, shipped as a platform wheel). No Rust
-toolchain is needed.
-
-<details>
-<summary>Installing into a virtualenv instead</summary>
-
-```bash
-uv venv && uv pip install \
-  --extra-index-url https://poulavbhowmick03.github.io/Erebus/simple \
-  erebus-mcp-server
-```
-
-This puts both `erebus-mcp-server` and `erebus-cli` on the environment's `PATH`.
-`uv tool install` exposes only `erebus-mcp-server`; the server locates the binary inside
-its own environment either way.
-</details>
-
-<details>
-<summary>Driving the binary from another language</summary>
-
-`erebus-cli` speaks one JSON request on stdin and one envelope on stdout, so anything that
-can spawn a process can drive it. Take it from the release directly rather than installing
-a Python package to extract it:
-
-```bash
-curl -LO https://github.com/PoulavBhowmick03/Erebus/releases/latest/download/erebus-cli-x86_64-unknown-linux-gnu
-chmod +x erebus-cli-x86_64-unknown-linux-gnu
-echo '{"method":"version"}' | ./erebus-cli-x86_64-unknown-linux-gnu
-```
-
-See [the CLI protocol](./docs/reference.md#the-cli-protocol).
-</details>
-
-Every release carries `SHA256SUMS` and a CycloneDX `sbom.json`. Verify before running:
-
-```bash
-curl -LO https://github.com/PoulavBhowmick03/Erebus/releases/latest/download/SHA256SUMS
-sha256sum -c SHA256SUMS --ignore-missing
-```
-
-> If a download times out, the release assets are served by a CDN that can be slow from
-> some networks. `UV_HTTP_TIMEOUT=600` raises uv's default 30-second limit.
-
-### Add it to your MCP client
-
-The installed entry point is `erebus-mcp-server`, on `PATH` after `uv tool install`. It is
-configured entirely through environment, so every client that can set environment can run
-it. `erebus-mcp-server config-schema` prints the machine-readable field contract.
-
-**Claude Code:**
-
-```bash
-claude mcp add erebus-buyer \
-  --env EREBUS_BACKEND=seam --env EREBUS_NETWORK=sepolia \
-  --env EREBUS_SETTLEMENT_ROLE=payer \
-  --env AGENT_ADDRESS=0x... \
-  --env STARKNET_RPC_URL=https://... --env PROVING_SERVICE_URL=https://... \
-  --env TOKEN_ADDRESS=0x... \
-  --env POOL_KEY_FILE=~/.erebus-a/agent.pool.key \
-  --env ACCOUNT_KEY_FILE=~/.erebus-a/agent.account.key \
-  --env EREBUS_STATE_DIR=~/.erebus-a/state \
-  -- erebus-mcp-server
-```
-
-**Claude Desktop, Cursor, and any client reading `mcpServers` JSON:**
-
-```json
-{
-  "mcpServers": {
-    "erebus-buyer": {
-      "command": "erebus-mcp-server",
-      "env": {
-        "EREBUS_BACKEND": "seam",
-        "EREBUS_NETWORK": "sepolia",
-        "EREBUS_SETTLEMENT_ROLE": "payer",
-        "AGENT_ADDRESS": "0x...",
-        "STARKNET_RPC_URL": "https://...",
-        "PROVING_SERVICE_URL": "https://...",
-        "TOKEN_ADDRESS": "0x...",
-        "POOL_KEY_FILE": "/home/you/.erebus-a/agent.pool.key",
-        "ACCOUNT_KEY_FILE": "/home/you/.erebus-a/agent.account.key",
-        "EREBUS_STATE_DIR": "/home/you/.erebus-a/state"
-      }
-    }
-  }
-}
-```
-
-Prefer not to put this in a client config at all? `erebus-init` writes a mode-`0600` env
-file once, and then the whole entry collapses to
-`erebus-mcp-server --config ~/.config/erebus/mcp.env`.
-
-**Two agents means two servers.** Negotiation has two sides, so register the counterparty
-as a second entry with its own identity, its own state directory, and
-`EREBUS_SETTLEMENT_ROLE=payee`. Nothing is shared between them — that is the point.
-
-| Variable | Required | Notes |
-|---|---|---|
-| `AGENT_ADDRESS` | always | This identity's Starknet account |
-| `PROVING_SERVICE_URL` | always | Unused in `mock`, but must be set |
-| `EREBUS_SETTLEMENT_ROLE` | always | `payer`, `payee`, or `both` |
-| `EREBUS_BACKEND` | — | `seam` (default) or `mock` |
-| `EREBUS_NETWORK` | `seam` | `sepolia` or `mainnet`; supplies chain ID and pool |
-| `STARKNET_RPC_URL` | `seam` | Sees the pool key. Operator-chosen |
-| `TOKEN_ADDRESS` | `seam` | Settlement token |
-| `POOL_KEY_FILE` | `seam` | Path only; contents never cross the seam |
-| `ACCOUNT_KEY_FILE` | `seam` | Path only |
-| `EREBUS_STATE_DIR` | `seam` | Locked, mode-`0600` Rust state |
-| `STARKSCAN_API_KEY` | mainnet prover | Only for the hosted Starkscan prover |
-
-The prover and RPC both receive the pool private key as calldata, so choosing them is a
-custody decision, not a config detail — [custody-design.md](./docs/custody-design.md).
-Running from a source checkout instead? `scripts/erebus-mcp.sh <env-file> <role>` wraps all
-of the above; see [mcp-server/README.md](./mcp-server/README.md).
-
-### Next: an identity
-
-Installing gets you the binary and the server. Running against a chain also needs a Starknet
-account, two key files, a pool allowance, and shielded notes. One script does all of it:
-
-```bash
-scripts/new-identity.sh bootstrap erebus-a ~/.erebus-a <funder-account>
-```
-
-It ends by running `erebus-cli doctor` and exits non-zero if anything is unready. The
-faucet flow, the three keys and who sees them, and every environment variable are in the
-[reference](./docs/reference.md#set-up-an-identity).
-
-To try the tools without a chain, keys, or gas, set `EREBUS_BACKEND=mock` and skip all of
-that.
-
-For a real chain, set `EREBUS_NETWORK=sepolia` or `EREBUS_NETWORK=mainnet`. The selector
-supplies the canonical chain ID and pool, rejects conflicting overrides, and appears as the
-friendly `network` label in every MCP result. RPC, prover, token, and identity values remain
-operator-supplied; start from [`config/sepolia.env.example`](./config/sepolia.env.example) or
-[`config/mainnet.env.example`](./config/mainnet.env.example).
-
-An installed server has a first-run command. It asks for paths, never key contents, and
-writes a mode-`0600` configuration:
-
-```bash
-erebus-init
-erebus-mcp-server --config ~/.config/erebus/mcp.env
-```
-
-Running `erebus-mcp-server` directly in a terminal triggers the same setup when no config or
-launch environment exists. An MCP marketplace must configure the process before stdio starts;
-`erebus-mcp-server config-schema` prints the platform-neutral field contract. SDK callers can
-use `SeamConfig.for_network("sepolia", ...)` or `SeamConfig.for_network("mainnet", ...)`.
-
-## Current-source quickstart: Protocol 4
-
-Build and install the current checkout before you use this example. The public `v0.1.0`
-wheel does not support these operation-ID and recovery calls.
-
-Two servers, one per identity, one configured `payer` and one `payee`. The payer spends its
-own notes; the payee never calls `accept_and_settle`. `base_env` below is the identity's env
-file — the one `new-identity.sh` writes — loaded into the environment.
-
-```python
-import secrets
-
-from mcp import ClientSession
-from mcp.client.stdio import StdioServerParameters, stdio_client
-
-params = StdioServerParameters(command="erebus-mcp-server", args=[], env={
-    **base_env, "EREBUS_BACKEND": "seam", "EREBUS_NETWORK": "sepolia",
-    "EREBUS_SETTLEMENT_ROLE": "payer",
-})
-
-async with stdio_client(params) as (read, write):
-    async with ClientSession(read, write) as payer:
-        await payer.initialize()
-
-        # 1. Health first. Every write costs a proof; find faults before paying for one.
-        await payer.call_tool("doctor", {})
-
-        # 2. Know what you can pay. Any 0 < amount <= total is payable —
-        #    settlement returns the excess as a change note.
-        await payer.call_tool("get_note_balance", {})
-
-        # 3. Open the channel. NOT private: this writes the counterparty's
-        #    address to public calldata (F38).
-        # Persist each ID with its canonical intent before the call. Reuse the same ID
-        # after a restart. This abbreviated example only shows ID generation.
-        open_id = "op_" + secrets.token_hex(32)
-        opened = await payer.call_tool(
-            "open_channel", {"operation_id": open_id, "counterparty": seller_address})
-        handle = opened.structured_content["result"]["channel_handle"]
-
-        # 4. Wait for the seller's ask. One tool call, not a poll loop.
-        waited = await payer.call_tool("wait_for_offers",
-                                       {"channel_handle": handle, "expected_count": 1})
-        offer = waited.structured_content["result"]["offers"][0]
-
-        # 5. Settle atomically: the accepted offer and the shielded payment
-        #    are one proven state transition. Takes 1-4 minutes; do not abort it.
-        receipt = await payer.call_tool(
-            "accept_and_settle",
-            {"operation_id": "op_" + secrets.token_hex(32),
-             "channel_handle": handle, "offer_id": offer["offer_id"]})
-
-        # Optional operator step: export this deal to a registered auditor. The MCP tool
-        # writes the encrypted capsule to a new mode-0600 file and returns only its path.
-        await payer.call_tool(
-            "grant_viewing_key",
-            {"operation_id": "op_" + secrets.token_hex(32),
-             "channel_handle": handle, "deal_id": offer["deal_id"],
-             "grantee": auditor_address, "expires_at": grant_expiry,
-             "output_path": "/secure/path/deal.grant.json"})
-```
-
-A runnable two-sided version is in
-[`agents/src/erebus_agents/mcp_loop.py`](./agents/src/erebus_agents/mcp_loop.py); the
-deterministic mock rehearsal is `uv run python agents/src/erebus_agents/demo.py`.
-
-For driving the same loop from a mainstream agent framework instead of `erebus_agents`, see
-[`agents/examples/openai-agents-quickstart/`](./agents/examples/openai-agents-quickstart/):
-two GPT-backed agents negotiating and settling entirely through the OpenAI Agents SDK's own
-MCP tool-calling loop, installed from published wheels rather than this checkout.
-
-Worked examples against mainnet and Sepolia, with real transaction hashes, timings, and
-failure and recovery evidence, are in [docs/runs/](./docs/runs/). The mainnet evidence
-records are:
-
-- [First mainnet run](./docs/runs/2026-08-31-mainnet-starkscan-workflow.md)
-- [Second mainnet run](./docs/runs/2026-08-31-mainnet-060-040-canary.md)
-- [Machine-readable gate](./docs/runs/v0.2-mainnet-canary.json)
-
-Configuration, the full tool surface, error handling, and the raw CLI protocol are in the
-[reference](./docs/reference.md).
-
-## Documentation
-
-| | |
-|---|---|
-| [Reference](./docs/reference.md) | Identity setup, configuration, the thirteen MCP tools, recovery, and CLI protocol 4 |
-| [Two-agent setup](./docs/setup.md) | Install to negotiated settlement with `erebus-init`, for 0.3.0 / Protocol 5 |
-| [Runbook](./docs/runbook.md) | The older Protocol 4 / manual-identity path; superseded by Two-agent setup on current `main` |
-| [Architecture](./ARCHITECTURE.md) | Component boundaries, the interface contract, the data model |
-| [Privacy model](./docs/privacy-model.md) | What leaks and what does not. The only source for privacy claims |
-| [Status](./docs/status.md) | Current state in one page; the tiebreaker between documents |
-| [Roadmap](./docs/roadmap.md) | Post-v0.2.0 direction, and what STRK20 now provides natively |
-| [First product](./docs/product.md) | Agent-to-agent paid work: the four gaps, sequence, and open decisions |
-| [Friction log](./docs/friction.md) | Where the stack fought us, and how we worked around it |
-| [Agent skill](./skills/erebus/) | Operating Erebus from an agent, with unsafe-behavior evals |
-| [Evidence](./docs/status.md) | Every mainnet transaction, and the observer check against one |
-| [Run evidence](./docs/runs/) | Real mainnet and Sepolia runs with transaction hashes and timings |
-
-## Repo layout
-
-```
-/sdk/rs         Rust client: primary implementation, holds all key material
-/sdk/ts         TypeScript: differential-test oracle only, ships nothing
-/sdk/py         Thin binding over /sdk/rs: no protocol logic
-/contracts      Cairo: conformance probes against the upstream pool
-/mcp-server     MCP server (Python) exposing Erebus tools to any agent framework
-/agents         Reference agents demonstrating the loop (Python)
-/skills         Agent skill for operating Erebus, with unsafe-behavior evals
-/packaging      Platform wheel that ships the erebus-cli binary
-/web            Public site (Next.js, static export): what is served at the demo URL
-/demo           The archived sprint evidence page, kept for its CI copy contract
-/docs           Specs, protocol notes, integration guides, friction log
-```
-
-The call path is `agents → mcp-server → sdk/py → sdk/rs → Starknet`. **Python above the
-binding, Rust below it.** Key material never crosses upward, which makes that boundary an
-enforced one rather than a convention.
-
-**On the Rust client.** Upstream ships a TypeScript SDK and a Rust `discovery-core` crate.
-`discovery-core` covers reads, hashes, storage slots, ECDH, decryption. There is no Rust
-write side: nothing builds `ClientAction`s, serialises calldata, signs, or calls the
-prover. Erebus's Rust client fills that gap and is useful outside this project. The
-TypeScript implementation is kept as the oracle it is differential-tested against. There is
-no written spec for the wire format, so two agreeing implementations is the strongest
-correctness signal on offer.
-
-**On Python above it.** The official `mcp` SDK is first-class, so the tool layer has no
-reason to be TypeScript. `/sdk/py` exists only to reach Rust from Python; it is
-not a third client, because a third implementation is a third place for a
-wrong hash preimage to hide silently.
-
-## Brand vocabulary
-
-Used in docs, marketing, and conversation. **Not** in the API surface, see [CLAUDE.md](./CLAUDE.md) for the naming policy.
-
-| Term | Meaning |
-|---|---|
-| **Erebus** | The protocol as a whole |
-| **Eleusis** | The private channel between two agents; opening one still exposes the counterparty's address on-chain (F38) |
-| **Kleidouchos** | A holder of a viewing key (auditor, operator, counterparty) |
-| Enter Erebus | Start using the protocol |
-| Open an Eleusis | Create a private agent channel |
-| Settle in Erebus | Execute the private payment |
-| Reveal as Kleidouchos | Use selective disclosure |
+Design: [ARCHITECTURE.md](./ARCHITECTURE.md) (Starknet) and
+[docs/metropolis-architecture.md](./docs/metropolis-architecture.md) (Monad). Where the stack
+fought us: [docs/friction.md](./docs/friction.md).
+
+## How this was built
+
+Claude, Codex and OpenCode helped with implementation, tests, documentation and review. Every
+change still needs human review, and none of that makes it audited.
+
+The Monad work builds on Circom, circomlib, circomlibjs and snarkjs for circuits and proving,
+arkworks and ark-circom for Rust proving, and ethers and solc for EVM tooling. The Starknet
+backend composes `starkware-libs/starknet-privacy`. Versions are pinned in each package's
+manifest and lockfile.
 
 ## Team
 
-- **Poulav Bhowmick**, protocol, Cairo, Starknet. StarkWare track winner at ETHIndia 2024; Starknet Foundation grantee; Ethereum Protocol Fellow.
-- **Ishita**, agents, orchestration, ML. Multi-agent systems, x402 and ERC-8004 agent-payment infrastructure.
+- **Poulav Bhowmick**: protocol, Cairo, Starknet and Monad. StarkWare track winner at ETHIndia 2024, Starknet Foundation grantee, Ethereum Protocol Fellow.
+- **Ishita**: agents, orchestration, ML. Multi-agent systems, x402 and ERC-8004 agent-payment infrastructure.
 
 ## License
 
-Apache-2.0. See [LICENSE](./LICENSE). Matches `starkware-libs/starknet-privacy`, whose
-primitives this composes.
+Apache-2.0. See [LICENSE](./LICENSE).

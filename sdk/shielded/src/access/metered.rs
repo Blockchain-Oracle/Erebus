@@ -1,6 +1,6 @@
 //! Prepaid metered access: profile, per-call request digest, and request authentication.
 //!
-//! Candidate profile, specified in `docs/metropolis-agreement.md`. One finalized settlement buys N calls to one
+//! Candidate profile, pinned by `tests/fixtures/metered-v1-vectors.json`. One finalized settlement buys N calls to one
 //! seller-configured resource. This module holds only pure types and derivations; it keeps no
 //! ledger, observes no chain, and serves no HTTP. A signed metered request authorizes consuming
 //! at most one prepaid unit. It is not a payment, snapshot access, or disclosure authorization.

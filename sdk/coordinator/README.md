@@ -116,5 +116,4 @@ The public-bound integration and funded shielded example now cover backend nonce
 replacement validation, paired chain reconciliation, note reservations, change recovery, and
 durable-boundary crash matrices. These are separate local integration checks, not evidence
 from the synthetic tests in this crate. The relayer uses its own durable coordinator records.
-Installed operator workflows and Monad testnet verification remain M8 gates. See
-[M6 progress](../../docs/metropolis-status.md) for commands, evidence, and limitations.
+Installed operator workflows and Monad testnet verification remain M8 gates.

@@ -38,7 +38,7 @@ a hash function, a salt encoder, or anything that could disagree with `sdk/rs`, 
 Hold key material. The library runs inside the agent operator's own process against the
 operator's own prover, because the proving call carries the pool private key in the clear.
 The server takes a prover URL and an identity from config and should fail loudly if they are
-absent rather than falling back to a shared endpoint. See `docs/custody-design.md`.
+absent rather than falling back to a shared endpoint.
 
 ## Running against the real Rust client
 
@@ -173,7 +173,7 @@ not to share it. Self-hosting is Pathfinder plus `transaction-prover`.
 So the honest statement is that Erebus is software an operator runs, not a service anyone
 can point at. Publishing the SDK shortens the install; it does not remove the prover
 requirement, and no amount of packaging will, because the requirement is the custody
-property rather than a missing feature. See `docs/custody-design.md`.
+property rather than a missing feature.
 
 ## Self-provisioning identities
 

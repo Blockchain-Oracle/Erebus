@@ -82,7 +82,7 @@ diffed field by field instead of byte by byte.
 
 **What we were trying to do.** Implement M2 offchain Eleusis and bind the negotiation transcript
 to the agreement, which already has a committed `transcript_root` field
-([agreement](metropolis-agreement.md) field 6, `sdk/core/src/terms.rs`).
+(agreement field 6 in `sdk/core/src/terms.rs`).
 
 **What the stack did instead.** Nothing. The field exists and is committed, but neither the spec
 nor the core says who populates it, when all-zero is valid, or whether any rule checks it. The
@@ -91,7 +91,7 @@ that carried a random one, would both encode and commit without complaint. There
 vector for a populated root, because the value did not exist at M1.
 
 **Worked around it?** Yes. M2 defines the derivation and the validity rule in
-[status decisions appendix](metropolis-status.md#decisions-appendix) DM2-4 (`Hash_suite("EREBUS_TRANSCRIPT_ROOT_V1" ||
+decision DM2-4 (`Hash_suite("EREBUS_TRANSCRIPT_ROOT_V1" ||
 deal_id || head_buyer || head_seller)`, all-zero only when the deal has no messages), so existing
 zero vectors remain valid and no `protocol_version` bump is needed. The transport enforces the
 rule; the agreement crate still treats the field as opaque.
@@ -961,7 +961,7 @@ action enums, which nothing invites you to do.
 
 **Consequence:** "the agent brings its own wallet and Erebus holds no keys" is not
 achievable through the wallet API as it stands, independently of the headless-agent problem.
-Options in [custody-design.md](./custody-design.md).
+The options are summarised in `sdk/rs/src/signer.rs`.
 
 **What would have made it easier.** One line in the wallet-API overview saying which
 `ClientAction`s it does not cover, and why.

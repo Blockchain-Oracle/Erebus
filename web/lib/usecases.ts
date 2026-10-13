@@ -7,7 +7,7 @@
  *   mcp-server/src/erebus_mcp/metropolis.py .......... the participant's MCP tools and their rules
  *   mcp-server/src/erebus_mcp/access.py .............. retrieval and metered access
  *   sdk/shielded/src/bin/erebus_negotiate.rs ......... operator-fixed price, asset and peer
- *   docs/metropolis-leakage-review.md ................ what each surface makes visible
+ *   docs/metropolis-threat-model.md .................. what each surface makes visible
  *
  * These use cases live on the `metropolis` branch, so their source links point there, not at
  * `main` like the rest of the site.
@@ -72,7 +72,7 @@ export const LOOP: LoopStep[] = [
   },
 ];
 
-/* ── Visibility · docs/metropolis-leakage-review.md "Visibility By Surface",
+/* ── Visibility · docs/metropolis-threat-model.md,
    mcp-server/src/erebus_mcp/metropolis.py server instructions ─────────────── */
 
 export const VISIBILITY = {

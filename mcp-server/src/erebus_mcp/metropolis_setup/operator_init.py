@@ -219,7 +219,7 @@ def command(bins: Path, name: str, request: dict, cwd: Path) -> dict:
     except ValueError:
         reply = {}
     if result.returncode != 0 or reply.get("status") != "ok":
-        # Fixed text only: the native reply's own fields are never echoed (see docs/metropolis-leakage-review.md).
+        # Fixed text only: the native reply's own fields are never echoed.
         status = reply.get("status") if reply.get("status") in NATIVE_STATUSES else "unreadable"
         raise ValueError(f"{name} {request.get('method')} refused (exit {result.returncode}, status {status}); "
                          f"run the installed {name} directly to see its error")

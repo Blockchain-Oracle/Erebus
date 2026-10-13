@@ -35,5 +35,3 @@ The local setup entropy and deterministic test secrets make these artifacts unsu
 real value. Never deploy this verifier or use this `.zkey` with funds. Regenerating after a
 circuit change creates a new verifier and invalidates previous proofs.
 
-See [M4 decisions](../../docs/metropolis-status.md) for the statement and
-[M4 baseline](../../docs/metropolis-status.md) for measured evidence.

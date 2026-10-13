@@ -1216,8 +1216,7 @@ Remaining dependencies for a user who has only the installed shielded candidate 
   before broadcast and needs a replacement agreement; earlier public-bound example transactions
   predate the package channel. The x402 `exact` rail has one team-operated live Monad
   payment (`0x8a0272e6…5df43`) with seller restart, resource recovery, and independent auditor
-  verification; see the [status](metropolis-status.md) and
-  [status](metropolis-status.md).
+  verification.
 - The external rehearsal on Monad with only these packages and public documentation has not
   been run. A team-operated installed-package rehearsal passed locally on macOS arm64, and the
   team-operated live x402 run used these published commands; neither is independent acceptance.

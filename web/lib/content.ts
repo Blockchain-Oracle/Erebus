@@ -1,14 +1,12 @@
 /**
  * Every value here is sourced from a document in this repository. Nothing is invented.
  *
- *   docs/status.md ................... the tiebreaker for current state
  *   docs/privacy-model.md ............ the only source for privacy claims
  *   docs/metropolis-threat-model.md ............. the measured observer metrics
  *   docs/runs/2026-08-31-mainnet-060-040-canary.md
  *   docs/runs/v0.2-mainnet-canary.json
  *   agents/src/erebus_agents/demo.py . the replay
  *   README.md ........................ install and the MCP tool surface
- *   docs/metropolis-status.md ........ (metropolis branch) Monad release, qualification, live evidence
  *   docs/metropolis-install.md ....... (metropolis branch) the published Monad install
  *   scripts/metropolis-demo-readonly.py  Monad pool addresses, runtime pins, the WMON payment, limits
  */
@@ -42,7 +40,7 @@ uv pip install --python erebus-metropolis/bin/python \\
   --default-index https://pypi.org/simple --index-strategy first-index \\
   "erebus-mcp-server==0.3.0.dev2026101307"`;
 
-/* ── Two settlement backends · README.md, docs/metropolis-status.md ──────── */
+/* ── Two settlement backends · README.md ──────────────────────────────────── */
 
 export type Backend = {
   chain: string;
@@ -92,8 +90,7 @@ export const BACKENDS: Backend[] = [
   },
 ];
 
-/* ── Monad testnet evidence · scripts/metropolis-demo-readonly.py,
-   docs/metropolis-status.md ───────────────────────────────────────────────── */
+/* ── Monad testnet evidence · scripts/metropolis-demo-readonly.py ───────────────────────────────────────────────── */
 
 export const MONAD_EVIDENCE = [
   {
@@ -220,7 +217,7 @@ export const OBSERVER = [
   },
 ] as const;
 
-/* ── What this does not do · docs/status.md ─────────────────────────────── */
+/* ── What this does not do · README.md ─────────────────────────────── */
 
 export type NonClaim = { title: string; body: string };
 
@@ -301,7 +298,7 @@ export const ENV_VARS = [
 
 export const CALL_PATH = ["agents", "mcp-server", "sdk/py", "sdk/rs", "Starknet"] as const;
 
-/* ── Concepts · docs/reference.md, docs/privacy-model.md ─────────────────── */
+/* ── Concepts · docs/privacy-model.md ─────────────────── */
 
 export const CONCEPTS = [
   {
@@ -330,7 +327,7 @@ export const CONCEPTS = [
   },
 ] as const;
 
-/* ── The tool surface, in full · docs/reference.md §The MCP tool surface ─── */
+/* ── The tool surface, in full · mcp-server/README.md §The MCP tool surface ─── */
 
 export const TOOL_DETAILS: Record<string, { signature: string; note: string }> = {
   open_channel: { signature: "(operation_id, counterparty)", note: "Returns channel_handle." },
@@ -372,7 +369,7 @@ export const TOOL_DETAILS: Record<string, { signature: string; note: string }> =
   doctor: { signature: "()", note: "Read-only. Always safe to call." },
 };
 
-/* ── Responses and errors · docs/reference.md §Errors and retries ────────── */
+/* ── Responses and errors · mcp-server/README.md §Errors and retries ────────── */
 
 export const RESPONSE_OK = `{"ok": true, "backend": "seam", "network": "sepolia", "result": {...}}`;
 export const RESPONSE_ERR = `{"ok": false, "backend": "seam", "network": "sepolia", "error": {"code": "...", "message": "...", "retryable": false}}`;
@@ -423,14 +420,14 @@ export const ERROR_GROUPS = [
   },
 ] as const;
 
-/* ── Version · docs/reference.md, docs/status.md ─────────────────────────── */
+/* ── Version · README.md, docs/onboarding.md ─────────────────────────── */
 
 export const VERSION_NOTE =
   "This page documents CLI Protocol 4, published as v0.2.0, exposing the thirteen tools listed above. The older v0.1.0 speaks Protocol 2 and exposes ten. erebus-sdk refuses a mismatched CLI by protocol number rather than failing later on a changed shape.";
 
 export const VERSION_BADGE = "Protocol 4 · v0.2.0";
 
-/* ── Set up an identity · docs/reference.md §Set up an identity ──────────── */
+/* ── Set up an identity · docs/onboarding.md §User flow ──────────── */
 
 export const IDENTITY_BOOTSTRAP = `scripts/new-identity.sh bootstrap erebus-a ~/.erebus-a <funder-account>`;
 
@@ -452,7 +449,7 @@ export const IDENTITY_KEYS = [
   },
 ] as const;
 
-/* ── The CLI protocol · docs/reference.md §The CLI protocol ──────────────── */
+/* ── The CLI protocol · sdk/rs/README.md §The CLI protocol ──────────────── */
 
 export const CLI_REQUEST = `echo '{"method":"doctor","params":{"config":{...}}}' | erebus-cli`;
 export const CLI_RESPONSE = `{"ok": true, "protocol": 4, "result": {"ready": true, "checks": [...]}}`;
@@ -460,7 +457,7 @@ export const CLI_RESPONSE = `{"ok": true, "protocol": 4, "result": {"ready": tru
 export const CLI_METHODS =
   "version, generate_pool_key, doctor, balance, allowance, approve, shield, open_channel, propose_offer, counter_offer, read_channel_state, accept_and_settle, reconcile, resume_operation, rebuild_state, grant_viewing_key, reveal";
 
-/* ── Building from source · docs/reference.md §Building from source ──────── */
+/* ── Building from source · sdk/rs/README.md §Building from source ──────── */
 
 export const BUILD_CLONE = `git clone https://github.com/PoulavBhowmick03/Erebus && cd Erebus`;
 
@@ -468,7 +465,7 @@ export const BUILD_RUST = `cd sdk/rs && cargo test --all-targets && cd ../.. # 3
 
 export const BUILD_PYTHON = `uv sync --all-packages && uv run pytest          # 154 tests`;
 
-/* ── How it works · sdk/rs/src/wire.rs module docs, docs/status.md ───────── */
+/* ── How it works · sdk/rs/src/wire.rs module docs ───────── */
 
 /** The 400-bit negotiation plaintext, most-significant-first. From wire.rs. */
 export const WIRE_FIELDS = [
@@ -579,7 +576,7 @@ export const INFRA_VISIBILITY = [
   { endpoint: "The submitted transaction", how: "apply_actions on chain", key: "Does not" },
 ] as const;
 
-/* ── Limits · docs/status.md, docs/production-gaps.md ────────────────────── */
+/* ── Limits · README.md, docs/privacy-model.md ────────────────────── */
 
 export const NOT_DOES = [
   {
@@ -835,6 +832,6 @@ export const SEARCH_INDEX = [
   {
     title: "Read the source of truth",
     href: "/docs/architecture#source",
-    snippet: "runbook.md, reference.md, ARCHITECTURE.md, status.md",
+    snippet: "runbook.md, setup.md, ARCHITECTURE.md, privacy-model.md",
   },
 ] as const;

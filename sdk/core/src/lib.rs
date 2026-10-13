@@ -7,8 +7,7 @@
 //! It deliberately depends on no chain library and on no proving system. Settlement adapters
 //! will translate between these types and a specific chain. The legacy STRK20 adapter does
 //! not accept canonical v1 agreements. Shared logic must not branch on a chain name or
-//! network; a chain namespace is opaque data. The byte
-//! encoding is specified in `docs/metropolis-agreement.md` and pinned by the known-answer
+//! network; a chain namespace is opaque data. The byte encoding is pinned by the known-answer
 //! vectors under `tests/fixtures`.
 //!
 //! Agreement consent signs the blinded commitment. Authorization verification requires its

@@ -13,8 +13,7 @@ and the agent never supplies or sees an amount.
 Delivery is an off-chain acknowledgement, never settlement evidence. The proof says nothing
 about whether a resource arrived, so a `DeliveryRecord` records what an operator observed and
 an auditor may read it, but `DELIVERED` is not proof of payment and payment is not proof of
-delivery. The two are kept in separate states on purpose (see `docs/usecases.md`, "One-off
-purchase of an off-chain service").
+delivery. The two are kept in separate states on purpose.
 """
 
 from __future__ import annotations

@@ -20,9 +20,7 @@ export function Footer() {
             <p className="label mb-4">Read</p>
             <ul className="m-0 list-none space-y-2 p-0">
               {[
-                ["status.md · Starknet", doc("docs/status.md")],
                 ["privacy-model.md", doc("docs/privacy-model.md")],
-                ["metropolis-status.md · Monad", docMonad("docs/metropolis-status.md")],
                 ["metropolis-threat-model.md", docMonad("docs/metropolis-threat-model.md")],
                 ["friction.md", doc("docs/friction.md")],
               ].map(([label, href]) => (
