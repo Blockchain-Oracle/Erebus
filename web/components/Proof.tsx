@@ -42,6 +42,7 @@ export function Proof() {
         >
           <source src="/erebus-final-cut.mp4" type="video/mp4" />
         </video>
+        <p className="mono-xs m-0 mt-3 text-fore-3">Public walkthrough of the complete mainnet workflow.</p>
       </Reveal>
 
       <div className="mt-10 overflow-x-auto">
