@@ -39,8 +39,8 @@ A frontend and paid hosting are not required for the self-hosted testnet loop.
 | M5D | Adversarial tests pass; final integrated rerun and independent audit remain open. |
 | M6-M7 | Recovery/disclosure pass local gates; live recipient-only shielded auditing now passes in a separate team process. |
 | M8S | WMON/USDC pools deployed; one WMON private payment finalized. Full installed live workflow remains open. |
-| M8O | Private prerelease `0.3.0.dev2026101202` published; native public-install checks passed. New installed init integration not yet released. |
-| M8E | Generated operator configs implemented; agent wallet tools, full installed onboarding and final ergonomics remain open. |
+| M8O | Testnet prerelease `0.3.0.dev2026101307` published; native qualification and fresh public installation passed on both platforms, including installed init and relayer. Live workflow remains open. |
+| M8E | Generated operator configs and agent wallet tools shipped in 1307; installed onboarding qualified natively. Cold-history and final live ergonomics remain open. |
 | M9 | Outside acceptance and operating video remain open. |
 
 ### Live Evidence
@@ -321,6 +321,11 @@ Completion gate: both approved assets complete reproducible installed live flows
 
 ### M8O. Operations and Developer Release
 
+Release update (2026-10-13): `0.3.0.dev2026101307` is published from clean commit `674e5a7`.
+[Native qualification](https://github.com/PoulavBhowmick03/Erebus/actions/runs/38431534413)
+and [fresh public installation](https://github.com/PoulavBhowmick03/Erebus/actions/runs/38443540443)
+passed on macOS arm64 and Linux x86_64. These are local-chain and installation gates, not live settlement.
+
 - [x] Publish public-bound/x402 dev5 and retain dev4 in the cumulative registry.
 - [x] Prepare private onboarding, allowance/funding diagnostics and self-hosting tools.
 - [x] Qualify r5 packages on macOS with both pool domains and local funded rehearsals.
@@ -333,11 +338,11 @@ Completion gate: both approved assets complete reproducible installed live flows
 - [ ] Verify release rollback/withdrawal, notices, platform limits and registry retention.
 - [x] Publish approved `0.3.0.dev2026101202` and verify native fresh public installation outside the checkout.
 - [ ] Deploy promised hosted services only with separate account/budget authorization.
-- [ ] Qualify and publish the installed `erebus-init --metropolis` integration; preserve plain Starknet init.
-- [ ] Include every new relayer/tool binary in the inventory, hashes, licenses and installed smoke tests.
+- [x] Qualify and publish the installed `erebus-init --metropolis` integration; preserve plain Starknet init (1307, native qualification above).
+- [x] Include every new relayer/tool binary in the inventory, hashes, licenses and installed smoke tests (1307, installed-relayer gate and public-install hash checks).
 - [ ] Test interrupted downloads, cache/disk failures, unsupported platforms and actionable recovery from the final release.
 - [ ] Supply one runnable buyer/seller/auditor example using public pins, not checkout fixtures.
-- [x] Remove the need to source deployment replay bytes from a private operator journal: add a pinned, paired read-only public exporter (14 offline tests; six real deployment transactions verified). Native workflow invocation remains open.
+- [x] Remove the need to source deployment replay bytes from a private operator journal: add a pinned, paired read-only public exporter (14 offline tests; six real deployment transactions verified; native invocation passed in the 1307 workflow).
 - [ ] Verify clean unattended process restart, owner-only persistent stores and bounded graceful shutdown.
 - [ ] Document configuration/schema compatibility and safe upgrade/rollback without losing reservations.
 - [ ] Provide release-pinned health, progress, gas-budget and redacted incident diagnostics.

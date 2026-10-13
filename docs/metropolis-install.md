@@ -1,5 +1,11 @@
 # Metropolis Fresh-Install Guide
 
+Current release: [0.3.0.dev2026101307](https://github.com/PoulavBhowmick03/erebus-metropolis/releases/tag/v0.3.0.dev2026101307).
+Use [section 10](#10-published-metropolis-packages) for public installation.
+Older source-build and candidate records below retain their original scope.
+This release includes installed Metropolis onboarding, wallet SDK/MCP tools and the shielded relayer.
+It remains testnet-only, single-operator and unaudited.
+
 Status: M8 external rehearsal guide. The published `0.3.0.dev5` channel exists
 ([section 10](#10-published-metropolis-packages)); the source-build commands below describe the
 local package surface and unreleased changes. Unpublished shielded-candidate packages and their
@@ -257,7 +263,7 @@ uv pip install --python erebus-metropolis/bin/python \
   --no-config \
   --index https://poulavbhowmick03.github.io/erebus-metropolis/simple/ \
   --default-index https://pypi.org/simple --index-strategy first-index \
-  "erebus-mcp-server==0.3.0.dev2026101202"
+  "erebus-mcp-server==0.3.0.dev2026101307"
 export PATH="$PWD/erebus-metropolis/bin:$PATH"
 printf '%s' '{"method":"version"}' | erebus-negotiate
 ```
@@ -321,7 +327,7 @@ It checks the manifests against the authorization. Confirm the publisher address
 
 ```sh
 B="$PWD/erebus-metropolis/bin"
-"$B/erebus-init" --metropolis pins --version 0.3.0.dev2026101202 --directory ./pins
+"$B/erebus-init" --metropolis pins --version 0.3.0.dev2026101307 --directory ./pins
 "$B/erebus-init" --metropolis init --role buyer --pool wmon --directory ./buyer \
   --bin "$B" --pins ./pins --deployment ./pins/monad-testnet-shielded-v2.json \
   --endpoint 127.0.0.1:9101 --rpc-url https://testnet-rpc.monad.xyz --peer-rpc-url https://rpc.ankr.com/monad_testnet \

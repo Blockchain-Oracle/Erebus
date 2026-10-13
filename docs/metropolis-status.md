@@ -10,6 +10,27 @@ records, the x402 record, the demo plan, and the submission gates into one statu
 
 ## Current status
 
+### Published release 1307 (2026-10-13)
+
+This entry supersedes the candidate and release-state summaries below.
+[Version 0.3.0.dev2026101307](https://github.com/PoulavBhowmick03/erebus-metropolis/releases/tag/v0.3.0.dev2026101307)
+is published from clean commit `674e5a77d3cfe7141f32c1221a1335f802f7b34b`.
+[Native qualification 38431534413](https://github.com/PoulavBhowmick03/Erebus/actions/runs/38431534413)
+passed on macOS arm64 and Linux x86_64, including platform comparison.
+Both platforms passed installed onboarding, both-pool HTTPS proving, asset/metered/x402 rehearsals,
+the generated two-agent workflow and the installed-relayer gate.
+Installed CLI and MCP delegation have separate checks; the relayer reports contain no coverage gaps.
+[Public-install verification 38443540443](https://github.com/PoulavBhowmick03/Erebus/actions/runs/38443540443)
+also passed on both platforms from fresh environments.
+
+These results qualify installation and local-chain operation, not live Monad settlement or independent acceptance.
+Fresh live wallets are funded, but cold-history recovery still blocks their first private operation.
+Quicknode passed 1,000 deployment-era header reads without errors at the probe's 40-RPS setting.
+Dwellir returned chain 10143 and deployment-era pool code: 100/100 reads passed at 10 RPS;
+36/100 reads were rate-limited at 40 RPS.
+Per-endpoint scan-rate controls are being prepared separately and are not in the published release.
+OpenCode's segmented-cache candidate is not integrated. Live asset/relayer loops, ceremony, audit and outside acceptance remain open.
+
 ### Shipping candidate 1307 (2026-10-13)
 
 This entry supersedes older qualification summaries below. Local rebuilt version

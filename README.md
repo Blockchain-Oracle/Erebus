@@ -39,7 +39,7 @@ used source-built payment commands, not the complete published-release workflow.
 
 ### Install the published Metropolis packages
 
-The recorded release `0.3.0.dev2026101202` is published as a prerelease on a separate Metropolis index (the stable Starknet
+The recorded release `0.3.0.dev2026101307` is published as a prerelease on a separate Metropolis index (the stable Starknet
 index is unrelated). With [uv](https://docs.astral.sh/uv/) and Python 3.11+:
 
 ```sh
@@ -48,7 +48,7 @@ uv pip install --python erebus-metropolis/bin/python \
   --no-config \
   --index https://poulavbhowmick03.github.io/erebus-metropolis/simple/ \
   --default-index https://pypi.org/simple --index-strategy first-index \
-  "erebus-mcp-server==0.3.0.dev2026101202"
+  "erebus-mcp-server==0.3.0.dev2026101307"
 ```
 
 Use uv with the index order above. Metropolis takes priority; PyPI supplies missing dependencies.
