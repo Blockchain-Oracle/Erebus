@@ -1,44 +1,111 @@
-"""Private SaaS metering: bundle accounting, exhaustion, and the mock rehearsal."""
+"""Metered access: read the real allowance, spend calls, retry pending by calling, never overdraw."""
 
 import asyncio
 
 import pytest
 
-from erebus_agents.metering import BundleExhausted, CreditBundle, consume
-from erebus_agents.saas_metering_demo import rehearse
+from erebus_agents.metering import Allowance, consume
+from erebus_agents.metropolis_loop import HarnessError
+from erebus_agents.saas_metering_demo import buy_and_consume, evidence_name, run
 
-BUNDLE = CreditBundle("ent-1", "0xseller", "0xbuyer", calls_total=5)
-
-
-def test_bundle_validation_and_remaining():
-    with pytest.raises(ValueError):
-        CreditBundle("", "0xs", "0xb", 5)
-    with pytest.raises(ValueError):
-        CreditBundle("e", "0xs", "0xb", 0)
-    with pytest.raises(ValueError):
-        CreditBundle("e", "0xs", "0xb", 5, calls_used=6)
-    assert BUNDLE.remaining == 5 and not BUNDLE.exhausted
+OPERATION = "34" * 32
+COMMITMENT = "cd" * 32
+ENTITLEMENT = "ee" * 32
 
 
-def test_consume_decrements_and_refuses_overdraw():
-    spent = consume(BUNDLE, 3)
-    assert spent.calls_used == 3 and spent.remaining == 2
-    assert consume(spent, 2).exhausted
-    with pytest.raises(BundleExhausted, match="2 of 5 remaining"):
-        consume(spent, 3)
-    with pytest.raises(ValueError):
-        consume(BUNDLE, 0)
+def status(remaining, quantity=5):
+    return {"ok": True, "result": {"status": "allowance", "result": {
+        "deal_commitment": COMMITMENT, "entitlement_id": ENTITLEMENT, "quantity": quantity,
+        "seller_next_call_index": quantity - remaining, "remaining": remaining,
+        "next_call_index": quantity - remaining, "in_flight": None, "exhausted": remaining == 0,
+        "recovered_calls": 0, "seller_reported_payment_finalized": True, "payment_verified": False,
+        "delivery_verified": False}}}
 
 
-def test_rehearsal_buys_a_bundle_and_refuses_overdraw(tmp_path):
-    record = asyncio.run(rehearse(5, 4, 3, consume_calls=7, store_dir=tmp_path))
-    assert record["settled"] and record["audit"]["compliant"]
-    assert record["calls_consumed"] == 5
-    assert record["bundle"]["remaining"] == 0 and record["bundle"]["exhausted"] is True
-    assert "0 of 5 remaining" in record["refused"]
+def issued(index, remaining):
+    return {"ok": True, "result": {"status": "issued", "result": {
+        "deal_commitment": COMMITMENT, "entitlement_id": ENTITLEMENT, "call_index": index, "quantity": 5,
+        "next_call_index": index + 1, "remaining": remaining, "response_sha256": "ab" * 32, "response_bytes": 9,
+        "response_file": f"/cache/metered/calls/{'ab' * 32}.0.tx", "repeated": False, "cached": False, "late": False,
+        "seller_reported_payment_finalized": True, "response_hash_consistent": True, "resource_verified": False,
+        "payment_verified": False, "delivery_verified": False}}}
 
 
-def test_rehearsal_within_bundle_never_refuses(tmp_path):
-    record = asyncio.run(rehearse(5, 4, 3, consume_calls=3, store_dir=tmp_path))
-    assert record["calls_consumed"] == 3 and record["refused"] is None
-    assert record["bundle"]["remaining"] == 2
+PENDING = {"ok": False, "result": {"status": "pending", "retry_without_payment": True, "payment_verified": False}}
+
+
+class Session:
+    def __init__(self, **replies):
+        self.replies = {name: list(values) for name, values in replies.items()}
+        self.calls = []
+
+    async def call_tool(self, name, arguments):
+        if name in {"metered_service_status", "call_metered_service"}:
+            assert arguments == {"evidence_name": evidence_name(OPERATION)}
+        self.calls.append(name)
+        return self.replies[name].pop(0)
+
+
+async def no_sleep(_):
+    pass
+
+
+def test_spends_the_allowance_and_refuses_to_overdraw():
+    buyer = Session(metered_service_status=[status(2), status(0)],
+                    call_metered_service=[issued(3, 1), issued(4, 0)])
+    usage = asyncio.run(consume(buyer, evidence_name(OPERATION), 4, sleep=no_sleep))
+    assert [call["call_index"] for call in usage["calls_issued"]] == [3, 4]
+    assert buyer.calls.count("call_metered_service") == 2, "no call is attempted past exhaustion"
+    assert "exhausted" in usage["refused"] and usage["after"]["exhausted"] is True
+    assert usage["payment_verified"] is False
+
+
+def test_a_pending_call_is_retried_by_calling_again_never_by_paying():
+    buyer = Session(metered_service_status=[status(1), status(0)], call_metered_service=[PENDING, PENDING, issued(4, 0)])
+    usage = asyncio.run(consume(buyer, evidence_name(OPERATION), 1, sleep=no_sleep))
+    assert len(usage["calls_issued"]) == 1 and usage["refused"] is None
+    assert buyer.calls.count("call_metered_service") == 3
+
+
+def test_a_non_retryable_failure_stops_and_a_verification_claim_is_refused():
+    rejected = {"ok": False, "result": {"status": "error", "retry_without_payment": False}}
+    with pytest.raises(HarnessError, match="non-retryable"):
+        asyncio.run(consume(Session(metered_service_status=[status(1)], call_metered_service=[rejected]),
+                            evidence_name(OPERATION), 1, sleep=no_sleep))
+    lying = issued(4, 0)
+    lying["result"]["result"]["payment_verified"] = True
+    with pytest.raises(HarnessError, match="must not claim"):
+        asyncio.run(consume(Session(metered_service_status=[status(1)], call_metered_service=[lying]),
+                            evidence_name(OPERATION), 1, sleep=no_sleep))
+
+
+def test_allowance_parses_the_seller_report():
+    allowance = Allowance.from_result(status(2)["result"]["result"])
+    assert allowance.quantity == 5 and allowance.remaining == 2 and not allowance.exhausted
+
+
+NEGOTIATED = {"ok": True, "result": {"deal_commitment": COMMITMENT, "measurements_ms": {"negotiation": 5},
+                                     "evidence_file": f"/operator/state/agent/{OPERATION}.0.tx"}}
+FINALIZED = {"ok": True, "result": {"status": "ok", "payment_verified": True, "stage": "Finalized",
+                                    "winning_commitment": COMMITMENT, "measurements_ms": {}}}
+
+
+def test_one_settlement_buys_the_bundle_then_calls_spend_it():
+    buyer = Session(negotiate_deal=[NEGOTIATED], check_settlement_funding=[{"ok": True, "result": {"status": "ready"}}],
+                    settle_deal=[FINALIZED], metered_service_status=[status(5), status(4)],
+                    call_metered_service=[issued(0, 4)])
+    record = asyncio.run(buy_and_consume(buyer, Session(negotiate_deal=[NEGOTIATED]), OPERATION, 1, sleep=no_sleep))
+    assert record["settlement_payment_verified"] is True and record["settle_calls"] == 1
+    assert record["usage"]["after"]["remaining"] == 4
+
+
+def test_consume_only_never_touches_the_settlement_tools():
+    buyer = Session(metered_service_status=[status(4), status(3)], call_metered_service=[issued(1, 3)])
+    record = asyncio.run(buy_and_consume(buyer, Session(), OPERATION, 1, consume_only=True, sleep=no_sleep))
+    assert "settle_deal" not in buyer.calls and "negotiate_deal" not in buyer.calls
+    assert record["usage"]["after"]["remaining"] == 3
+
+
+def test_the_buyer_operator_must_select_the_metered_profile():
+    with pytest.raises(ValueError, match="metered"):
+        asyncio.run(run("/b.json", "/p.json", {"EREBUS_ACCESS_PROFILE": "snapshot"}, "/s.json", OPERATION, 1))

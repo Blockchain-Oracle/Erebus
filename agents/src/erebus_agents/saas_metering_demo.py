@@ -1,13 +1,16 @@
-"""Mock rehearsal of private SaaS metering: buy a bundle in one settlement, then spend its calls.
+"""Private SaaS metering: buy a bundle of calls in one settlement, then spend the calls.
 
-The buyer negotiates and settles once for a bundle of N calls to a seller's resource, then
-consumes calls until the bundle is exhausted. Payment is the settlement; usage is the local
-credit accounting. The two are separate: an auditor verifies the payment from the disclosure
-grant, never the call count.
+The buyer's Metropolis server is configured by its operator with the metered access profile
+(`EREBUS_ACCESS_PROFILE=metered` among its `EREBUS_ACCESS_*` settings), so it exposes the ordinary
+settlement tools plus `metered_service_status` and `call_metered_service`. One run settles the
+bundle through `metropolis_loop.drive_deal` (negotiate on both sides, settle at most once,
+recover by observation until finalized), then spends calls against the seller's real allowance
+and refuses to overdraw it. Payment is the settlement; usage is the seller's metered issuer. An
+auditor verifies the payment from the disclosure grant, never the call count.
 
-The bundle here is created locally and is not bound to Rust's metered issuer or its
-entitlement records. On the installed rail, `erebus-access-service` serves the metered profile
-and its issuer is the authority on how many calls a settlement bought.
+The bundle size and price are fixed by the operators' files, not chosen here. Reuse the same
+`--operation` after any interruption. To spend more calls from a bundle already paid under that
+operation, pass `--consume-only`: it never touches the settlement tools.
 """
 
 from __future__ import annotations
@@ -15,78 +18,77 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import logging
 import sys
-import tempfile
 from pathlib import Path
 from typing import Any
 
-from erebus_mcp.interface import DisclosedRecord
-from erebus_mcp.mock_client import MockErebusClient
-
-from erebus_agents.agent import run_negotiation
-from erebus_agents.metering import BundleExhausted, CreditBundle, consume
-from erebus_agents.procurement import Catalog, Requisition, buyer_policy, review_disclosure, supplier_policy
-
-BUYER = "0xbuyer"
-SELLER = "0xseller"
-ASSET = "0xusdc"
-ITEM = "api-call-bundle"
+from erebus_agents.metering import METERED_TOOLS, consume
+from erebus_agents.metropolis_loop import (
+    BUYER_TOOLS,
+    ToolSession,
+    _harness_error,
+    connect_participants,
+    drive_deal,
+    server_params,
+)
 
 
-async def rehearse(calls: int, max_unit_price: int, floor_unit_price: int, *, consume_calls: int,
-                   latency: float = 0.0, max_rounds: int = 3, store_dir: Path) -> dict[str, Any]:
-    requisition = Requisition(ITEM, calls, max_unit_price)
-    store = store_dir / "erebus-mock-store.json"
-    buyer = MockErebusClient(identity=BUYER, store_path=store, latency_seconds=latency,
-                             spendable_notes=[requisition.ceiling])
-    seller = MockErebusClient(identity=SELLER, store_path=store, latency_seconds=latency, spendable_notes=[])
-    state = await run_negotiation(
-        buyer_client=buyer, seller_client=seller, buyer_address=BUYER, seller_address=SELLER,
-        buyer_policy=buyer_policy(BUYER, requisition, max_rounds=max_rounds),
-        seller_policy=supplier_policy(SELLER, Catalog(ITEM, floor_unit_price), requisition, max_rounds=max_rounds),
-        token=ASSET, max_rounds=max_rounds)
-    if state.settlement is None:
-        return {"settled": False}
+def evidence_name(operation_ref: str) -> str:
+    """Negotiation writes the buyer's evidence as `<state_root>/agent/<operation>.0.tx`."""
+    return f"{operation_ref}.0.tx"
 
-    accepted = next(offer for offer in state.offers if offer.offer_id == state.settlement.acceptance)
-    review = review_disclosure(
-        DisclosedRecord(channel_id=accepted.channel_id, participants=[BUYER, SELLER],
-                        offers=state.offers, settlement=state.settlement),
-        requisition)
-    bundle = CreditBundle(f"entitlement-{accepted.deal_id}", SELLER, BUYER, calls_total=calls)
-    consumed = 0
-    refused: str | None = None
-    for _ in range(consume_calls):
-        try:
-            bundle = consume(bundle, 1)
-        except BundleExhausted as error:
-            refused = str(error)
-            break
-        consumed += 1
-    return {
-        "settled": True,
-        "agreed_amount": state.settlement.agreed_amount,
-        "paid_amount": state.settlement.paid_amount,
-        "bundle": bundle.to_dict(),
-        "calls_consumed": consumed,
-        "refused": refused,
-        "audit": {"compliant": review.compliant, "reasons": list(review.reasons)},
-    }
+
+async def buy_and_consume(buyer: ToolSession, seller: ToolSession, operation_ref: str, calls: int, *,
+                          consume_only: bool = False, **options: Any) -> dict[str, Any]:
+    record: dict[str, Any] = {"operation_ref": operation_ref}
+    if not consume_only:
+        deal = await drive_deal(buyer, seller, operation_ref, **options)
+        record.update(deal_commitment=deal["deal_commitment"], settlement_payment_verified=deal["payment_verified"],
+                      settle_calls=deal["settle_calls"], recover_calls=deal["recover_calls"])
+    record["usage"] = await consume(buyer, evidence_name(operation_ref), calls, **options)
+    return record
+
+
+async def run(buyer_negotiation: str, buyer_payment: str, buyer_access: dict[str, str], seller_negotiation: str,
+              operation_ref: str, calls: int, *, consume_only: bool = False, server_command: str | None = None,
+              negotiation_cli: str | None = None, payment_cli: str | None = None,
+              max_polls: int = 120) -> dict[str, Any]:
+    if buyer_access.get("EREBUS_ACCESS_PROFILE") != "metered":
+        raise ValueError("the buyer operator must select EREBUS_ACCESS_PROFILE=metered")
+    buyer = server_params(sys.executable, buyer_negotiation, payment_config=buyer_payment, access=buyer_access,
+                          server_command=server_command, negotiation_cli=negotiation_cli, payment_cli=payment_cli)
+    seller = server_params(sys.executable, seller_negotiation, negotiation_cli=negotiation_cli,
+                           server_command=server_command)
+    async with connect_participants(buyer, seller, buyer_allowed=(BUYER_TOOLS | METERED_TOOLS,)) as ((b, _), (s, _)):
+        return await buy_and_consume(b, s, operation_ref, calls, consume_only=consume_only, max_polls=max_polls)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--calls", type=int, default=5, help="calls bought in the bundle")
-    parser.add_argument("--consume", type=int, default=7, help="calls the agent tries to consume")
-    parser.add_argument("--max-unit-price", type=int, default=4)
-    parser.add_argument("--floor-unit-price", type=int, default=3)
-    parser.add_argument("--latency", type=float, default=0.2)
+    parser.add_argument("--buyer-negotiation", required=True)
+    parser.add_argument("--buyer-payment", required=True)
+    parser.add_argument("--buyer-access", type=Path, required=True,
+                        help="JSON file of the buyer operator's EREBUS_ACCESS_* variables (metered profile)")
+    parser.add_argument("--seller-negotiation", required=True)
+    parser.add_argument("--operation", required=True, help="64-hex operation ID; reuse it after any interruption")
+    parser.add_argument("--calls", type=int, required=True, help="calls to spend from the bundle")
+    parser.add_argument("--consume-only", action="store_true", help="the bundle is already paid; only spend calls")
+    parser.add_argument("--server-command", help="installed erebus-mcp-server; default: this Python's module")
+    parser.add_argument("--negotiation-cli")
+    parser.add_argument("--payment-cli")
+    parser.add_argument("--max-polls", type=int, default=120)
     args = parser.parse_args()
-    logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stdout)
-    with tempfile.TemporaryDirectory() as tmp:
-        record = asyncio.run(rehearse(args.calls, args.max_unit_price, args.floor_unit_price,
-                                      consume_calls=args.consume, latency=args.latency, store_dir=Path(tmp)))
+    try:
+        record = asyncio.run(run(args.buyer_negotiation, args.buyer_payment, json.loads(args.buyer_access.read_text()),
+                                 args.seller_negotiation, args.operation, args.calls, consume_only=args.consume_only,
+                                 server_command=args.server_command, negotiation_cli=args.negotiation_cli,
+                                 payment_cli=args.payment_cli, max_polls=args.max_polls))
+    except BaseException as error:
+        found = _harness_error(error)
+        if found is None:
+            raise
+        print(json.dumps({"operation_ref": args.operation, "error": str(found)}))
+        raise SystemExit(1) from None
     print(json.dumps(record, indent=2))
 
 

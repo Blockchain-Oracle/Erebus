@@ -1,9 +1,10 @@
-"""Rehearsal of one-off off-chain purchases: compute, a dataset, or an API response.
+"""One-off off-chain purchases -- compute, a dataset, or an API response -- over the real loop.
 
-These are the same shape as the marketplace loop -- one buyer, one seller, one private
-settlement, an off-chain deliverable -- so this reuses `marketplace.rehearse` and only swaps the
-capability and the candidate listings. It is here to show that "buy compute" and "buy a dataset"
-need no new mechanism, not to add one.
+These are the same shape as a marketplace purchase: one buyer, one seller, one settlement, an
+off-chain deliverable. So this is the marketplace purchase (`marketplace_demo.purchase`) with the
+capability named by the kind of thing bought. It shows that "buy compute" and "buy a dataset"
+need no new mechanism, not to add one. The registry, the buyer operator's routes and the
+operation ID are the same inputs `marketplace_demo.py` takes.
 """
 
 from __future__ import annotations
@@ -11,55 +12,52 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import logging
-import sys
-import tempfile
 from pathlib import Path
-from typing import Any
 
-from erebus_agents.marketplace import ServiceListing, ServiceRegistry
-from erebus_agents.marketplace_demo import ASSET, rehearse
+from erebus_agents.marketplace import ServiceRegistry, load_routes
+from erebus_agents.marketplace_demo import purchase, select_listing
+from erebus_agents.metropolis_loop import _harness_error
 
-KINDS: dict[str, tuple[str, tuple[ServiceListing, ...]]] = {
-    "compute": ("run-model", (
-        ServiceListing("svc-atlas", "0xatlas", "run-model", ASSET, "gpu-hour", 3, 7),
-        ServiceListing("svc-aegean", "0xaegean", "run-model", ASSET, "gpu-hour", 5, 9),
-    )),
-    "dataset": ("purchase-dataset", (
-        ServiceListing("svc-atlas", "0xatlas", "purchase-dataset", ASSET, "record", 2, 6),
-        ServiceListing("svc-boreas", "0xboreas", "purchase-dataset", ASSET, "record", 4, 8),
-    )),
-    "api": ("call-api", (
-        ServiceListing("svc-aegean", "0xaegean", "call-api", ASSET, "call", 1, 4),
-    )),
-}
+KINDS = {"compute": "run-model", "dataset": "purchase-dataset", "api": "call-api"}
 
 
-async def rehearse_purchase(kind: str, ceiling_unit_price: int, quantity: int, *, latency: float = 0.0,
-                            max_rounds: int = 3, store_dir: Path) -> dict[str, Any]:
+def capability_for(kind: str) -> str:
     if kind not in KINDS:
         raise ValueError(f"kind must be one of {sorted(KINDS)}")
-    capability, listings = KINDS[kind]
-    registry = ServiceRegistry()
-    for listing in listings:
-        registry.publish(listing)
-    record = await rehearse(capability, ceiling_unit_price, quantity, registry=registry,
-                            latency=latency, max_rounds=max_rounds, store_dir=store_dir)
-    return {"kind": kind, **record}
+    return KINDS[kind]
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--kind", choices=sorted(KINDS), default="compute")
-    parser.add_argument("--quantity", type=int, default=10)
-    parser.add_argument("--ceiling-unit-price", type=int, default=8)
-    parser.add_argument("--latency", type=float, default=0.2)
+    parser.add_argument("--kind", choices=sorted(KINDS), required=True)
+    parser.add_argument("--registry", type=Path, required=True)
+    parser.add_argument("--routes", type=Path, required=True)
+    parser.add_argument("--ceiling-unit-price", type=int, required=True)
+    parser.add_argument("--operation", required=True, help="64-hex operation ID; reuse it after any interruption")
+    parser.add_argument("--server-command")
+    parser.add_argument("--negotiation-cli")
+    parser.add_argument("--payment-cli")
+    parser.add_argument("--max-polls", type=int, default=120)
     args = parser.parse_args()
-    logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stdout)
-    with tempfile.TemporaryDirectory() as tmp:
-        record = asyncio.run(rehearse_purchase(args.kind, args.ceiling_unit_price, args.quantity,
-                                               latency=args.latency, store_dir=Path(tmp)))
-    print(json.dumps(record, indent=2))
+    capability = capability_for(args.kind)
+    selected = select_listing(ServiceRegistry.load(args.registry), load_routes(args.routes), capability,
+                              args.ceiling_unit_price)
+    if selected is None:
+        print(json.dumps({"kind": args.kind, "matched": False, "capability": capability}))
+        raise SystemExit(1)
+    listing, route = selected
+    try:
+        record = asyncio.run(purchase(listing, route, args.operation, server_command=args.server_command,
+                                      negotiation_cli=args.negotiation_cli, payment_cli=args.payment_cli,
+                                      max_polls=args.max_polls))
+    except BaseException as error:
+        found = _harness_error(error)
+        if found is None:
+            raise
+        print(json.dumps({"kind": args.kind, "operation_ref": args.operation, "payment_verified": False,
+                          "error": str(found)}))
+        raise SystemExit(1) from None
+    print(json.dumps({"kind": args.kind, "matched": True, **record}, indent=2))
 
 
 if __name__ == "__main__":

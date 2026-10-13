@@ -80,14 +80,19 @@ seller-authored offer.
   counterparty allowlist, expiry) and a `GrantLedger`, so an agent's spending is attributable to a
   sponsor's intent. A draw in any token other than the grant's is refused. Shares the firewall's
   refusal codes.
-- `discovery.py` / `discovery_demo.py`. A `DiscoveryDirectory` of `ServiceRecord`s: capability,
-  asset, price band, endpoint and an optional signed-descriptor digest. It indexes; the Rust
-  `ServiceDescriptor` verifies.
-- `metering.py` / `saas_metering_demo.py`. Prepaid `CreditBundle` accounting: buy N calls in one
-  settlement, spend them, refuse an overdraw. The bundle is a local projection, not bound to the
-  Rust metered issuer, which stays authoritative on the installed rail.
-- `offchain_purchase_demo.py`. Compute, dataset or API purchases reusing the marketplace loop
-  unchanged.
+- `discovery.py` / `discovery_demo.py`. A `DiscoveryDirectory` indexed from real signed
+  `ServiceDescriptor` files (`erebus-negotiate prepare_operator` writes them). A record pairs a
+  capability and an advertised price band with one descriptor file; address, endpoints, chain,
+  assets, modes and expiry are read from that file, and its bytes are pinned by SHA-256.
+  `resolve` refuses an expired or swapped descriptor. It indexes; Rust verifies the signature when
+  the buyer operator configures the file as its `peer_descriptor_file`. Also a CLI.
+- `metering.py` / `saas_metering_demo.py`. Prepaid metered access on the real metered profile:
+  one settlement (`drive_deal`) buys the bundle, then `call_metered_service` spends calls against
+  the seller's allowance from `metered_service_status`. A pending call is retried by calling
+  again, never by paying, and nothing is called past exhaustion. Rust keeps the cursor and the
+  seller's issuer is authoritative; `--consume-only` spends from a bundle already paid.
+- `offchain_purchase_demo.py`. Compute, dataset or API purchases: the marketplace purchase under
+  a kind-specific capability, with the same registry, routes and operation ID.
 - `demo.py` / `demo_mcp.py`, the two CLI entry points above.
 
 ```bash
@@ -104,14 +109,27 @@ uv run python agents/src/erebus_agents/api_gateway_demo.py --buyer-negotiation b
 uv run python agents/src/erebus_agents/receipt_explorer.py --report audit.json \
   --issuer <participant> --format text   # or --format html --out receipt.html
 
-# RFQ desk, vendor selection, spending firewall, grants, discovery, metering, off-chain buys
+# Discovery: index a seller's signed descriptor, then search and resolve
+uv run python agents/src/erebus_agents/discovery_demo.py --directory discovery.json publish \
+  --service-id svc-atlas --capability summarize-documents --min-unit-price 3 --max-unit-price 7 \
+  --descriptor /operator/seller/keys/seller.descriptor.json
+uv run python agents/src/erebus_agents/discovery_demo.py --directory discovery.json search \
+  --capability summarize-documents --mode shielded
+
+# SaaS metering: one settlement buys the bundle, then spend calls (metered access profile)
+uv run python agents/src/erebus_agents/saas_metering_demo.py --buyer-negotiation buyer.json \
+  --buyer-payment payment.json --buyer-access buyer-metered-access.json \
+  --seller-negotiation seller.json --operation <64-hex> --calls 5
+
+# Off-chain purchase: the marketplace purchase for compute, a dataset or an API response
+uv run python agents/src/erebus_agents/offchain_purchase_demo.py --kind compute \
+  --registry registry.json --routes buyer-routes.json --ceiling-unit-price 8 --operation <64-hex>
+
+# RFQ desk, vendor selection, spending firewall and grants (not yet on the real path)
 uv run python agents/src/erebus_agents/rfq_demo.py --latency 0
 uv run python agents/src/erebus_agents/vendor_selection_demo.py --latency 0
 uv run python agents/src/erebus_agents/firewall_demo.py
 uv run python agents/src/erebus_agents/grant_demo.py
-uv run python agents/src/erebus_agents/discovery_demo.py
-uv run python agents/src/erebus_agents/saas_metering_demo.py --latency 0
-uv run python agents/src/erebus_agents/offchain_purchase_demo.py --kind compute --latency 0
 ```
 
 ## Where it sits
