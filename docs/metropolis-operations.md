@@ -375,6 +375,21 @@ Use `mode: "shielded"`, not the public-bound configuration above. Set these fiel
 
 ### Shielded wallet operations
 
+#### Per-endpoint history pacing (unreleased)
+
+The source candidate accepts optional `rpc_requests_per_second` and
+`peer_rpc_requests_per_second` fields in wallet and shielded payment configs.
+Each value must be an integer from 1 through 40. Omitted fields retain the 40-RPS default.
+The fields control `PoolRpc` reads, including history scans; they do not limit every EVM RPC request.
+Each source retains its bounded eight-request burst. Allow headroom below the provider's total quota.
+Multiple processes sharing an endpoint also share the provider's quota, not the local pacer.
+
+For example, use 40 for a qualified 50-RPS primary and 10 for a slower peer.
+Use small `max_scan_blocks` values when slower scans would exceed the caller's process timeout.
+Lower rates do not skip headers, logs, canonicality checks or paired evidence.
+They also do not solve the legacy cache size limit or prove full-history throughput.
+Published `0.3.0.dev2026101307` rejects these new config fields; do not add them to its operator configs.
+
 `erebus-wallet` performs explicit deposit and withdrawal onboarding against one shielded pool.
 It shares the payment driver's wallet file, deployment identity, artifact manifest, and gas
 signer. Build and run:

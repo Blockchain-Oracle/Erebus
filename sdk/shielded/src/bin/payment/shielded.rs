@@ -32,6 +32,10 @@ struct ShieldedConfig {
     first_hash: String,
     rpc_url: String,
     peer_rpc_url: String,
+    #[serde(default)]
+    rpc_requests_per_second: Option<u32>,
+    #[serde(default)]
+    peer_rpc_requests_per_second: Option<u32>,
     buyer_key_hex: String,
     asset: String,
     signer_address: String,
@@ -81,6 +85,10 @@ pub(super) async fn run(
 ) -> Result<Value, &'static str> {
     let config: ShieldedConfig =
         serde_json::from_slice(bytes).map_err(|_| "invalid shielded operator configuration")?;
+    validate_read_rates(
+        config.rpc_requests_per_second,
+        config.peer_rpc_requests_per_second,
+    )?;
     let maximum = amount(&config.maximum_price)?;
     let pool = parse_lowercase_address(&config.pool).ok_or("invalid shielded deployment")?;
     let signer = parse_lowercase_address(&config.signer_address).ok_or("invalid gas payer")?;
@@ -192,8 +200,22 @@ pub(super) async fn run(
         .await
         .map_err(|_| "peer RPC unavailable")?;
     let rpc = PoolRpc::with_timeout(&config.rpc_url, chain_id, pool, timeout)
+        .and_then(|rpc| {
+            rpc.with_max_requests_per_second(
+                config
+                    .rpc_requests_per_second
+                    .unwrap_or(erebus_shielded_prover::rpc::DEFAULT_MAX_REQUESTS_PER_SECOND),
+            )
+        })
         .map_err(|_| "invalid primary RPC")?;
     let peer_rpc = PoolRpc::with_timeout(&config.peer_rpc_url, chain_id, pool, timeout)
+        .and_then(|rpc| {
+            rpc.with_max_requests_per_second(
+                config
+                    .peer_rpc_requests_per_second
+                    .unwrap_or(erebus_shielded_prover::rpc::DEFAULT_MAX_REQUESTS_PER_SECOND),
+            )
+        })
         .map_err(|_| "invalid peer RPC")?;
     if rpc.shares_endpoint(&peer_rpc) {
         return Err("shielded recovery requires distinct RPC endpoints");
@@ -571,6 +593,32 @@ pub(super) async fn run(
     response["stage"] = json!(format!("{:?}", submitted.stage));
     response["broadcast_attempts"] = json!(submitted.broadcast_attempts);
     Ok(response)
+}
+
+fn validate_read_rates(primary: Option<u32>, peer: Option<u32>) -> Result<(), &'static str> {
+    if [primary, peer].into_iter().flatten().any(|rate| {
+        rate == 0 || rate > erebus_shielded_prover::rpc::DEFAULT_MAX_REQUESTS_PER_SECOND
+    }) {
+        return Err("invalid shielded RPC read rate");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod read_rate_tests {
+    #[test]
+    fn rates_are_optional_bounded_and_independent() {
+        assert!(super::validate_read_rates(None, None).is_ok());
+        for rate in [1, 10, 40] {
+            assert!(super::validate_read_rates(Some(rate), None).is_ok());
+            assert!(super::validate_read_rates(None, Some(rate)).is_ok());
+        }
+        assert!(super::validate_read_rates(Some(40), Some(10)).is_ok());
+        for rate in [0, 41, u32::MAX] {
+            assert!(super::validate_read_rates(Some(rate), Some(10)).is_err());
+            assert!(super::validate_read_rates(Some(40), Some(rate)).is_err());
+        }
+    }
 }
 
 async fn submit_relay(

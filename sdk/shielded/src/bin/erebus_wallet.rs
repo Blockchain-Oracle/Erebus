@@ -120,6 +120,10 @@ struct Config {
     wrapper: Option<String>,
     rpc_url: String,
     peer_rpc_url: String,
+    #[serde(default)]
+    rpc_requests_per_second: Option<u32>,
+    #[serde(default)]
+    peer_rpc_requests_per_second: Option<u32>,
     first_block: u64,
     first_hash: String,
     wallet_file: PathBuf,
@@ -385,6 +389,15 @@ fn load(path: &Path) -> Result<Prepared, Failure> {
         || config.max_scan_blocks == 0
         || config.gas_limit == 0
         || config.rpc_url == config.peer_rpc_url
+        || [
+            config.rpc_requests_per_second,
+            config.peer_rpc_requests_per_second,
+        ]
+        .into_iter()
+        .flatten()
+        .any(|rate| {
+            rate == 0 || rate > erebus_shielded_prover::rpc::DEFAULT_MAX_REQUESTS_PER_SECOND
+        })
     {
         return Err(Failure::Error("invalid config"));
     }
@@ -585,6 +598,16 @@ async fn connect_chain(
             prepared.pool,
             Duration::from_secs(timeout_seconds),
         )
+        .and_then(|rpc| {
+            rpc.with_max_requests_per_second(
+                if url == prepared.config.rpc_url {
+                    prepared.config.rpc_requests_per_second
+                } else {
+                    prepared.config.peer_rpc_requests_per_second
+                }
+                .unwrap_or(erebus_shielded_prover::rpc::DEFAULT_MAX_REQUESTS_PER_SECOND),
+            )
+        })
         .map_err(|_| Failure::Error("invalid RPC"))?;
         rpc.authenticate_dependencies_at(anchor.hash, dependencies)
             .await
@@ -700,6 +723,14 @@ async fn status(prepared: &Prepared) -> Result<Value, Failure> {
         prepared.pool,
         Duration::from_secs(prepared.config.timeout_seconds),
     )
+    .and_then(|rpc| {
+        rpc.with_max_requests_per_second(
+            prepared
+                .config
+                .rpc_requests_per_second
+                .unwrap_or(erebus_shielded_prover::rpc::DEFAULT_MAX_REQUESTS_PER_SECOND),
+        )
+    })
     .map_err(|_| Failure::Error("invalid RPC"))?;
     let peer_rpc = PoolRpc::with_timeout(
         &prepared.config.peer_rpc_url,
@@ -707,6 +738,14 @@ async fn status(prepared: &Prepared) -> Result<Value, Failure> {
         prepared.pool,
         Duration::from_secs(prepared.config.timeout_seconds),
     )
+    .and_then(|rpc| {
+        rpc.with_max_requests_per_second(
+            prepared
+                .config
+                .peer_rpc_requests_per_second
+                .unwrap_or(erebus_shielded_prover::rpc::DEFAULT_MAX_REQUESTS_PER_SECOND),
+        )
+    })
     .map_err(|_| Failure::Error("invalid peer RPC"))?;
     let primary = index_store(prepared, "primary.json")?;
     let peer = index_store(prepared, "peer.json")?;
@@ -894,6 +933,14 @@ async fn sync(prepared: &Prepared) -> Result<Value, Failure> {
         Duration::from_secs(prepared.config.timeout_seconds),
     )
     .and_then(|rpc| rpc.with_max_concurrent_reads(MAX_CONCURRENT_READS))
+    .and_then(|rpc| {
+        rpc.with_max_requests_per_second(
+            prepared
+                .config
+                .rpc_requests_per_second
+                .unwrap_or(erebus_shielded_prover::rpc::DEFAULT_MAX_REQUESTS_PER_SECOND),
+        )
+    })
     .map_err(|_| Failure::Error("invalid RPC"))?;
     let peer_rpc = PoolRpc::with_timeout(
         &prepared.config.peer_rpc_url,
@@ -902,6 +949,14 @@ async fn sync(prepared: &Prepared) -> Result<Value, Failure> {
         Duration::from_secs(prepared.config.timeout_seconds),
     )
     .and_then(|rpc| rpc.with_max_concurrent_reads(MAX_CONCURRENT_READS))
+    .and_then(|rpc| {
+        rpc.with_max_requests_per_second(
+            prepared
+                .config
+                .peer_rpc_requests_per_second
+                .unwrap_or(erebus_shielded_prover::rpc::DEFAULT_MAX_REQUESTS_PER_SECOND),
+        )
+    })
     .map_err(|_| Failure::Error("invalid peer RPC"))?;
     let primary = index_store(prepared, "primary.json")?;
     let peer = index_store(prepared, "peer.json")?;
@@ -1527,6 +1582,26 @@ mod tests {
                 "wallet release requires trusted pool and verifier runtime pins"
             ))
         ));
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+        for field in ["rpc_requests_per_second", "peer_rpc_requests_per_second"] {
+            for rate in [0, 41, u32::MAX] {
+                let mut invalid = config.clone();
+                invalid[field] = json!(rate);
+                std::fs::write(&path, serde_json::to_vec(&invalid).unwrap()).unwrap();
+                assert!(matches!(load(&path), Err(Failure::Error("invalid config"))));
+            }
+            for rate in [1, 10, 40] {
+                let mut valid = config.clone();
+                valid[field] = json!(rate);
+                std::fs::write(&path, serde_json::to_vec(&valid).unwrap()).unwrap();
+                assert!(matches!(
+                    load(&path),
+                    Err(Failure::Error(
+                        "wallet release requires trusted pool and verifier runtime pins"
+                    ))
+                ));
+            }
+        }
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
     }
 
