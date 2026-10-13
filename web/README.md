@@ -94,6 +94,14 @@ not `/docs`). The hero CTA and the header nav link straight there, and root `ver
 redirects `/docs` and `/docs/*` to the docs domain so old links keep working. The
 `docs.erebusagents.live` domain no longer belongs to this Vercel project.
 
+## Fonts
+
+The three faces are bundled in `app/fonts` (latin subset, SIL OFL 1.1, licence files beside them)
+and loaded with `next/font/local`. They used to come from `next/font/google`, which downloads them
+at build time; a Vercel build failed inside that loader when Google returned a font URL with no
+file extension. With local files the build never contacts Google. To change a face, replace its
+`.woff2` and its `OFL-*.txt` together.
+
 ## Type
 
 Mono is for data: labels, hashes, block numbers, tool names, code. Sentences are set in the

@@ -1,5 +1,5 @@
 import type { Metadata, Viewport } from "next";
-import { Anton, Space_Grotesk, JetBrains_Mono } from "next/font/google";
+import localFont from "next/font/local";
 import { KeyProvider } from "@/components/KeyContext";
 import { SmoothScroll } from "@/components/SmoothScroll";
 import { Grain } from "@/components/Grain";
@@ -14,23 +14,29 @@ import "./globals.css";
 // slightly-bolder version of a body font. Space Grotesk carries the actual
 // sentences, where a poster face would be unreadable. JetBrains Mono stays
 // for data and labels.
-const display = Anton({
-  subsets: ["latin"],
-  weight: ["400"],
+//
+// The faces are bundled in `app/fonts` (latin subset, SIL OFL 1.1, licences beside them) rather
+// than fetched from Google Fonts at build time. A Vercel build failed inside `next/font/google`
+// when Google returned a font URL with no file extension; a local file cannot do that, and the
+// build no longer depends on reaching Google at all. Space Grotesk and JetBrains Mono are
+// variable fonts, so one file each covers every weight the page uses.
+const display = localFont({
+  src: "./fonts/anton-latin.woff2",
+  weight: "400",
   variable: "--font-display-face",
   display: "swap",
 });
 
-const body = Space_Grotesk({
-  subsets: ["latin"],
-  weight: ["400", "500", "600"],
+const body = localFont({
+  src: "./fonts/space-grotesk-latin.woff2",
+  weight: "300 700",
   variable: "--font-body-face",
   display: "swap",
 });
 
-const mono = JetBrains_Mono({
-  subsets: ["latin"],
-  weight: ["400", "500", "600"],
+const mono = localFont({
+  src: "./fonts/jetbrains-mono-latin.woff2",
+  weight: "100 800",
   variable: "--font-mono-face",
   display: "swap",
 });
