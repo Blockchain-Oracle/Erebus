@@ -27,9 +27,9 @@ import json
 import os
 import sys
 import time
-from contextlib import AsyncExitStack
+from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Protocol
+from typing import Any, AsyncIterator, Awaitable, Callable, Protocol
 
 from mcp import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
@@ -213,14 +213,15 @@ def server_params(python: str, negotiation_config: str, *, payment_config: str |
     return StdioServerParameters(command=python, args=["-m", "erebus_mcp.server"], env=env)
 
 
-async def run_over_mcp(buyer_params: StdioServerParameters, seller_params: StdioServerParameters,
-                       operation_ref: str, *, profile: str = "settlement", **options: Any) -> dict[str, Any]:
-    if profile not in {"settlement", "x402-exact"}:
-        raise HarnessError("profile must be settlement or x402-exact")
-    buyer_allowed = (X402_BUYER_TOOLS,) if profile == "x402-exact" else (BUYER_TOOLS, BUYER_TOOLS | {ACCESS_TOOL})
+@asynccontextmanager
+async def connect_participants(
+    buyer_params: StdioServerParameters, seller_params: StdioServerParameters, *,
+    buyer_allowed: tuple[set[str], ...], seller_allowed: tuple[set[str], ...] = (SELLER_TOOLS,),
+) -> AsyncIterator[tuple[tuple[ClientSession, set[str]], tuple[ClientSession, set[str]]]]:
+    """Open both participants' MCP servers and fail closed on any unexpected tool surface."""
     async with AsyncExitStack() as stack:
         sessions = []
-        for params, allowed in ((buyer_params, buyer_allowed), (seller_params, (SELLER_TOOLS,))):
+        for params, allowed in ((buyer_params, buyer_allowed), (seller_params, seller_allowed)):
             read, write = await stack.enter_async_context(stdio_client(params))
             session = await stack.enter_async_context(ClientSession(read, write))
             await session.initialize()
@@ -228,7 +229,16 @@ async def run_over_mcp(buyer_params: StdioServerParameters, seller_params: Stdio
             if tools not in allowed:
                 raise HarnessError(f"unexpected tool surface: {sorted(tools)}")
             sessions.append((session, tools))
-        (buyer, buyer_tools), (seller, _) = sessions
+        yield sessions[0], sessions[1]
+
+
+async def run_over_mcp(buyer_params: StdioServerParameters, seller_params: StdioServerParameters,
+                       operation_ref: str, *, profile: str = "settlement", **options: Any) -> dict[str, Any]:
+    if profile not in {"settlement", "x402-exact"}:
+        raise HarnessError("profile must be settlement or x402-exact")
+    buyer_allowed = (X402_BUYER_TOOLS,) if profile == "x402-exact" else (BUYER_TOOLS, BUYER_TOOLS | {ACCESS_TOOL})
+    async with connect_participants(buyer_params, seller_params, buyer_allowed=buyer_allowed) as (
+            (buyer, buyer_tools), (seller, _)):
         if profile == "x402-exact":
             return await drive_x402_deal(buyer, seller, operation_ref, **options)
         return await drive_deal(buyer, seller, operation_ref, deliver=ACCESS_TOOL in buyer_tools, **options)

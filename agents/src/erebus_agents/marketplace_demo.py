@@ -1,119 +1,121 @@
-"""Mock rehearsal of the marketplace loop: search a registry, negotiate, settle, deliver, audit.
+"""Buy a listed capability over the real Metropolis loop: search, negotiate, settle, deliver.
 
-A buyer searches a `ServiceRegistry` for a capability, picks the cheapest listing inside its
-ceiling, negotiates against that seller's reserve on the mock client, pays once, records the
-off-chain delivery, and has the deal reviewed against the buyer's policy.
+A buyer searches a `ServiceRegistry` for a capability and picks the cheapest listing whose
+advertised floor is inside its ceiling. The buyer operator's route file maps that listing to the
+configured servers for that seller, and the purchase runs through `metropolis_loop.run_over_mcp`:
+both sides negotiate, the buyer settles at most once, and recovery observes until the payment is
+finalized. The agent supplies only the operation ID. Price, keys and settlement mode are fixed by
+the operators' files, and the buyer's `maximum_price` is what Rust enforces; the advertised band
+only chose which seller to approach.
 
-This is a rehearsal, not chain evidence. `deal_ref` is a local digest, and the delivery record
-is an operator observation the auditor may read but cannot treat as settlement proof.
+When the buyer's server is configured with access, the paid resource is retrieved and the
+delivery is recorded as DELIVERED with its verified hash. Otherwise delivery stays PENDING for the
+operator to record. Delivery is an off-chain observation, never settlement evidence. Public-bound
+settlement exposes the accepted terms and parties; it is not private.
+
+Reuse the same `--operation` after any interruption: it is the recovery handle, and a new one
+would be a new deal.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
-import hashlib
 import json
-import logging
+import re
 import sys
-import tempfile
 from pathlib import Path
 from typing import Any
 
-from erebus_mcp.interface import DisclosedRecord
-from erebus_mcp.mock_client import MockErebusClient
-
-from erebus_agents.agent import run_negotiation
 from erebus_agents.marketplace import (
     DeliveryRecord,
     DeliveryStatus,
+    PurchaseRoute,
     ServiceListing,
     ServiceRegistry,
+    load_routes,
     mark_delivered,
 )
-from erebus_agents.procurement import Catalog, Requisition, buyer_policy, review_disclosure, supplier_policy
+from erebus_agents.metropolis_loop import _harness_error, run_over_mcp, server_params
 
-BUYER = "0xbuyer"
-AUDITOR = "0xauditor"
-ASSET = "0xusdc"
-
-DEFAULT_LISTINGS = (
-    ServiceListing("svc-atlas", "0xatlas", "summarize-documents", ASSET, "page", 3, 7),
-    ServiceListing("svc-aegean", "0xaegean", "summarize-documents", ASSET, "page", 4, 9),
-    ServiceListing("svc-boreas", "0xboreas", "summarize-documents", ASSET, "page", 6, 12),
-)
+_OPERATION = re.compile(r"[a-f0-9]{64}")
 
 
-def seed_registry(listings: tuple[ServiceListing, ...] = DEFAULT_LISTINGS) -> ServiceRegistry:
-    registry = ServiceRegistry()
-    for listing in listings:
-        registry.publish(listing)
-    return registry
+def select_listing(registry: ServiceRegistry, routes: dict[str, PurchaseRoute], capability: str,
+                   ceiling_unit_price: int) -> tuple[ServiceListing, PurchaseRoute] | None:
+    """The cheapest listing inside the ceiling that this buyer's operator has wired a route to."""
+    for listing in registry.search(capability, max_unit_price=ceiling_unit_price):
+        route = routes.get(listing.service_id)
+        if route is not None:
+            return listing, route
+    return None
 
 
-async def rehearse(capability: str, ceiling_unit_price: int, quantity: int, *,
-                   registry: ServiceRegistry, latency: float = 0.0, max_rounds: int = 3,
-                   store_dir: Path, resource: bytes = b"the summarized document") -> dict[str, Any]:
-    listing = registry.best(capability, max_unit_price=ceiling_unit_price)
-    if listing is None:
-        return {"matched": False, "capability": capability, "ceiling_unit_price": ceiling_unit_price}
-
-    requisition = Requisition(capability, quantity, ceiling_unit_price)
-    catalog = Catalog(capability, listing.min_unit_price)
-    store = store_dir / "erebus-mock-store.json"
-    buyer = MockErebusClient(identity=BUYER, store_path=store, latency_seconds=latency,
-                             spendable_notes=[requisition.ceiling])
-    supplier = MockErebusClient(identity=listing.seller, store_path=store, latency_seconds=latency, spendable_notes=[])
-    state = await run_negotiation(
-        buyer_client=buyer, seller_client=supplier, buyer_address=BUYER, seller_address=listing.seller,
-        buyer_policy=buyer_policy(BUYER, requisition, max_rounds=max_rounds),
-        seller_policy=supplier_policy(listing.seller, catalog, requisition, max_rounds=max_rounds),
-        token=listing.asset, max_rounds=max_rounds)
-    if state.settlement is None:
-        return {"matched": True, "settled": False, "listing": listing.to_dict(),
-                "capability": capability, "ceiling": requisition.ceiling}
-
-    accepted = next(offer for offer in state.offers if offer.offer_id == state.settlement.acceptance)
-    deal_ref = hashlib.sha256(
-        f"{listing.service_id}:{accepted.deal_id}:{state.settlement.agreed_amount}:"
-        f"{state.settlement.paid_amount}".encode()).hexdigest()
-    delivery = mark_delivered(
-        DeliveryRecord(deal_ref, listing.service_id, DeliveryStatus.PENDING),
-        hashlib.sha256(resource).hexdigest())
-    review = review_disclosure(
-        DisclosedRecord(channel_id=accepted.channel_id, participants=[BUYER, listing.seller],
-                        offers=state.offers, settlement=state.settlement),
-        requisition)
+def purchase_record(listing: ServiceListing, deal: dict[str, Any]) -> dict[str, Any]:
+    """Project a finalized `drive_deal` record into the marketplace's purchase record."""
+    delivery = DeliveryRecord(deal["operation_ref"], listing.service_id, DeliveryStatus.PENDING)
+    if "delivery" in deal:
+        delivery = mark_delivered(delivery, deal["delivery"]["resource_sha256"])
     return {
-        "matched": True,
-        "settled": True,
         "listing": listing.to_dict(),
-        "capability": capability,
-        "ceiling": requisition.ceiling,
-        "agreed_amount": state.settlement.agreed_amount,
-        "paid_amount": state.settlement.paid_amount,
-        "deal_ref": deal_ref,
+        "operation_ref": deal["operation_ref"],
+        "deal_commitment": deal["deal_commitment"],
+        "payment_verified": deal["payment_verified"] is True,
+        "stage": deal.get("stage"),
+        "settle_calls": deal["settle_calls"],
+        "recover_calls": deal["recover_calls"],
         "delivery": {"status": delivery.status.value, "artifact_sha256": delivery.artifact_sha256,
                      "is_settlement_evidence": False},
-        "audit": {"compliant": review.compliant, "reasons": list(review.reasons)},
+        "stages_ms": deal.get("stages_ms"),
     }
+
+
+async def purchase(listing: ServiceListing, route: PurchaseRoute, operation_ref: str, *,
+                   server_command: str | None = None, negotiation_cli: str | None = None,
+                   payment_cli: str | None = None, max_polls: int = 120) -> dict[str, Any]:
+    if not _OPERATION.fullmatch(operation_ref) or operation_ref == "0" * 64:
+        raise ValueError("operation_ref must be 64 nonzero lowercase hex digits")
+    access = json.loads(Path(route.buyer_access_file).read_text()) if route.buyer_access_file else None
+    buyer = server_params(sys.executable, route.buyer_negotiation_config, payment_config=route.buyer_payment_config,
+                          access=access, server_command=server_command, negotiation_cli=negotiation_cli,
+                          payment_cli=payment_cli)
+    seller = server_params(sys.executable, route.seller_negotiation_config, negotiation_cli=negotiation_cli,
+                           server_command=server_command)
+    deal = await run_over_mcp(buyer, seller, operation_ref, max_polls=max_polls)
+    return purchase_record(listing, deal)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--capability", default="summarize-documents")
-    parser.add_argument("--quantity", type=int, default=10)
-    parser.add_argument("--ceiling-unit-price", type=int, default=8, help="the buyer's maximum unit price")
-    parser.add_argument("--rounds", type=int, default=3)
-    parser.add_argument("--latency", type=float, default=0.2)
+    parser.add_argument("--registry", type=Path, required=True, help="the ServiceRegistry JSON file")
+    parser.add_argument("--routes", type=Path, required=True, help="the buyer operator's route file")
+    parser.add_argument("--capability", required=True)
+    parser.add_argument("--ceiling-unit-price", type=int, required=True, help="the buyer's maximum advertised unit price")
+    parser.add_argument("--operation", required=True, help="64-hex operation ID; reuse it after any interruption")
+    parser.add_argument("--server-command", help="installed erebus-mcp-server; default: this Python's module")
+    parser.add_argument("--negotiation-cli")
+    parser.add_argument("--payment-cli")
+    parser.add_argument("--max-polls", type=int, default=120)
     args = parser.parse_args()
-    logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stdout)
-    registry = seed_registry()
-    with tempfile.TemporaryDirectory() as tmp:
-        record = asyncio.run(rehearse(
-            args.capability, args.ceiling_unit_price, args.quantity, registry=registry,
-            latency=args.latency, max_rounds=args.rounds, store_dir=Path(tmp)))
-    print(json.dumps(record, indent=2))
+    selected = select_listing(ServiceRegistry.load(args.registry), load_routes(args.routes), args.capability,
+                              args.ceiling_unit_price)
+    if selected is None:
+        print(json.dumps({"matched": False, "capability": args.capability,
+                          "ceiling_unit_price": args.ceiling_unit_price}))
+        raise SystemExit(1)
+    listing, route = selected
+    try:
+        record = asyncio.run(purchase(listing, route, args.operation, server_command=args.server_command,
+                                      negotiation_cli=args.negotiation_cli, payment_cli=args.payment_cli,
+                                      max_polls=args.max_polls))
+    except BaseException as error:
+        found = _harness_error(error)
+        if found is None:
+            raise
+        print(json.dumps({"matched": True, "service_id": listing.service_id, "operation_ref": args.operation,
+                          "payment_verified": False, "error": str(found)}))
+        raise SystemExit(1) from None
+    print(json.dumps({"matched": True, **record}, indent=2))
 
 
 if __name__ == "__main__":

@@ -17,8 +17,6 @@ AUDITOR_REPORT = {
     "auditor": {"agreement_verified": True, "payment_verified": True,
                 "delivery_verified": False, "deal_commitment": COMMITMENT},
 }
-REHEARSAL_REPORT = {"settled": True, "agreed_amount": 64, "paid_amount": 64, "deal_ref": COMMITMENT,
-                    "audit": {"compliant": True, "reasons": []}}
 
 
 def test_receipt_rejects_bad_commitment_and_a_delivery_claim():
@@ -26,40 +24,33 @@ def test_receipt_rejects_bad_commitment_and_a_delivery_claim():
         DealReceipt("xyz", ISSUER, True, True)
     with pytest.raises(ValueError, match="delivery"):
         DealReceipt(COMMITMENT, ISSUER, True, True, delivery_verified=True)
+    with pytest.raises(ValueError, match="delivery"):
+        receipt_from_report({"auditor": {**AUDITOR_REPORT["auditor"], "delivery_verified": True}}, issuer=ISSUER)
 
 
-def test_consistency_and_status_keep_the_three_facts_separate():
+def test_status_keeps_the_facts_separate():
     assert DealReceipt(COMMITMENT, ISSUER, True, True).status == "verified"
     assert DealReceipt(COMMITMENT, ISSUER, True, False).status == "agreement_only"
     assert DealReceipt(COMMITMENT, ISSUER, False, False).status == "unverified"
-    assert DealReceipt(COMMITMENT, ISSUER, True, True, agreed_amount=10, paid_amount=10).consistency == "consistent"
-    assert DealReceipt(COMMITMENT, ISSUER, True, True, agreed_amount=10, paid_amount=9).consistency == "inconsistent"
-    assert DealReceipt(COMMITMENT, ISSUER, True, False).consistency == "unknown"
 
 
 def test_receipt_from_auditor_report_maps_the_independent_flags():
     receipt = receipt_from_report(AUDITOR_REPORT, issuer=ISSUER, parties=("0xa", "0xb"))
     assert receipt.agreement_verified and receipt.payment_verified and not receipt.delivery_verified
-    assert receipt.operation_ref == "op-1" and receipt.source == "disclosure"
+    assert receipt.operation_ref == "op-1" and receipt.parties == ("0xa", "0xb")
 
 
-def test_receipt_from_rehearsal_report_is_not_independent_verification():
-    receipt = receipt_from_report(REHEARSAL_REPORT, issuer=ISSUER)
-    assert not receipt.agreement_verified and not receipt.payment_verified
-    assert receipt.status == "rehearsal" and receipt.reported_settled is True
-    assert receipt.agreed_amount == receipt.paid_amount == 64 and receipt.source == "rehearsal"
-    text = render_text(receipt)
-    assert "Status:     rehearsal" in text
-    assert not any(line.rstrip().endswith(": verified") or line.split(":", 1)[-1].strip() == "verified"
-                   for line in text.splitlines())
-    assert "Status</th><td class=\"warn\">rehearsal" in render_html(receipt)
+def test_only_an_auditor_report_is_accepted():
+    with pytest.raises(ValueError, match="auditor"):
+        receipt_from_report({"settled": True, "deal_ref": COMMITMENT}, issuer=ISSUER)
 
 
-def test_a_rehearsal_receipt_cannot_claim_verification():
-    with pytest.raises(ValueError, match="rehearsal"):
-        DealReceipt(COMMITMENT, ISSUER, True, True, source="rehearsal")
-    with pytest.raises(ValueError, match="source"):
-        DealReceipt(COMMITMENT, ISSUER, True, True, source="self-reported")
+def test_an_agreement_only_audit_leaves_payment_pending():
+    # metropolis_audit.py without a deployment verifies the agreement and reports no payment flag.
+    report = {"operation_ref": "op-1", "auditor": {"agreement_verified": True, "payment_verified": None,
+                                                    "delivery_verified": False, "deal_commitment": COMMITMENT}}
+    receipt = receipt_from_report(report, issuer=ISSUER)
+    assert receipt.status == "agreement_only" and receipt.payment_verified is False
 
 
 def test_commitment_override_fills_a_gap_but_never_replaces_a_verified_one():
@@ -69,17 +60,13 @@ def test_commitment_override_fills_a_gap_but_never_replaces_a_verified_one():
     assert same.deal_commitment == COMMITMENT
     with pytest.raises(ValueError, match="auditor verified"):
         receipt_from_report(AUDITOR_REPORT, issuer=ISSUER, deal_commitment="cd" * 32)
-    rehearsal = {k: v for k, v in REHEARSAL_REPORT.items() if k != "deal_ref"}
-    assert receipt_from_report(rehearsal, issuer=ISSUER, deal_commitment=COMMITMENT).deal_commitment == COMMITMENT
 
 
 def test_text_render_flags_pending_without_calling_it_failure():
     text = render_text(receipt_from_report(AUDITOR_REPORT, issuer=ISSUER, asset="0xusdc"))
-    assert "Status:     verified" in text
-    assert "Delivery:   not proven" in text
+    assert "Status:     verified" in text and "Delivery:   not proven" in text and "Asset:      0xusdc" in text
     pending = render_text(DealReceipt(COMMITMENT, ISSUER, True, False))
-    assert "Payment:    pending" in pending
-    assert "not evidence of non-payment" in pending
+    assert "Payment:    pending" in pending and "not evidence of non-payment" in pending
 
 
 def test_html_render_is_self_contained_and_escapes_values():

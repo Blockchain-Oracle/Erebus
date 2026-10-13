@@ -1,21 +1,44 @@
-"""Marketplace registry, discovery and delivery-state policy, plus the mock rehearsal."""
+"""Marketplace registry, routes and delivery-state policy, and the purchase over the real loop."""
 
 import asyncio
+import json
 
 import pytest
 
 from erebus_agents.marketplace import (
     DeliveryRecord,
     DeliveryStatus,
+    PurchaseRoute,
     ServiceListing,
     ServiceRegistry,
+    load_routes,
     mark_delivered,
     mark_disputed,
     mark_refunded,
 )
-from erebus_agents.marketplace_demo import rehearse, seed_registry
+from erebus_agents.marketplace_demo import purchase_record, select_listing
+from erebus_agents.metropolis_loop import drive_deal
 
 DIGEST = "ab" * 32
+OPERATION = "12" * 32
+COMMITMENT = "cd" * 32
+LISTINGS = (
+    ServiceListing("svc-atlas", "0xatlas", "summarize-documents", "0xusdc", "page", 3, 7),
+    ServiceListing("svc-aegean", "0xaegean", "summarize-documents", "0xusdc", "page", 4, 9),
+    ServiceListing("svc-boreas", "0xboreas", "summarize-documents", "0xusdc", "page", 6, 12),
+)
+
+
+def seed_registry():
+    registry = ServiceRegistry()
+    for entry in LISTINGS:
+        registry.publish(entry)
+    return registry
+
+
+def route(service_id, access=None):
+    return PurchaseRoute(service_id, f"/operator/{service_id}/buyer.negotiation.json",
+                         "/operator/buyer.payment.json", f"/operator/{service_id}/seller.negotiation.json", access)
 
 
 def listing(service_id="svc-a", seller="0xseller", capability="summarize", minimum=3, maximum=7):
@@ -79,19 +102,77 @@ def test_delivery_is_never_settlement_evidence():
     assert not hasattr(delivered, "payment_verified")
 
 
-def run(capability, ceiling, tmp_path):
-    return asyncio.run(rehearse(capability, ceiling, 10, registry=seed_registry(), store_dir=tmp_path))
+def test_routes_need_absolute_operator_files_and_load_once_per_listing(tmp_path):
+    with pytest.raises(ValueError, match="absolute"):
+        PurchaseRoute("svc-a", "buyer.json", "/p.json", "/s.json")
+    with pytest.raises(ValueError, match="absolute"):
+        PurchaseRoute("svc-a", "/b.json", "/p.json", "/s.json", "access.json")
+    path = tmp_path / "routes.json"
+    entry = {"service_id": "svc-atlas", "buyer_negotiation_config": "/b.json",
+             "buyer_payment_config": "/p.json", "seller_negotiation_config": "/s.json"}
+    path.write_text(json.dumps({"routes": [entry]}))
+    assert load_routes(path)["svc-atlas"].buyer_access_file is None
+    path.write_text(json.dumps({"routes": [entry, entry]}))
+    with pytest.raises(ValueError, match="routed twice"):
+        load_routes(path)
 
 
-def test_rehearsal_picks_the_cheapest_listing_and_audits_compliant(tmp_path):
-    result = run("summarize-documents", 8, tmp_path)
-    assert result["matched"] and result["settled"]
-    assert result["listing"]["service_id"] == "svc-atlas"
-    assert result["paid_amount"] == result["agreed_amount"] <= result["ceiling"]
-    assert result["audit"]["compliant"]
-    assert result["delivery"]["status"] == "delivered" and not result["delivery"]["is_settlement_evidence"]
+def test_selection_takes_the_cheapest_listing_this_buyer_can_actually_reach():
+    registry = seed_registry()
+    routes = {name: route(name) for name in ("svc-atlas", "svc-aegean")}
+    listing, chosen = select_listing(registry, routes, "summarize-documents", 8)
+    assert listing.service_id == chosen.service_id == "svc-atlas"
+    # An unrouted listing is skipped, never bought through some default server.
+    listing, _ = select_listing(registry, {"svc-aegean": route("svc-aegean")}, "summarize-documents", 8)
+    assert listing.service_id == "svc-aegean"
+    assert select_listing(registry, routes, "summarize-documents", 2) is None
+    assert select_listing(registry, {}, "summarize-documents", 8) is None
 
 
-def test_rehearsal_reports_no_match_when_the_ceiling_is_below_every_listing(tmp_path):
-    result = run("summarize-documents", 2, tmp_path)
-    assert result == {"matched": False, "capability": "summarize-documents", "ceiling_unit_price": 2}
+class Session:
+    """Scripted replies in the shape the real Metropolis MCP tools return."""
+
+    def __init__(self, **replies):
+        self.replies = {name: list(values) for name, values in replies.items()}
+        self.calls = []
+
+    async def call_tool(self, name, arguments):
+        self.calls.append(name)
+        return self.replies[name].pop(0)
+
+
+async def no_sleep(_):
+    pass
+
+
+NEGOTIATED = {"ok": True, "result": {"deal_commitment": COMMITMENT, "measurements_ms": {"negotiation": 5},
+                                     "evidence_file": f"/operator/state/agent/{OPERATION}.0.tx"}}
+FINALIZED = {"ok": True, "result": {"status": "ok", "payment_verified": True, "stage": "Finalized",
+                                    "winning_commitment": COMMITMENT, "measurements_ms": {"submission": 3},
+                                    "chain_times": {"inclusion_block": 7}}}
+RETRIEVED = {"ok": True, "result": {"status": "retrieved", "result": {
+    "resource_verified": True, "resource_sha256": DIGEST, "resource_bytes": 37}}}
+
+
+def drive(deliver):
+    buyer = Session(negotiate_deal=[NEGOTIATED], check_settlement_funding=[{"ok": True, "result": {"status": "ready"}}],
+                    settle_deal=[FINALIZED], retrieve_service_access=[RETRIEVED])
+    record = asyncio.run(drive_deal(buyer, Session(negotiate_deal=[NEGOTIATED]), OPERATION, deliver=deliver,
+                                    sleep=no_sleep))
+    return buyer, record
+
+
+def test_a_finalized_purchase_with_access_records_the_verified_delivery():
+    buyer, deal = drive(deliver=True)
+    record = purchase_record(LISTINGS[0], deal)
+    assert buyer.calls.count("settle_deal") == 1
+    assert record["payment_verified"] is True and record["deal_commitment"] == COMMITMENT
+    assert record["operation_ref"] == OPERATION and record["listing"]["service_id"] == "svc-atlas"
+    assert record["delivery"] == {"status": "delivered", "artifact_sha256": DIGEST, "is_settlement_evidence": False}
+
+
+def test_without_access_the_delivery_stays_pending_for_the_operator():
+    _, deal = drive(deliver=False)
+    record = purchase_record(LISTINGS[0], deal)
+    assert record["payment_verified"] is True
+    assert record["delivery"] == {"status": "pending", "artifact_sha256": None, "is_settlement_evidence": False}
