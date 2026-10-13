@@ -24,7 +24,9 @@ PAYMENT = b"\xcf\xfa\xed\xfe packaged payment"
 
 
 @pytest.fixture
-def world(tmp_path):
+def world(tmp_path, monkeypatch):
+    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+    monkeypatch.delenv("RUNNER_ENVIRONMENT", raising=False)
     registry = tmp_path / "registry"
     registry.mkdir()
     release = {"version": "0.3.0.dev2026101306", "source_commit": "5" * 40, "dirty_source": False,

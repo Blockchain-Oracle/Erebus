@@ -402,9 +402,28 @@ def reference() -> str:
     return secrets.token_hex(32)
 
 
+def check_operator_mode(replies: dict, summaries: list[dict], prepublication: bool) -> None:
+    for name in ("seller_init", "buyer_init", "auditor"):
+        if name not in replies:
+            continue
+        if prepublication:
+            require(not replies[name].get("rehearsal"), f"{name} unexpectedly used rehearsal pins")
+        else:
+            require(bool(replies[name].get("rehearsal")), f"{name} output is not marked as a rehearsal")
+    for summary in summaries:
+        if prepublication:
+            require(summary.get("prepublication") is True and not summary.get("rehearsal")
+                    and "rehearsal-pins" not in summary.get("labels", []),
+                    "operator.json is not labelled as prepublication")
+        else:
+            require("rehearsal-pins" in summary.get("labels", [])
+                    and (summary.get("rehearsal") or {}).get("publication_evidence") is False
+                    and not summary.get("prepublication"), "operator.json is not labelled as a rehearsal")
+
+
 class Pool:
     def __init__(self, name: str, installed: Installed, chain: Chain, deployment: Path, pins: Path, work: Path,
-                 dev_keys: list[tuple[str, str]]) -> None:
+                 dev_keys: list[tuple[str, str]], prepublication: bool = False) -> None:
         self.name, self.installed, self.chain, self.deployment, self.pins = name, installed, chain, deployment, pins
         self.root = work / name
         self.root.mkdir(mode=0o700)
@@ -412,6 +431,7 @@ class Pool:
         self.asset, self.contract = self.record["asset"].lower(), self.record["pool"].lower()
         self.amounts = AMOUNTS[name]
         self.dev_keys = dev_keys
+        self.prepublication = prepublication
         self.report: dict = {"pool": name, "asset_code": "local MockWMON" if name == "wmon" else
                              "local MockERC20 at the testnet USDC address (not Circle USDC)"}
 
@@ -466,13 +486,8 @@ class Pool:
                                                      "--deployment", str(self.deployment), "--rpc-url", primary,
                                                      "--peer-rpc-url", peer)
             operators["auditor"] = auditor
-        for name in ("seller_init", "buyer_init", "auditor"):
-            if name in replies:
-                require(replies[name].get("rehearsal") not in (None, False), f"{name} output is not marked as a rehearsal")
-        for role in ("seller", "buyer"):
-            summary = json.loads((operators[role] / "operator.json").read_text())
-            require("rehearsal-pins" in summary["labels"] and summary["rehearsal"]["publication_evidence"] is False,
-                    f"{role} operator.json is not labelled as a rehearsal")
+        check_operator_mode(replies, [json.loads((operators[role] / "operator.json").read_text())
+                                     for role in ("seller", "buyer")], self.prepublication)
         self.report.setdefault("generated", {})[pair] = {
             name: reply.get("status") for name, reply in replies.items()}
         return operators
@@ -851,7 +866,7 @@ async def workflow(arguments: argparse.Namespace) -> dict:
         dev_keys = chain.fixture_keys()
         report["pools"] = {}
         for index, name in enumerate(arguments.pools):
-            pool = Pool(name, installed, chain, deployment, pins, work, dev_keys)
+            pool = Pool(name, installed, chain, deployment, pins, work, dev_keys, prepublication=prepublication)
             pool.report["main"] = await pool.main_pair(extended=index == 0)
             if index == 0:
                 pool.report["deadline"] = await pool.deadline_pair()
