@@ -435,6 +435,7 @@ jobs:
           node scripts/verify-setup.test.mjs
           node scripts/build-artifact-bundle.test.mjs
           node scripts/bundle-testnet-setup.test.mjs
+          node --test scripts/export-testnet-replay.test.mjs
           node scripts/stage-test-bundle.test.mjs
           node scripts/verify-phase1.test.mjs
           node scripts/verify-phase2-step.test.mjs
@@ -515,6 +516,10 @@ jobs:
       - name: Negotiate in separate processes, recover a lost payment response, and audit x402
         working-directory: sdk/shielded
         run: cargo test --locked --test negotiation_cli payment_driver -- --include-ignored
+
+      - name: Verify external shielded relay proofs and paired funded admission without sends
+        working-directory: sdk/shielded
+        run: cargo test --locked --test relay_admission -- --ignored
 
       - name: Check prepaid request and profile vectors independently
         run: python3 scripts/check_agreement_vectors.py

@@ -307,7 +307,7 @@ async function main() {
       eddsa, BigInt(predictedSettlementAddress), expiry,
     );
     writeFileSync(resolve(buildDir, "suite2-vector.json"), `${JSON.stringify(suite2Vector, null, 2)}\n`);
-    const pinnedSuite2 = JSON.parse(readFileSync(resolve(workDir, "../../sdk/core/tests/fixtures/agreement-suite2-vector.json"), "utf8"));
+    const pinnedSuite2 = JSON.parse(readFileSync(resolve(workDir, "fixtures/agreement-suite2-vector.json"), "utf8"));
     if (JSON.stringify(suite2Vector) !== JSON.stringify(pinnedSuite2)) {
       throw new Error("computed suite-2 agreement differs from pinned Rust vector");
     }

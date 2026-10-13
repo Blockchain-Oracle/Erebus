@@ -9,11 +9,13 @@ import { compileContracts, artifactBuild } from "./pool.mjs";
 const build = artifactBuild;
 const provider = new JsonRpcProvider(process.argv[2]);
 try {
-  if (!/^http:\/\/127\.0\.0\.1:\d+$/.test(process.argv[2]) || (await provider.getNetwork()).chainId !== 31337n) {
-    throw new Error("native fixture requires a local Anvil chain 31337");
+  const chain = process.argv[4] === undefined ? 31337n : BigInt(process.argv[4]);
+  if (!/^http:\/\/127\.0\.0\.1:\d+$/.test(process.argv[2])
+      || ![31337n, 10143n].includes(chain) || (await provider.getNetwork()).chainId !== chain) {
+    throw new Error("native fixture requires a local Anvil chain 31337 or 10143");
   }
   const assetMode = process.argv[3] ?? "erc20";
-  if (!["erc20", "wmon"].includes(assetMode) || process.argv.length > 4) {
+  if (!["erc20", "wmon"].includes(assetMode) || process.argv.length > 5) {
     throw new Error("native fixture asset must be erc20 or wmon");
   }
   const signer = await provider.getSigner(0);
@@ -44,15 +46,15 @@ try {
   const salt = BigInt(`0x${"07".repeat(32)}`);
   const tag = BigInt(poseidon.F.toObject(poseidon([2006n, spendSecret])));
   const asset = BigInt(await token.getAddress());
-  const chainId = 31337n;
+  const chainId = chain;
   const version = 2n;
   const contractAddress = BigInt(await pool.getAddress());
   const domain = BigInt(poseidon.F.toObject(poseidon([chainId, contractAddress, version])));
   const note = BigInt(poseidon.F.toObject(poseidon([2010n, domain, asset, 150n, ...owner, tag, salt])));
   const input = {
-    chainId: "31337", contractAddress: BigInt(await pool.getAddress()).toString(), verifierVersion: "2",
+    chainId: chain.toString(), contractAddress: BigInt(await pool.getAddress()).toString(), verifierVersion: "2",
     asset: asset.toString(), amount: "150", noteCommitment: note.toString(), ownerAx: owner[0].toString(), ownerAy: owner[1].toString(),
-    spendTag: tag.toString(), salt: salt.toString(), privateChainId: "31337",
+    spendTag: tag.toString(), salt: salt.toString(), privateChainId: chain.toString(),
     privateContractAddress: BigInt(await pool.getAddress()).toString(), privateVerifierVersion: "2",
   };
   const proved = await snarkjs.groth16.fullProve(input, resolve(build, "deposit_js/deposit.wasm"), resolve(build, "deposit.zkey"));

@@ -26,6 +26,11 @@ settles once, and runs replay and mutation checks. It writes `build/metrics.json
 The pinned public vector is `fixtures/public.json`. The M1 service-record encoding is checked
 against the Rust agreement fixture before the proof is generated.
 
+`fixtures/agreement-suite2-vector.json` preserves the Rust vector from revision `94aa059`.
+M4 uses the historical note tags 2007/2008; M5 candidate v2 uses domain-bound tags 2010/2011.
+The M4 regression must not use M5's current payment-note vector. This prototype does not
+qualify the current pool circuits or deployment.
+
 The local setup entropy and deterministic test secrets make these artifacts unsuitable for
 real value. Never deploy this verifier or use this `.zkey` with funds. Regenerating after a
 circuit change creates a new verifier and invalidates previous proofs.

@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
 import { mkdtemp, writeFile, rm, symlink } from "node:fs/promises";
-import { resolve } from "node:path";
+import { tmpdir } from "node:os";
+import { resolve, join } from "node:path";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { bundleTestnetSetup } from "./bundle-testnet-setup.mjs";
 import { hashFile } from "./build-artifact-bundle.mjs";
 
-const temp = await mkdtemp("/private/tmp/erebus-bundle-tests-");
+const temp = await mkdtemp(join(tmpdir(), "erebus-bundle-tests-"));
 try {
   const path = resolve(temp, "receipt.json");
   const base = { test_only: true, receipt: { path, sha256: "11".repeat(32) }, base_url: "https://example.invalid/",
