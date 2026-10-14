@@ -3,7 +3,8 @@
 
 ``observer.py`` answers "did this transaction leak?" for one transaction. This answers "how
 well does an observer do across a corpus?", which is what a privacy claim needs before it
-can be defended. The metrics are M1 and M2 in ``docs/threat-model.md``.
+can be defended. The metrics M1 and M2 are defined below; the privacy boundary
+is documented in ``docs/privacy-model.md``.
 
     python3 scripts/linkage.py
     python3 scripts/linkage.py --negatives 100000 --json

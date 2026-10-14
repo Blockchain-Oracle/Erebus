@@ -21,8 +21,9 @@ relationship. The counterparty address is public at channel-open, the submitter 
 and the prover plus preflight RPC both see the pool private key during writes.
 
 For privacy scope and the known leaks, read [privacy-model.md](./privacy-model.md) first.
-For the implementation and trust boundaries, read `sdk/rs/src/signer.rs`
-and [local-prover.md](./local-prover.md).
+For the implementation and trust boundaries, read
+[`sdk/rs/src/signer.rs`](../sdk/rs/src/signer.rs) and
+[the setup guide](./setup.md).
 
 ## Clean shell
 
@@ -115,7 +116,8 @@ PROVING_SERVICE_URL=https://api.starkscan.co/v1/SN_MAIN/prove
 ```
 
 If you use Starkscan, the env must also include `STARKSCAN_API_KEY` with `prove` scope.
-See [local-prover.md](./local-prover.md) for the local fallback and its screening limits.
+This runbook covers the hosted path only. It does not qualify a local-prover fallback.
+See [the privacy model](./privacy-model.md) for the prover trust boundary.
 
 ## 5. Shield and register
 
@@ -284,4 +286,4 @@ Use this guide together with:
 
 - [README.md](../README.md)
 - [privacy-model.md](./privacy-model.md)
-- [local-prover.md](./local-prover.md)
+- [setup.md](./setup.md)

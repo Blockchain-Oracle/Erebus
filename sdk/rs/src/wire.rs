@@ -757,7 +757,7 @@ pub fn decode_message(
 /// every message had bits 60..118 clear whatever the message said. A random salt has that
 /// shape with probability 2^-59, so the fifth salt identified an Erebus message essentially
 /// every time. Measured at balanced accuracy 1.0000 in `scripts/linkage.py`; tracked as F31
-/// and as M1 in `docs/threat-model.md`.
+/// in `docs/privacy-model.md` under the historical wire-v2 fifth-salt fingerprint.
 ///
 /// Wire v3 covers the three spare bits with a separately derived keystream. The ciphertext
 /// and tag below them are already uniform, so all 595 bits become

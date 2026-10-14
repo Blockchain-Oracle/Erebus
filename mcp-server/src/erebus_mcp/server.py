@@ -80,7 +80,7 @@ def build_server() -> MCPServer:
             "Structured negotiation and settlement between two agents on Starknet. "
             "Negotiation terms and settlement amounts are confidential against a chain "
             "reader; they are not confidential against the prover or write RPC, which see "
-            "the pool key (docs/threat-model.md). Opening a channel is never confidential: "
+            "the pool key (docs/privacy-model.md). Opening a channel is never confidential: "
             "it writes the counterparty's address to public calldata (F38). "
             "Open a channel with a counterparty, exchange structured offers, and settle "
             "atomically. accept_and_settle always spends this identity's private notes: "

@@ -7,7 +7,7 @@
  *   docs/runs/v0.2-mainnet-canary.json
  *   agents/src/erebus_agents/demo.py . the replay
  *   README.md ........................ install and the MCP tool surface
- *   docs/metropolis-install.md ....... (metropolis branch) the published Monad install
+ *   docs/metropolis-install.md ....... the published Monad install
  *   scripts/metropolis-demo-readonly.py  Monad pool addresses, runtime pins, the WMON payment, limits
  */
 
@@ -15,7 +15,7 @@ export const SOURCE = "https://github.com/PoulavBhowmick03/Erebus";
 export const X_HANDLE = "https://x.com/Erebus_pvt";
 export const doc = (p: string) => `${SOURCE}/blob/main/${p}`;
 export const starkscan = (h: string) => `https://starkscan.co/tx/${h}`;
-export const docMonad = (p: string) => `${SOURCE}/blob/metropolis/${p}`;
+export const docMonad = doc;
 export const monadTx = (h: string) => `https://testnet.monadexplorer.com/tx/${h}`;
 export const monadAddress = (a: string) => `https://testnet.monadexplorer.com/address/${a}`;
 export const MONAD_RELEASE = "https://github.com/PoulavBhowmick03/erebus-metropolis/releases/tag/v0.3.0.dev2026101307";

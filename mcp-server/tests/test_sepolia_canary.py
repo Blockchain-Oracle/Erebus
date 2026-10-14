@@ -5,8 +5,8 @@ runbook as a manual pass").
 Every other test in this repository either drives the mock backend or points the real
 `erebus-cli` at a dead RPC endpoint (`UNREACHABLE = "http://127.0.0.1:1"` in
 `test_seam_integration.py`). Both are correct for what they check, but neither can catch a
-regression that only shows up against a live chain: a real RPC dropping `proof_facts` (see
-`docs/local-prover.md`), a pool ABI drifting out from under a pinned prover tag (roadmap Q4),
+regression that only shows up against a live chain: a real RPC dropping `proof_facts`,
+a pool ABI drifting out from under a pinned prover tag (roadmap Q4),
 or a genuinely unreachable prover that a dead-endpoint test can't distinguish from a
 deliberately-dead one.
 
