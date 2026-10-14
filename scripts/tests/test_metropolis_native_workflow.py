@@ -139,6 +139,9 @@ def test_platform_compare_requires_identity_bound_feature_gates_for_hosted_relay
     assert 'sys.exit("; ".join(failures))' in text
 
 
-def test_public_replay_offline_regressions_are_in_the_m5_ci_job():
+def test_public_replay_offline_regressions_remain_in_typescript_ci():
     text = (ROOT / ".github/workflows/ci.yml").read_text()
-    assert "node --test scripts/export-testnet-replay.test.mjs" in text
+    typescript = text.split("  typescript:\n", 1)[1].split("  secrets:\n", 1)[0]
+    assert "npm ci --prefix circuits/m5" in typescript
+    assert "node --test circuits/m5/scripts/export-testnet-replay.test.mjs" in typescript
+    assert "  m5-proof:\n" not in text
