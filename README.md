@@ -56,9 +56,6 @@ claude mcp add erebus \
   -- erebus-mcp-server
 ```
 
-`mock` runs the whole loop in memory, with no keys or gas. Run `erebus-init` to set up a real
-identity; [docs/onboarding.md](./docs/onboarding.md) covers the flags and recovery.
-
 ## Evidence
 
 Starknet mainnet. Amount and recipient can't be recovered from any of these:
@@ -77,8 +74,6 @@ Monad testnet, all run by our team:
 | x402, with the earlier `0.3.0.dev4` release | [`0x8a0272e6…`](https://testnet.monadexplorer.com/tx/0x8a0272e69188ac3be52783ddfc4d4436496a58f2d5c63d808cd3320a1fa5df43) |
 | Public-bound | [`0x1ba9ddb3…`](https://testnet.monadexplorer.com/tx/0x1ba9ddb363a0c916f8e41ca8eca7d4c524d1ba4722bf4ea37ed423547700ff73) |
 | Shielded WMON, with source-built payment commands | [`0xe01666d8…`](https://testnet.monadexplorer.com/tx/0xe01666d8c4e16efe8195da8047674c71a325ee20ff250f02f4fdf570a04934fa) |
-
-Starknet run records, with timings, are in [docs/runs](./docs/runs/).
 
 Videos: [Starknet demo](https://drive.google.com/file/d/1zOkEJt08DwRiHeLIu4IaXCl1s8VRSKuu/view?usp=sharing),
 [Monad product](https://youtu.be/fIsfHgDBhxo), [pitch](https://youtu.be/6Dwl0PfzdJ8) and
